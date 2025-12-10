@@ -116,7 +116,6 @@ local status_led    = LED{parent = system, label = "STATUS",    colors = ind_red
 local heartbeat_led = LED{parent = system, label = "HEARTBEAT", colors = ind_red}
 local reactor_led   = LED{parent = system, label = "REACTOR",   colors = ind_red}
 local modem_led     = LED{parent = system, label = "MODEM (1)", colors = ind_grn}
-
 local network_led   = RGBLED{
     parent = system,
     label  = "NETWORK",
@@ -260,11 +259,12 @@ end
 hb_last = os.clock() - hb_timeout * 2
 update_heartbeat()
 
+local STATUS_CHAN = 9001
 local TIMER_PERIOD = 1.0      -- seconds between heartbeat checks
 local timer_id = os.startTimer(TIMER_PERIOD)
 
 while true do
-    local ev, p1, p2, p3, p4, p5 = os.pullEventRaw()
+    local ev, p1, p2, p3, p4 = os.pullEventRaw()
 
     if ev == "terminate" then
         break

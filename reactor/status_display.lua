@@ -1,20 +1,19 @@
 -- status_display.lua
 -- PLC-style front panel for the fission reactor
--- Uses only vanilla term/monitor APIs (no external graphics libs).
--- Designed for a 3×3 advanced monitor that reports size 57×24.
+-- No external graphics libs, only term/monitor.
+-- Designed for a 3x3 advanced monitor (57x24).
 
 ----------------------------
 -- CONFIG
 ----------------------------
 
 local MONITOR_SIDE = "top"   -- monitor side
-local MODEM_SIDE   = "back"  -- modem side (for heartbeat/status packets)
+local MODEM_SIDE   = "back"  -- modem side
 
--- Channel to listen on for status packets from the core controller.
--- Expected packet format:
+-- Status packets from the core:
 -- {
 --   type        = "status",
---   powered     = true/false,   -- reactor actually running
+--   powered     = bool,
 --   manualTrip  = bool,
 --   autoTrip    = bool,
 --   hiDamage    = bool,
@@ -24,20 +23,16 @@ local MODEM_SIDE   = "back"  -- modem side (for heartbeat/status packets)
 --   loCCoolant  = bool,
 --   hiHCoolant  = bool,
 -- }
--- Any missing field is simply ignored.
 local STATUS_CHANNEL = 600
 
--- Seconds with no packet before heartbeat/network are considered failed
-local HEARTBEAT_TIMEOUT = 20
+local HEARTBEAT_TIMEOUT = 20   -- seconds
 
 ----------------------------
 -- PERIPHERALS
 ----------------------------
 
 local mon = peripheral.wrap(MONITOR_SIDE)
-if not mon then
-    error("No monitor on side '" .. MONITOR_SIDE .. "'")
-end
+if not mon then error("No monitor on side '" .. MONITOR_SIDE .. "'") end
 
 mon.setTextScale(0.5)
 local W, H = mon.getSize()
@@ -91,77 +86,105 @@ local function write_at(x, y, text, fg, bg)
     mon.write(text)
 end
 
+-- 1x1 LED: a single space with background colour
 local function led(x, y, on, color_on, color_off)
     color_on  = color_on  or colors.lime
     color_off = color_off or colors.gray
     mon.setBackgroundColor(on and color_on or color_off)
     mon.setCursorPos(x, y)
-    mon.write("  ")
+    mon.write(" ")
 end
 
 ----------------------------
 -- LAYOUT CONSTANTS
 ----------------------------
 
-local FRAME_BG   = colors.gray
-local BORDER_COL = colors.yellow
+local BG_OUTER   = colors.yellow
+local BG_MAIN    = colors.gray
+local BG_PANEL   = colors.black
+local BG_PANEL2  = colors.gray
+
 local TITLE      = "FISSION REACTOR PLC - UNIT 1"
 
--- Left column
-local L_BASE_X, L_BASE_Y = 4, 4
--- Right column
-local R_BASE_X, R_BASE_Y = 34, 6
--- Center row for RPS TRIP block
-local CENTER_Y = 11
+-- Left column baseline
+local L_LED_X    = 6
+local L_TEXT_X   = 9
+local L_FIRST_Y  = 6
+
+-- Right column baseline
+local R_LED_X    = 37
+local R_TEXT_X   = 40
+local R_FIRST_Y  = 8
+
+-- Center RPS TRIP panel
+local RPS_W      = 17
+local RPS_H      = 4
+local RPS_Y      = 11
+local RPS_X      = math.floor(W / 2 - RPS_W / 2)
 
 ----------------------------
 -- STATIC BACKGROUND
 ----------------------------
 
 local function draw_frame()
-    -- outer border
-    mon.setBackgroundColor(BORDER_COL)
+    -- outer yellow border
+    mon.setBackgroundColor(BG_OUTER)
     mon.clear()
-    fill(2, 2, W - 1, H - 1, FRAME_BG)
 
-    -- title bar
-    fill(3, 3, W - 2, 4, FRAME_BG)
+    -- inner dark main area
+    fill(2, 2, W - 1, H - 1, BG_MAIN)
+
+    -- inner darker panel where content lives
+    fill(4, 4, W - 3, H - 3, BG_PANEL)
+
+    -- top title strip
+    fill(4, 4, W - 3, 5, BG_MAIN)
     local title_x = math.floor((W - #TITLE) / 2)
-    write_at(title_x, 3, TITLE, colors.white, FRAME_BG)
+    write_at(title_x, 4, TITLE, colors.white, BG_MAIN)
 end
 
 local function draw_static_labels()
-    mon.setTextColor(colors.white)
+    -- left labels
+    local y = L_FIRST_Y
+    write_at(L_TEXT_X, y, "STATUS",    colors.white, BG_PANEL); y = y + 2
+    write_at(L_TEXT_X, y, "HEARTBEAT", colors.white, BG_PANEL); y = y + 2
+    write_at(L_TEXT_X, y, "REACTOR",   colors.white, BG_PANEL); y = y + 2
+    write_at(L_TEXT_X, y, "MODEM (1)", colors.white, BG_PANEL); y = y + 2
+    write_at(L_TEXT_X, y, "NETWORK",   colors.white, BG_PANEL)
 
-    -- left group
-    local y = L_BASE_Y
-    write_at(L_BASE_X + 3, y, "STATUS",    colors.white, FRAME_BG); y = y + 2
-    write_at(L_BASE_X + 3, y, "HEARTBEAT", colors.white, FRAME_BG); y = y + 2
-    write_at(L_BASE_X + 3, y, "REACTOR",   colors.white, FRAME_BG); y = y + 2
-    write_at(L_BASE_X + 3, y, "MODEM (1)", colors.white, FRAME_BG); y = y + 2
-    write_at(L_BASE_X + 3, y, "NETWORK",   colors.white, FRAME_BG)
+    -- centre "RPS TRIP" caption above the box
+    write_at(RPS_X + math.floor((RPS_W - #"RPS TRIP") / 2), RPS_Y - 1,
+             "RPS TRIP", colors.white, BG_PANEL)
 
-    -- center label
-    write_at(math.floor(W / 2) - 3, CENTER_Y - 1, "RPS TRIP", colors.white, FRAME_BG)
+    -- right labels
+    local y2 = R_FIRST_Y
+    write_at(R_TEXT_X, y2, "MANUAL",    colors.white, BG_PANEL); y2 = y2 + 2
+    write_at(R_TEXT_X, y2, "AUTOMATIC", colors.white, BG_PANEL); y2 = y2 + 3
 
-    -- right group
-    local x  = R_BASE_X
-    local y2 = R_BASE_Y
-    write_at(x + 3, y2, "MANUAL",    colors.white, FRAME_BG); y2 = y2 + 2
-    write_at(x + 3, y2, "AUTOMATIC", colors.white, FRAME_BG); y2 = y2 + 3
+    write_at(R_TEXT_X, y2, "HI DAMAGE", colors.white, BG_PANEL); y2 = y2 + 2
+    write_at(R_TEXT_X, y2, "HI TEMP",   colors.white, BG_PANEL); y2 = y2 + 3
 
-    write_at(x + 3, y2, "HI DAMAGE", colors.white, FRAME_BG); y2 = y2 + 2
-    write_at(x + 3, y2, "HI TEMP",   colors.white, FRAME_BG); y2 = y2 + 3
+    write_at(R_TEXT_X, y2, "LO FUEL",   colors.white, BG_PANEL); y2 = y2 + 2
+    write_at(R_TEXT_X, y2, "HI WASTE",  colors.white, BG_PANEL); y2 = y2 + 3
 
-    write_at(x + 3, y2, "LO FUEL",   colors.white, FRAME_BG); y2 = y2 + 2
-    write_at(x + 3, y2, "HI WASTE",  colors.white, FRAME_BG); y2 = y2 + 3
+    write_at(R_TEXT_X, y2, "LO CCOOLANT", colors.white, BG_PANEL); y2 = y2 + 2
+    write_at(R_TEXT_X, y2, "HI HCOOLANT", colors.white, BG_PANEL)
+end
 
-    write_at(x + 3, y2, "LO CCOOLANT", colors.white, FRAME_BG); y2 = y2 + 2
-    write_at(x + 3, y2, "HI HCOOLANT", colors.white, FRAME_BG)
+local function draw_static_panels()
+    -- Left “group” bar background, just to visually echo the real PLC
+    fill(5, 5, 26, 16, BG_PANEL)
+
+    -- Right side background area
+    fill(34, 6, W - 4, 18, BG_PANEL)
+
+    -- RPS TRIP box (centre)
+    fill(RPS_X, RPS_Y, RPS_X + RPS_W - 1, RPS_Y + RPS_H - 1, BG_PANEL2)
 end
 
 local function draw_static()
     draw_frame()
+    draw_static_panels()
     draw_static_labels()
 end
 
@@ -171,54 +194,40 @@ end
 
 local function draw_leds()
     -- left LEDs
-    local x_led = L_BASE_X
-    local y = L_BASE_Y
+    local y = L_FIRST_Y
+    led(L_LED_X, y, state.reactor_ok, colors.lime, colors.red); y = y + 2
+    led(L_LED_X, y, state.heartbeat_ok, colors.lime, colors.red); y = y + 2
+    led(L_LED_X, y, state.reactor_ok, colors.lime, colors.red); y = y + 2
+    led(L_LED_X, y, state.modem_ok, colors.lime, colors.red);   y = y + 2
+    led(L_LED_X, y, state.network_ok, colors.lime, colors.red)
 
-    -- STATUS = reactor OK (powered and not tripped)
-    led(x_led, y, state.reactor_ok, colors.lime, colors.red); y = y + 2
-    -- HEARTBEAT
-    led(x_led, y, state.heartbeat_ok, colors.lime, colors.red); y = y + 2
-    -- REACTOR (mirror STATUS for now)
-    led(x_led, y, state.reactor_ok, colors.lime, colors.red); y = y + 2
-    -- MODEM
-    led(x_led, y, state.modem_ok, colors.lime, colors.red);   y = y + 2
-    -- NETWORK
-    led(x_led, y, state.network_ok, colors.lime, colors.red)
-
-    -- center RPS TRIP block
+    -- RPS TRIP centre block
     local trip_on = state.manualTrip or state.autoTrip
-    local box_w   = 13
-    local x1      = math.floor(W / 2 - box_w / 2)
-    local x2      = x1 + box_w - 1
-    local y1      = CENTER_Y
-    local y2      = CENTER_Y + 2
-    fill(x1, y1, x2, y2, trip_on and colors.red or colors.gray)
-    write_at(
-        x1 + 3, CENTER_Y + 1,
-        trip_on and "TRIPPED" or "NORMAL",
-        colors.white,
-        trip_on and colors.red or colors.gray
-    )
+    local box_bg  = trip_on and colors.red or BG_PANEL2
+    fill(RPS_X, RPS_Y, RPS_X + RPS_W - 1, RPS_Y + RPS_H - 1, box_bg)
+
+    local label = trip_on and "TRIPPED" or "NORMAL"
+    local lx    = RPS_X + math.floor((RPS_W - #label) / 2)
+    local ly    = RPS_Y + math.floor(RPS_H / 2)
+    write_at(lx, ly, label, colors.white, box_bg)
 
     -- right LEDs
-    local x_r_led = R_BASE_X
-    local yr      = R_BASE_Y
+    local y2 = R_FIRST_Y
+    led(R_LED_X, y2, state.manualTrip, colors.red, colors.gray); y2 = y2 + 2
+    led(R_LED_X, y2, state.autoTrip,   colors.red, colors.gray); y2 = y2 + 3
 
-    led(x_r_led, yr, state.manualTrip, colors.red, colors.gray); yr = yr + 2
-    led(x_r_led, yr, state.autoTrip,   colors.red, colors.gray); yr = yr + 3
+    led(R_LED_X, y2, state.hiDamage,   colors.red, colors.gray); y2 = y2 + 2
+    led(R_LED_X, y2, state.hiTemp,     colors.red, colors.gray); y2 = y2 + 3
 
-    led(x_r_led, yr, state.hiDamage,   colors.red, colors.gray); yr = yr + 2
-    led(x_r_led, yr, state.hiTemp,     colors.red, colors.gray); yr = yr + 3
+    led(R_LED_X, y2, state.loFuel,     colors.red, colors.gray); y2 = y2 + 2
+    led(R_LED_X, y2, state.hiWaste,    colors.red, colors.gray); y2 = y2 + 3
 
-    led(x_r_led, yr, state.loFuel,     colors.red, colors.gray); yr = yr + 2
-    led(x_r_led, yr, state.hiWaste,    colors.red, colors.gray); yr = yr + 3
-
-    led(x_r_led, yr, state.loCCoolant, colors.red, colors.gray); yr = yr + 2
-    led(x_r_led, yr, state.hiHCoolant, colors.red, colors.gray)
+    led(R_LED_X, y2, state.loCCoolant, colors.red, colors.gray); y2 = y2 + 2
+    led(R_LED_X, y2, state.hiHCoolant, colors.red, colors.gray)
 end
 
 ----------------------------
--- HEARTBEAT HANDLING
+-- HEARTBEAT & PACKETS
 ----------------------------
 
 local function update_heartbeat()
@@ -226,7 +235,6 @@ local function update_heartbeat()
         state.heartbeat_ok = false
         return
     end
-
     local now = os.clock()
     if now - last_heartbeat > HEARTBEAT_TIMEOUT then
         state.heartbeat_ok = false
@@ -236,10 +244,6 @@ local function update_heartbeat()
         state.network_ok   = true
     end
 end
-
-----------------------------
--- PACKET HANDLING
-----------------------------
 
 local function handle_status_packet(pkt)
     if type(pkt) ~= "table" then return end

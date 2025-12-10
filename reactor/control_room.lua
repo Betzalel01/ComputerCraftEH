@@ -6,7 +6,7 @@
 --------------------------
 -- CONFIG
 --------------------------
-local MODEM_SIDE      = "right"   -- side with modem on control-room PC
+local MODEM_SIDE      = "back"   -- side with modem on control-room PC
 local MONITOR_SIDE    = "top"     -- side with (advanced) monitor
 
 local REACTOR_CHANNEL = 100       -- must match reactor_core.lua

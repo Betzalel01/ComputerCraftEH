@@ -6,6 +6,7 @@
 --   * setBurnRate()
 --
 -- It listens for commands over a modem and enforces safety logic locally.
+-- Now also sends a heartbeat packet every HEARTBEAT_PERIOD seconds.
 
 --------------------------
 -- CONFIG
@@ -16,10 +17,11 @@ local REDSTONE_ACTIVATION_SIDE = "left"   -- side which actually enables reactor
 
 -- Rednet / channel setup
 local REACTOR_CHANNEL  = 100   -- channel this machine listens on
-local CONTROL_CHANNEL  = 101   -- channel it replies to
+local CONTROL_CHANNEL  = 101   -- channel it replies to (control room, panel, etc.)
 
--- Poll period
-local POLL_PERIOD      = 0.2   -- seconds between sensor/logic ticks
+-- Periods
+local SENSOR_POLL_PERIOD = 0.2   -- seconds between sensor/logic ticks
+local HEARTBEAT_PERIOD   = 10.0  -- seconds between heartbeat packets (CONFIGURABLE)
 
 -- Safety thresholds (only enforced if emergencyOn = true)
 local MAX_DAMAGE_PCT   = 5     -- SCRAM if damage > 5%
@@ -194,6 +196,14 @@ local function sendStatus(replyChannel)
   modem.transmit(replyChannel or CONTROL_CHANNEL, REACTOR_CHANNEL, msg)
 end
 
+local function sendHeartbeat()
+  local msg = {
+    type      = "heartbeat",
+    timestamp = os.clock(),
+  }
+  modem.transmit(CONTROL_CHANNEL, REACTOR_CHANNEL, msg)
+end
+
 local function handleCommand(cmd, data, replyChannel)
   if cmd == "scram" then
     doScram("Remote SCRAM")
@@ -266,20 +276,29 @@ readSensors() -- populate sensors, including reactor max burn
 term.clear()
 log("Reactor core online. Listening on channel "..REACTOR_CHANNEL)
 
-local timerId = os.startTimer(POLL_PERIOD)
+local sensorTimerId   = os.startTimer(SENSOR_POLL_PERIOD)
+local heartbeatTimerId = os.startTimer(HEARTBEAT_PERIOD)
 
 while true do
   local ev, p1, p2, p3, p4 = os.pullEvent()
 
-  if ev == "timer" and p1 == timerId then
-    readSensors()
-    applyControl()
-    timerId = os.startTimer(POLL_PERIOD)
+  if ev == "timer" then
+    if p1 == sensorTimerId then
+      readSensors()
+      applyControl()
+      sensorTimerId = os.startTimer(SENSOR_POLL_PERIOD)
+
+    elseif p1 == heartbeatTimerId then
+      sendHeartbeat()
+      heartbeatTimerId = os.startTimer(HEARTBEAT_PERIOD)
+    end
 
   elseif ev == "modem_message" then
     local side, ch, reply, msg = p1, p2, p3, p4
-    if ch == REACTOR_CHANNEL and type(msg) == "table" and msg.type == "cmd" then
-      handleCommand(msg.cmd, msg.data, reply)
+    if ch == REACTOR_CHANNEL and type(msg) == "table" then
+      if msg.type == "cmd" or msg.type == "command" then
+        handleCommand(msg.cmd, msg.data, reply)
+      end
     end
 
   elseif ev == "key" and p1 == keys.q then
@@ -287,4 +306,5 @@ while true do
     break
   end
 end
+
 

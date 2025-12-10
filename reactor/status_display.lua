@@ -6,14 +6,14 @@
 ---------------------------
 -- CONFIG
 ---------------------------
-local MODEM_SIDE    = "back"   -- change if your modem is on a different side
+local MODEM_SIDE    = "right"   -- change if your modem is on a different side
 local MONITOR_SIDE  = "top"     -- per your setup
 local CORE_CHANNEL  = 100       -- MUST match reactor_core & control_room scripts
 local PANEL_CHANNEL = 101       -- reply channel for status / heartbeat
 
 -- Polling and timing
 local STATUS_POLL_INTERVAL = 0.5   -- seconds between status requests
-local HEARTBEAT_TIMEOUT    = 15.0  -- seconds since last heartbeat before fault (>= core's period)
+local HEARTBEAT_TIMEOUT    = 15.0  -- seconds since last heartbeat before fault
 local BLINK_PERIOD         = 0.5   -- seconds per blink phase
 
 ---------------------------
@@ -33,6 +33,48 @@ mon.setTextColor(colors.white)
 mon.clear()
 
 local mw, mh = mon.getSize()
+
+---------------------------
+-- LAYOUT (dynamic)
+---------------------------
+-- Longest right-column label: "LO CCOOLANT" (11 chars)
+local RIGHT_LABEL_MAXLEN = 11
+
+-- Left & right column X positions (guarantee labels fit on screen)
+local colLeftX  = 4
+local colRightX = mw - RIGHT_LABEL_MAXLEN - 2
+if colRightX <= colLeftX + 4 then
+    -- If the screen is extremely narrow, push left column right a bit.
+    colLeftX  = 2
+    colRightX = mw - RIGHT_LABEL_MAXLEN - 1
+end
+
+-- Lamp X positions (one space before labels)
+local leftLampX  = colLeftX - 2
+local rightLampX = colRightX - 2
+
+-- RPS / button area: centered between columns
+local midX1 = colLeftX + 10
+local midX2 = colRightX - 2
+if midX2 <= midX1 + 10 then
+    -- Fallback if monitor is very narrow
+    midX1 = math.floor(mw / 2) - 8
+    midX2 = math.floor(mw / 2) + 8
+end
+
+-- SCRAM / RESET button boxes inside middle region
+local btnWidth = 7
+local gap      = 2
+local totalW   = btnWidth * 2 + gap
+local center   = math.floor((midX1 + midX2) / 2)
+
+local scramX1  = center - math.floor(totalW / 2)
+local scramX2  = scramX1 + btnWidth - 1
+local resetX1  = scramX2 + 1 + gap
+local resetX2  = resetX1 + btnWidth - 1
+
+local btnScram = { x1 = scramX1, y1 = 9,  x2 = scramX2, y2 = 11 }
+local btnReset = { x1 = resetX1, y1 = 9,  x2 = resetX2, y2 = 11 }
 
 ---------------------------
 -- STATE
@@ -68,9 +110,6 @@ local function sendCommand(cmd, payload)
     sendCore(msg)
 end
 
----------------------------
--- LAYOUT HELPERS
----------------------------
 local function centerText(y, text)
     local x = math.floor((mw - #text) / 2) + 1
     mon.setCursorPos(x, y)
@@ -97,25 +136,16 @@ local function drawLamp(x, y, isOn, colorOn)
     mon.setBackgroundColor(colors.gray)
 end
 
-local function drawLampLabel(x, y, isOn, colorOn, label)
-    drawLamp(x, y, isOn, colorOn)
-    mon.setCursorPos(x + 2, y)
+local function drawLampLabel(lampX, y, isOn, colorOn, labelX, label)
+    drawLamp(lampX, y, isOn, colorOn)
+    mon.setCursorPos(labelX, y)
     mon.write(label)
 end
-
----------------------------
--- BUTTON DEFINITIONS
----------------------------
-local btnScram = { x1 = 20, y1 = 9,  x2 = 26, y2 = 11 }
-local btnReset = { x1 = 28, y1 = 9,  x2 = 35, y2 = 11 }
 
 local function inBox(box, x, y)
     return x >= box.x1 and x <= box.x2 and y >= box.y1 and y <= box.y2
 end
 
----------------------------
--- STATUS INTERPRETATION
----------------------------
 local function hasFreshStatus()
     return lastStatus and (now() - lastStatusTime) < (3 * STATUS_POLL_INTERVAL)
 end
@@ -129,8 +159,6 @@ local function classifyTrip(prev, curr)
         lastTripSource = "none"
         return
     end
-
-    -- If we weren't tripped before and are now, classify this trip.
     if not prev or not prev.scramLatched then
         local dtCmd = now() - (lastCommandTime or 0)
         if lastCommand == "scram" and dtCmd < 2.0 then
@@ -154,12 +182,12 @@ local function drawStaticFrame()
     centerText(2, "FISSION REACTOR PLC - UNIT 1")
 
     drawBox(2, 4, mw - 1, mh - 1, colors.gray)
-    drawBox(19, 5, mw - 2, mh - 3, colors.gray)
 
-    -- RPS TRIP box
-    drawBox(20, 5, mw - 4, 8, colors.gray)
+    -- Middle block and RPS area
+    drawBox(midX1, 5, midX2, mh - 3, colors.gray)
+    drawBox(midX1, 5, midX2, 8, colors.gray)
 
-    -- Button boxes
+    -- SCRAM / RESET buttons
     drawBox(btnScram.x1, btnScram.y1, btnScram.x2, btnScram.y2, colors.red)
     drawBox(btnReset.x1, btnReset.y1, btnReset.x2, btnReset.y2, colors.yellow)
 
@@ -205,29 +233,28 @@ local function drawDynamic()
     local rpsBlinkOn = scram and blinkOn
 
     -- Left column indicators
-    drawLampLabel(4,  5, statusOk and poweredOn, colors.lime, "STATUS")
+    drawLampLabel(leftLampX,  5, statusOk and poweredOn, colors.lime, colLeftX, "STATUS")
 
     if not heartbeatOk then
-        drawLampLabel(4, 6, true, colors.red, "HEARTBEAT")
+        drawLampLabel(leftLampX, 6, true, colors.red, colLeftX, "HEARTBEAT")
     else
-        drawLampLabel(4, 6, heartbeatBlinkOn, colors.lime, "HEARTBEAT")
+        drawLampLabel(leftLampX, 6, heartbeatBlinkOn, colors.lime, colLeftX, "HEARTBEAT")
     end
 
-    drawLampLabel(4, 7, poweredOn, colors.green, "REACTOR")
-    drawLampLabel(4, 8, lastStatus ~= nil, colors.green, "MODEM (1)")
-    drawLampLabel(4, 9, statusOk, statusOk and colors.green or colors.red, "NETWORK")
+    drawLampLabel(leftLampX, 7, poweredOn, colors.green, colLeftX, "REACTOR")
+    drawLampLabel(leftLampX, 8, lastStatus ~= nil, colors.green, colLeftX, "MODEM (1)")
+    drawLampLabel(leftLampX, 9, statusOk, statusOk and colors.green or colors.red, colLeftX, "NETWORK")
 
     -- Center RPS TRIP lamp
-    drawLamp(21, 6, rpsBlinkOn, colors.red)
+    drawLamp(midX1 + 1, 6, rpsBlinkOn, colors.red)
 
     -- Right column indicators
     local manualOn = (lastTripSource == "manual")
     local autoOn   = (lastTripSource == "auto")
 
-    drawLampLabel(mw - 18, 5, manualOn, colors.red, "MANUAL")
-    drawLampLabel(mw - 18, 6, autoOn,   colors.red, "AUTOMATIC")
+    drawLampLabel(rightLampX, 5, manualOn, colors.red, colRightX, "MANUAL")
+    drawLampLabel(rightLampX, 6, autoOn,   colors.red, colRightX, "AUTOMATIC")
 
-    -- Advisory thresholds
     local hiDamage   = damage > 0.0
     local hiTemp     = temp >= 1200
     local loFuel     = fuelFrac < 0.10
@@ -235,14 +262,14 @@ local function drawDynamic()
     local loCoolant  = coolFrac < 0.20
     local hiHcoolant = heatedFrac > 0.95
 
-    drawLampLabel(mw - 18, 8,  hiDamage,   colors.red, "HI DAMAGE")
-    drawLampLabel(mw - 18, 9,  hiTemp,     colors.red, "HI TEMP")
+    drawLampLabel(rightLampX, 8,  hiDamage,   colors.red, colRightX, "HI DAMAGE")
+    drawLampLabel(rightLampX, 9,  hiTemp,     colors.red, colRightX, "HI TEMP")
 
-    drawLampLabel(mw - 18, 11, loFuel,     colors.red, "LO FUEL")
-    drawLampLabel(mw - 18, 12, hiWaste,    colors.red, "HI WASTE")
+    drawLampLabel(rightLampX, 11, loFuel,     colors.red, colRightX, "LO FUEL")
+    drawLampLabel(rightLampX, 12, hiWaste,    colors.red, colRightX, "HI WASTE")
 
-    drawLampLabel(mw - 18, 14, loCoolant,  colors.red, "LO CCOOLANT")
-    drawLampLabel(mw - 18, 15, hiHcoolant, colors.red, "HI HCOOLANT")
+    drawLampLabel(rightLampX, 14, loCoolant,  colors.red, colRightX, "LO CCOOLANT")
+    drawLampLabel(rightLampX, 15, hiHcoolant, colors.red, colRightX, "HI HCOOLANT")
 end
 
 local function redrawAll()
@@ -315,3 +342,4 @@ end
 ---------------------------
 redrawAll()
 parallel.waitForAny(statusPollLoop, blinkLoop, eventLoop)
+

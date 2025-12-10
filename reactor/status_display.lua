@@ -1,267 +1,271 @@
--- status_display.lua
--- Standalone Fission Reactor PLC front-panel clone (display only)
+-- reactor/status_display.lua
+-- Fission Reactor PLC front panel clone using cc-mek-scada graphics
 -- Monitor is assumed to be attached on TOP of the computer.
 
 -------------------------------------------------------
--- monitor / term setup
+-- monitor setup
 -------------------------------------------------------
 local mon = peripheral.wrap("top")
 if not mon then
-    error("No monitor found on top side")
+    error("No monitor found on top")
 end
 
+-- the SCADA UI uses text scale 0.5 on large monitors
 mon.setTextScale(0.5)
-local oldTerm = term.current()
+
+-- redirect term to the monitor while we build the panel
+local native = term.current()
 term.redirect(mon)
 
-local w, h = term.getSize()
+-------------------------------------------------------
+-- graphics / style imports
+-------------------------------------------------------
+local style      = require("reactor-plc.panel.style")
+
+local core       = require("graphics.core")
+local DisplayBox = require("graphics.elements.DisplayBox")
+local Div        = require("graphics.elements.Div")
+local Rectangle  = require("graphics.elements.Rectangle")
+local TextBox    = require("graphics.elements.TextBox")
+
+local LED        = require("graphics.elements.indicators.LED")
+local LEDPair    = require("graphics.elements.indicators.LEDPair")
+local RGBLED     = require("graphics.elements.indicators.RGBLED")
+
+local ALIGN  = core.ALIGN
+local cpair  = core.cpair
+local border = core.border
 
 -------------------------------------------------------
--- colors & simple drawing helpers
+-- choose theme / color mode
 -------------------------------------------------------
-local COL_BG        = colors.gray
-local COL_FRAME     = colors.lightGray
-local COL_HEADER_BG = colors.gray
-local COL_TEXT      = colors.white
-local COL_TEXT_DIM  = colors.lightGray
-local COL_LED_OFF   = colors.gray
-local COL_LED_RED   = colors.red
-local COL_LED_GRN   = colors.lime
-local COL_LED_YEL   = colors.yellow
-local COL_PANEL_DK  = colors.gray
-local COL_PANEL_LT  = colors.lightGray
+-- This matches the default SCADA front panel look.
+-- If you want the basalt theme later, we can change style.set_theme().
+if style.set_theme then
+    local themes = require("graphics.themes")
+    style.set_theme(themes.FP_THEME.SANDSTONE, themes.COLOR_MODE.STANDARD)
+end
 
-local function filled_rect(x, y, rw, rh, col)
-    term.setBackgroundColor(col)
-    for yy = y, y + rh - 1 do
-        term.setCursorPos(x, yy)
-        term.write(string.rep(" ", rw))
+local ind_grn = style.ind_grn or cpair(colors.green, colors.green_off or colors.black)
+local ind_red = style.ind_red or cpair(colors.red, colors.red_off or colors.black)
+
+-------------------------------------------------------
+-- build the front panel
+-------------------------------------------------------
+local function build_panel()
+    local term_w, term_h = term.getSize()
+
+    -- root display box: use the full monitor
+    local panel = DisplayBox{ window = term.current(), fg_bg = style.fp.root }
+
+    ---------------------------------------------------
+    -- HEADER
+    ---------------------------------------------------
+    TextBox{
+        parent    = panel,
+        y         = 1,
+        text      = "FISSION REACTOR PLC - UNIT 1",
+        alignment = ALIGN.CENTER,
+        fg_bg     = style.theme.header
+    }
+
+    ---------------------------------------------------
+    -- LEFT COLUMN: STATUS / HEARTBEAT / REACTOR / MODEM / NETWORK
+    ---------------------------------------------------
+    local system = Div{ parent = panel, width = 14, height = 18, x = 2, y = 3 }
+
+    local led_status    = LED{ parent = system, label = "STATUS",
+                               colors = cpair(colors.red, colors.green) }
+    local led_heartbeat = LED{ parent = system, label = "HEARTBEAT",
+                               colors = ind_grn }
+    system.line_break()
+
+    -- in this static version, leave STATUS red and HEARTBEAT off
+    led_status.update(false)       -- "degraded" false => red in original
+    led_heartbeat.update(false)
+
+    local led_reactor = LEDPair{
+        parent = system, label = "REACTOR",
+        off    = colors.red, c1 = colors.yellow, c2 = colors.green
+    }
+    local led_modem   = LED{ parent = system, label = "MODEM",
+                             colors = ind_grn }
+
+    -- leave reactor & modem in "off" state for now
+    led_reactor.update(1)
+    led_modem.update(false)
+
+    -- network indicator
+    if not style.colorblind then
+        local net = RGBLED{
+            parent = system,
+            label  = "NETWORK",
+            colors = cpair(colors.green, style.ind_bkg),
+            off    = style.ind_bkg
+        }
+        -- disconnected as default
+        net.update(1)       -- PANEL_LINK_STATE.DISCONNECTED
+    else
+        local nt_lnk = LEDPair{
+            parent = system, label = "NT LINKED",
+            off    = style.ind_bkg, c1 = colors.red, c2 = colors.green
+        }
+        local nt_ver = LEDPair{
+            parent = system, label = "NT VERSION",
+            off    = style.ind_bkg, c1 = colors.red, c2 = colors.green
+        }
+        local nt_col = LED{
+            parent = system, label = "NT COLLISION",
+            colors = ind_red
+        }
+        nt_lnk.update(1)
+        nt_ver.update(3)
+        nt_col.update(false)
     end
-end
 
-local function frame_rect(x, y, rw, rh, borderCol, fillCol)
-    if fillCol then
-        filled_rect(x, y, rw, rh, fillCol)
+    system.line_break()
+
+    -- We omit the RT MAIN / RPS / COMMS / SPCTL row and FW/NT footer
+    -- on purpose; you said you don’t want those.
+
+    ---------------------------------------------------
+    -- CENTRAL STATUS AREA (RCT ACTIVE, EMER COOLANT)
+    ---------------------------------------------------
+    local status = Div{ parent = panel, width = term_w - 32, height = 18, x = 17, y = 3 }
+
+    local led_active = LED{
+        parent = status, x = 2, width = 12,
+        label  = "RCT ACTIVE",
+        colors = ind_grn
+    }
+    -- default: reactor inactive
+    led_active.update(false)
+
+    if style.fp and style.fp.highlight_box then
+        -- EMER COOLANT LED, same as original pattern
+        local emer_cool = LED{
+            parent = status, x = 2, width = 14,
+            label  = "EMER COOLANT",
+            colors = cpair(colors.yellow, colors.yellow_off or colors.black)
+        }
+        emer_cool.update(false)
     end
-    term.setBackgroundColor(borderCol)
-    -- top
-    term.setCursorPos(x, y)
-    term.write(string.rep(" ", rw))
-    -- bottom
-    term.setCursorPos(x, y + rh - 1)
-    term.write(string.rep(" ", rw))
-    -- sides
-    for yy = y + 1, y + rh - 2 do
-        term.setCursorPos(x, yy)
-        term.write(" ")
-        term.setCursorPos(x + rw - 1, yy)
-        term.write(" ")
-    end
-end
 
-local function write_text(x, y, s, fg, bg)
-    term.setTextColor(fg or COL_TEXT)
-    term.setBackgroundColor(bg or COL_BG)
-    term.setCursorPos(x, y)
-    term.write(s)
-end
+    ---------------------------------------------------
+    -- RPS TRIP BOX + SCRAM/RESET LABELS (non-interactive)
+    ---------------------------------------------------
+    local s_hi_box = style.theme.highlight_box
 
-local function center_text(y, s, fg, bg)
-    local x = math.floor((w - #s) / 2) + 1
-    write_text(x, y, s, fg, bg)
-end
+    local trip_box = Rectangle{
+        parent = status,
+        width  = term_w - 32,
+        height = 3,
+        x      = 1,
+        y      = 6,
+        border = border(1, s_hi_box.bkg),
+        thin   = true,
+        fg_bg  = s_hi_box
+    }
 
--- LED: 2x1 colored block + label beginning at x+3
-local function draw_led(x, y, label, col)
-    term.setBackgroundColor(col)
-    term.setCursorPos(x, y)
-    term.write("  ")
-    term.setBackgroundColor(COL_BG)
-    term.setTextColor(COL_TEXT)
-    term.setCursorPos(x + 3, y)
-    term.write(label)
-end
+    TextBox{
+        parent    = trip_box,
+        x         = 2,
+        y         = 2,
+        text      = "RPS TRIP",
+        alignment = ALIGN.CENTER,
+        fg_bg     = s_hi_box
+    }
 
--- single colored bullet only (no label)
-local function led_only(x, y, col)
-    term.setBackgroundColor(col)
-    term.setCursorPos(x, y)
-    term.write("  ")
-end
+    -- Draw SCRAM / RESET blocks but do not bind any buttons.
+    local scram_box = Rectangle{
+        parent = status,
+        width  = 8,
+        height = 3,
+        x      = 4,
+        y      = 10,
+        border = border(1, colors.red),
+        thin   = true,
+        fg_bg  = cpair(colors.white, colors.red)
+    }
+    TextBox{ parent = scram_box, text = "SCRAM", alignment = ALIGN.CENTER }
 
--------------------------------------------------------
--- static frame & layout
--------------------------------------------------------
-local function draw_static_frame()
-    term.setBackgroundColor(COL_BG)
-    term.clear()
+    local reset_box = Rectangle{
+        parent = status,
+        width  = 8,
+        height = 3,
+        x      = 18,
+        y      = 10,
+        border = border(1, colors.yellow),
+        thin   = true,
+        fg_bg  = cpair(colors.black, colors.yellow)
+    }
+    TextBox{ parent = reset_box, text = "RESET", alignment = ALIGN.CENTER }
 
-    -- outer frame
-    frame_rect(1, 1, w, h, COL_FRAME, COL_BG)
+    ---------------------------------------------------
+    -- RIGHT RPS LIST: MANUAL / AUTO / HI DAMAGE / HI TEMP / etc.
+    ---------------------------------------------------
+    local rps = Rectangle{
+        parent = panel,
+        width  = 16,
+        height = 16,
+        x      = term_w - 15,
+        y      = 3,
+        border = border(1, s_hi_box.bkg),
+        thin   = true,
+        fg_bg  = s_hi_box
+    }
 
-    -- main inner background
-    filled_rect(2, 2, w - 2, h - 2, COL_BG)
+    local led_manual = LED{ parent = rps, label = "MANUAL",    colors = ind_red }
+    local led_auto   = LED{ parent = rps, label = "AUTOMATIC", colors = ind_red }
+    local led_tmo    = LED{ parent = rps, label = "TIMEOUT",   colors = ind_red }
+    local led_plc    = LED{ parent = rps, label = "PLC FAULT", colors = ind_red }
+    local led_rct    = LED{ parent = rps, label = "RCT FAULT", colors = ind_red }
 
-    -- header band
-    filled_rect(3, 2, w - 4, 1, COL_HEADER_BG)
-    center_text(2, "FISSION REACTOR PLC - UNIT 1", COL_TEXT, COL_HEADER_BG)
+    rps.line_break()
 
-    -- left “system” background block (for appearance)
-    filled_rect(3, 4, 24, 16, COL_BG)
+    local led_dmg    = LED{ parent = rps, label = "HI DAMAGE", colors = ind_red }
+    local led_temp   = LED{ parent = rps, label = "HI TEMP",   colors = ind_red }
 
-    -- middle top reactor status panel (RCT ACTIVE / EMER COOLANT)
-    filled_rect(29, 4, 25, 3, COL_PANEL_DK)
+    rps.line_break()
 
-    -- RPS TRIP banner area
-    filled_rect(29, 7, 25, 3, COL_PANEL_LT)
+    local led_lofuel = LED{ parent = rps, label = "LO FUEL",   colors = ind_red }
+    local led_waste  = LED{ parent = rps, label = "HI WASTE",  colors = ind_red }
 
-    -- SCRAM / RESET panel
-    filled_rect(29, 10, 25, 4, COL_PANEL_LT)
+    rps.line_break()
 
-    -- right RPS fault list area
-    filled_rect(37, 4, 18, 16, COL_PANEL_DK)
+    local led_locool = LED{ parent = rps, label = "LO CCOOLANT", colors = ind_red }
+    local led_hicool = LED{ parent = rps, label = "HI HCOOLANT", colors = ind_red }
 
-    -- footer version text
-    write_text(4, h - 1, "FW: v1.9.1", COL_TEXT_DIM, COL_BG)
-    write_text(4, h,     "NT: v3.0.8", COL_TEXT_DIM, COL_BG)
-end
+    -- all RPS causes default OFF (no trip)
+    local leds = {
+        led_manual, led_auto,  led_tmo,    led_plc,    led_rct,
+        led_dmg,    led_temp,  led_lofuel, led_waste,
+        led_locool, led_hicool
+    }
+    for _, l in ipairs(leds) do l.update(false) end
 
--------------------------------------------------------
--- dynamic contents (LEDs etc.)
--------------------------------------------------------
-local state = {
-    heartbeat_on  = false,
-    rps_trip      = false,
-    rct_active    = false,
-    emer_coolant  = false,
-
-    -- left group
-    status_on     = true,
-    reactor_on    = true,
-    modem_on      = true,
-    network_on    = false,
-    rt_main_on    = true,
-    rt_rps_on     = true,
-    rt_tx_on      = true,
-    rt_rx_on      = true,
-    rt_spctl_on   = true,
-
-    -- RPS cause flags (for now only some demo ones)
-    cause_manual  = false,
-    cause_auto    = true,
-    cause_timeout = false,
-    cause_plcflt  = false,
-    cause_rctflt  = true,
-    cause_damage  = false,
-    cause_temp    = false,
-    cause_lofuel  = false,
-    cause_waste   = false,
-    cause_locool  = false,
-    cause_hicool  = false,
-}
-
-local function draw_contents()
-    -- LEFT COLUMN --------------------------------------------------------
-    local lx = 5
-    local y  = 5
-
-    draw_led(lx, y, "STATUS",      state.status_on   and COL_LED_GRN or COL_LED_RED)
-    y = y + 1
-    draw_led(lx, y, "HEARTBEAT",   state.heartbeat_on and COL_LED_GRN or COL_LED_OFF)
-    y = y + 1
-    draw_led(lx, y, "REACTOR",     state.reactor_on  and COL_LED_YEL or COL_LED_OFF)
-    y = y + 1
-    draw_led(lx, y, "MODEM (1)",   state.modem_on    and COL_LED_GRN or COL_LED_OFF)
-    y = y + 1
-    draw_led(lx, y, "NETWORK",     state.network_on  and COL_LED_GRN or COL_LED_OFF)
-
-    y = y + 1
-    draw_led(lx, y, "RT MAIN",     state.rt_main_on  and COL_LED_GRN or COL_LED_OFF)
-    y = y + 1
-    draw_led(lx, y, "RT RPS",      state.rt_rps_on   and COL_LED_GRN or COL_LED_OFF)
-    y = y + 1
-    draw_led(lx, y, "RT COMMS TX", state.rt_tx_on    and COL_LED_GRN or COL_LED_OFF)
-    y = y + 1
-    draw_led(lx, y, "RT COMMS RX", state.rt_rx_on    and COL_LED_GRN or COL_LED_OFF)
-    y = y + 1
-    draw_led(lx, y, "RT SPCTL",    state.rt_spctl_on and COL_LED_GRN or COL_LED_OFF)
-
-    -- MIDDLE TOP (RCT ACTIVE / EMER COOLANT) ----------------------------
-    local mx = 31
-    local my = 5
-    draw_led(mx,   my,   "RCT ACTIVE",   state.rct_active   and COL_LED_GRN or COL_LED_OFF)
-    draw_led(mx,   my+1, "EMER COOLANT", state.emer_coolant and COL_LED_YEL or COL_LED_OFF)
-
-    -- RPS TRIP banner ----------------------------------------------------
-    center_text(8, "RPS TRIP", COL_TEXT, COL_PANEL_LT)
-    -- small LED at banner left
-    led_only(30, 8, state.rps_trip and COL_LED_RED or COL_LED_OFF)
-
-    -- SCRAM / RESET buttons (visual only) -------------------------------
-    local btnW = 9
-    local btnH = 3
-    local totalW = btnW * 2 + 3
-    local startX = math.floor((w - totalW) / 2) + 1
-    local btnY = 11
-
-    -- SCRAM
-    filled_rect(startX, btnY, btnW, btnH, COL_LED_RED)
-    write_text(startX + math.floor((btnW - 5)/2), btnY + 1, "SCRAM", colors.black, COL_LED_RED)
-
-    -- RESET
-    local resetX = startX + btnW + 3
-    filled_rect(resetX, btnY, btnW, btnH, COL_LED_YEL)
-    write_text(resetX + math.floor((btnW - 5)/2), btnY + 1, "RESET", colors.black, COL_LED_YEL)
-
-    -- RIGHT COLUMN (RPS causes) -----------------------------------------
-    local rx = 39
-    local ry = 5
-
-    draw_led(rx, ry,   "MANUAL",      state.cause_manual  and COL_LED_RED or COL_LED_OFF)
-    ry = ry + 1
-    draw_led(rx, ry,   "AUTOMATIC",   state.cause_auto    and COL_LED_RED or COL_LED_OFF)
-    ry = ry + 1
-    draw_led(rx, ry,   "TIMEOUT",     state.cause_timeout and COL_LED_RED or COL_LED_OFF)
-    ry = ry + 1
-    draw_led(rx, ry,   "PLC FAULT",   state.cause_plcflt  and COL_LED_RED or COL_LED_OFF)
-    ry = ry + 1
-    draw_led(rx, ry,   "RCT FAULT",   state.cause_rctflt  and COL_LED_RED or COL_LED_OFF)
-    ry = ry + 2
-    draw_led(rx, ry,   "HI DAMAGE",   state.cause_damage  and COL_LED_RED or COL_LED_OFF)
-    ry = ry + 1
-    draw_led(rx, ry,   "HI TEMP",     state.cause_temp    and COL_LED_RED or COL_LED_OFF)
-    ry = ry + 2
-    draw_led(rx, ry,   "LO FUEL",     state.cause_lofuel  and COL_LED_RED or COL_LED_OFF)
-    ry = ry + 1
-    draw_led(rx, ry,   "HI WASTE",    state.cause_waste   and COL_LED_RED or COL_LED_OFF)
-    ry = ry + 2
-    draw_led(rx, ry,   "LO CCOOLANT", state.cause_locool  and COL_LED_RED or COL_LED_OFF)
-    ry = ry + 1
-    draw_led(rx, ry,   "HI HCOOLANT", state.cause_hicool  and COL_LED_RED or COL_LED_OFF)
+    return panel
 end
 
 -------------------------------------------------------
--- initial draw
+-- MAIN
 -------------------------------------------------------
-draw_static_frame()
-draw_contents()
+local panel = build_panel()
 
--------------------------------------------------------
--- simple heartbeat animation loop
--- (purely cosmetic for now; Ctrl+T to stop)
--------------------------------------------------------
-local heartbeat_period = 0.8  -- seconds
+-- draw once
+panel.redraw()
 
-local timer = os.startTimer(heartbeat_period)
-
+-- keep the program alive so the GUI stays visible
+-- (no event handling needed yet – this is display-only)
 while true do
-    local ev, id = os.pullEvent()
-    if ev == "timer" and id == timer then
-        state.heartbeat_on = not state.heartbeat_on
-        draw_contents()
-        timer = os.startTimer(heartbeat_period)
-    end
+    os.pullEvent("terminate")
+    -- allow CTRL+T to close
+    break
 end
 
--- (term is intentionally left redirected to the monitor
---  while the panel is running)
+-- restore original terminal when exiting
+term.redirect(native)
+term.setBackgroundColor(colors.black)
+term.setTextColor(colors.white)
+term.clear()
+term.setCursorPos(1, 1)

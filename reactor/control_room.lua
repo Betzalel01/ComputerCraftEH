@@ -22,16 +22,19 @@ modem.open(CONTROL_CHANNEL)
 local mon = peripheral.wrap(MONITOR_SIDE)
 local monLines    = {}
 local monMaxLines = 0
+local monWidth    = 0
 
 if mon then
   if mon.setTextScale then mon.setTextScale(1) end  -- larger text
   local w, h = mon.getSize()
+  monWidth    = w
   monMaxLines = h
 end
 
 --------------------------
 -- MONITOR LOGGING
 --------------------------
+
 local function monRedraw()
   if not mon then return end
   mon.clear()
@@ -43,20 +46,40 @@ local function monRedraw()
   end
 end
 
+-- word-wrap a single logical line to the monitor width
 local function monLog(text)
   if not mon then return end
   text = tostring(text or "")
-  local w, h = mon.getSize()
-  if #text > w then
-    text = text:sub(1, w)
+
+  if monWidth <= 0 then
+    -- fallback: no width info, just push as-is
+    table.insert(monLines, text)
+  else
+    local line = text
+    while #line > monWidth do
+      -- try to break at last space within width
+      local breakPos = line:sub(1, monWidth):match(".*() ")
+      if not breakPos or breakPos < 1 then
+        breakPos = monWidth
+      end
+      table.insert(monLines, line:sub(1, breakPos))
+      -- trim leading spaces on the remainder
+      line = line:sub(breakPos + 1):gsub("^%s+", "")
+    end
+    table.insert(monLines, line)
   end
-  table.insert(monLines, text)
+
   if monMaxLines > 0 then
     while #monLines > monMaxLines do
       table.remove(monLines, 1)
     end
   end
   monRedraw()
+end
+
+local function monSpacer()
+  if not mon then return end
+  monLog("")  -- empty line as visual separator
 end
 
 --------------------------
@@ -121,6 +144,7 @@ local function commandWithConfirm(description, sendFn, confirmFn)
       if s then
         printStatusToMonitor(s)
         if not confirmFn or confirmFn(s) then
+          monSpacer()
           return s
         end
       else
@@ -131,6 +155,7 @@ local function commandWithConfirm(description, sendFn, confirmFn)
     monLog("[WARN] "..description.." not confirmed, retrying ("..attempt.."/3)")
   end
   monLog("[ERROR] "..description.." failed after retries")
+  monSpacer()
   return nil
 end
 
@@ -154,6 +179,7 @@ local _, menuBottomY = term.getCursorPos()
 local INPUT_Y = menuBottomY + 1  -- fixed line for all inputs
 
 monLog("Control client started")
+monSpacer()
 
 local function readCleared(prompt)
   term.setCursorPos(1, INPUT_Y)
@@ -218,12 +244,15 @@ while true do
       commandWithConfirm("set burn", function() end, function(_) return true end)
     else
       monLog("[INPUT] invalid burn value")
+      monSpacer()
     end
 
   elseif k == "5" then
+    monLog("[CMD] status")
     sendCmd("request_status")
     local s = waitStatus(2)
     printStatusToMonitor(s)
+    monSpacer()
 
   elseif k == "6" then
     commandWithConfirm(
@@ -237,4 +266,3 @@ while true do
     break
   end
 end
-

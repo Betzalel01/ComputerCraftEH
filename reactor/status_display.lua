@@ -1,22 +1,19 @@
--- front_panel.lua
--- Simple PLC-style front panel for Mekanism fission reactor
--- Monitor on TOP, modem on BACK.
--- Talks to reactor_core.lua using:
---    CORE_CHANNEL  (commands and status)
---    PANEL_CHANNEL (replies & heartbeat)
+-- status_display.lua
+-- Front-panel PLC-style status display for Mekanism fission reactor
+-- Monitor on TOP, modem on BACK. Talks to reactor_core over CORE_CHANNEL.
 
 ---------------------------
 -- CONFIG
 ---------------------------
-local MODEM_SIDE    = "back"   -- modem on back (wireless or wired)
-local MONITOR_SIDE  = "top"    -- advanced monitor on top
+local MODEM_SIDE    = "back"
+local MONITOR_SIDE  = "top"
 local CORE_CHANNEL  = 100      -- must match reactor_core.lua
-local PANEL_CHANNEL = 101      -- must match reactor_core.lua
+local PANEL_CHANNEL = 101      -- status + heartbeat from core
 
--- Timing
+-- Polling and timing
 local STATUS_POLL_INTERVAL = 0.5   -- seconds between status requests
 local HEARTBEAT_TIMEOUT    = 15.0  -- seconds since last heartbeat before fault
-local BLINK_PERIOD         = 0.5   -- blink period for heartbeat and RPS TRIP
+local BLINK_PERIOD         = 0.5   -- seconds per blink phase
 
 ---------------------------
 -- PERIPHERALS
@@ -29,51 +26,44 @@ if not mon then error("No monitor on "..MONITOR_SIDE, 0) end
 
 modem.open(PANEL_CHANNEL)
 
-mon.setTextScale(0.5)  -- small font, more resolution (closer to original PLC)
+-- Small font: more resolution, closer to original PLC feel
+mon.setTextScale(0.5)
 mon.setBackgroundColor(colors.gray)
 mon.setTextColor(colors.white)
 mon.clear()
 
 local mw, mh = mon.getSize()
+-- You reported mw=57, mh=24, but code is robust to similar sizes.
 
 ---------------------------
--- LAYOUT (inspired by cc-mek-scada)
+-- LAYOUT (tuned for ~57x24)
 ---------------------------
--- Left system block ~14 chars wide, starting near x=2
-local LEFT_WIDTH = 14
-local leftX1     = 2
-local leftX2     = leftX1 + LEFT_WIDTH - 1
-
--- Right RPS block ~16 chars wide, anchored to right
-local RIGHT_WIDTH = 16
-local rightX2     = mw
-local rightX1     = rightX2 - RIGHT_WIDTH + 1
-
--- Middle status/controls block is between left and right
-local midX1 = leftX2 + 2
-local midX2 = rightX1 - 2
-if midX2 <= midX1 + 6 then
-  -- fallback for very narrow monitors: just compress
-  midX1 = math.floor(mw / 2) - 10
-  midX2 = math.floor(mw / 2) + 10
-end
-
--- Vertical positions
-local headerY    = 1
+-- Left block: STATUS / HEARTBEAT / REACTOR / MODEM / NETWORK
+local leftX1  = 2
+local leftX2  = leftX1 + 13      -- 14-char wide block
+local leftLampX = leftX1
+local leftLabelX = leftX1 + 2
 
 local leftY0     = 3
 local statusY    = leftY0
-local heartbeatY = leftY0 + 2
-local reactorY   = leftY0 + 4
-local modemY     = leftY0 + 6
-local networkY   = leftY0 + 8
+local heartbeatY = leftY0 + 1
+local reactorY   = leftY0 + 2
+local modemY     = leftY0 + 3
+local networkY   = leftY0 + 4
 
-local rpsBoxY1   = leftY0
-local rpsBoxY2   = rpsBoxY1 + 4       -- RPS TRIP + blinking lamp
-local btnY1      = rpsBoxY2 + 1
-local btnY2      = btnY1 + 2
+-- Right block: alarms and MANUAL/AUTOMATIC
+local rightBlockWidth = 18
+local rightX2  = mw - 1          -- leave 1-col margin on far right
+local rightX1  = rightX2 - rightBlockWidth + 1
+if rightX1 <= leftX2 + 4 then
+  -- Fallback if monitor narrower than expected
+  rightX1 = leftX2 + 6
+  rightX2 = rightX1 + rightBlockWidth - 1
+end
+local rightLampX  = rightX1
+local rightLabelX = rightX1 + 2
 
-local rightY0    = leftY0
+local rightY0    = 3
 local manualY    = rightY0
 local autoY      = rightY0 + 1
 local hiDamageY  = rightY0 + 3
@@ -83,19 +73,33 @@ local hiWasteY   = rightY0 + 7
 local loCoolY    = rightY0 + 9
 local hiHcoolY   = rightY0 + 10
 
+-- Middle: RPS TRIP and SCRAM/RESET buttons between left and right blocks
+local midX1 = leftX2 + 3
+local midX2 = rightX1 - 3
+if midX2 <= midX1 + 10 then
+  -- Very narrow monitor fallback: center smaller middle block
+  midX1 = math.floor(mw / 2) - 10
+  midX2 = math.floor(mw / 2) + 10
+end
+
+local headerY   = 1
+local rpsY      = leftY0 + 2      -- RPS TRIP label row
+local btnY1     = rpsY + 2
+local btnY2     = btnY1 + 2
+
 -- SCRAM / RESET buttons centered in the middle block
-local btnWidth   = 7
-local btnGap     = 3
-local totalW     = 2 * btnWidth + btnGap
-local midCenter  = math.floor((midX1 + midX2) / 2)
+local btnWidth = 8
+local btnGap   = 4
+local totalW   = 2 * btnWidth + btnGap
+local midCenter = math.floor((midX1 + midX2) / 2)
 
-local scramX1    = midCenter - math.floor(totalW / 2)
-local scramX2    = scramX1 + btnWidth - 1
-local resetX1    = scramX2 + 1 + btnGap
-local resetX2    = resetX1 + btnWidth - 1
+local scramX1 = midCenter - math.floor(totalW / 2)
+local scramX2 = scramX1 + btnWidth - 1
+local resetX1 = scramX2 + 1 + btnGap
+local resetX2 = resetX1 + btnWidth - 1
 
-local btnScram   = { x1 = scramX1, y1 = btnY1, x2 = scramX2, y2 = btnY2 }
-local btnReset   = { x1 = resetX1, y1 = btnY1, x2 = resetX2, y2 = btnY2 }
+local btnScram = { x1 = scramX1, y1 = btnY1, x2 = scramX2, y2 = btnY2 }
+local btnReset = { x1 = resetX1, y1 = btnY1, x2 = resetX2, y2 = btnY2 }
 
 ---------------------------
 -- STATE
@@ -118,7 +122,7 @@ end
 
 local function sendCore(msg)
   msg = msg or {}
-  msg.src = "front_panel"
+  msg.src = "status_panel"
   modem.transmit(CORE_CHANNEL, PANEL_CHANNEL, msg)
 end
 
@@ -145,23 +149,6 @@ local function drawBox(x1, y1, x2, y2, bg)
     mon.write(string.rep(" ", math.max(0, x2 - x1 + 1)))
   end
   mon.setBackgroundColor(colors.gray)
-end
-
-local function drawBorder(x1, y1, x2, y2)
-  mon.setBackgroundColor(colors.gray)
-  mon.setTextColor(colors.lightGray)
-  local w = math.max(0, x2 - x1 + 1)
-  if w < 2 then return end
-  mon.setCursorPos(x1, y1)
-  mon.write(string.rep("-", w))
-  mon.setCursorPos(x1, y2)
-  mon.write(string.rep("-", w))
-  for y = y1 + 1, y2 - 1 do
-    mon.setCursorPos(x1, y)
-    mon.write("|")
-    mon.setCursorPos(x2, y)
-    mon.write("|")
-  end
 end
 
 local function drawLamp(x, y, isOn, colorOn)
@@ -216,22 +203,15 @@ local function drawStaticFrame()
   mon.setTextColor(colors.white)
   mon.clear()
 
-  -- Header
+  -- Header title
   centerText(headerY, "FISSION REACTOR PLC - UNIT 1")
 
-  -- Left system block border
-  drawBorder(leftX1, leftY0 - 1, leftX2, leftY0 + 10)
+  -- Light background blocks to visually group columns
+  drawBox(leftX1 - 1, leftY0 - 1, leftX2 + 1, leftY0 + 6, colors.gray)
+  drawBox(midX1,     leftY0 - 1,   midX2,     btnY2 + 1,  colors.gray)
+  drawBox(rightX1-1, rightY0 - 1,  rightX2+1, rightY0+11, colors.gray)
 
-  -- Middle RPS + controls area border
-  drawBorder(midX1, rpsBoxY1 - 1, midX2, btnY2 + 1)
-
-  -- Right RPS list border
-  drawBorder(rightX1, rightY0 - 1, rightX2, rightY0 + 11)
-
-  -- RPS TRIP label in middle
-  centerText(rpsBoxY1, "RPS TRIP")
-
-  -- Draw SCRAM/RESET button rectangles
+  -- SCRAM / RESET button backgrounds
   drawBox(btnScram.x1, btnScram.y1, btnScram.x2, btnScram.y2, colors.red)
   drawBox(btnReset.x1, btnReset.y1, btnReset.x2, btnReset.y2, colors.yellow)
 
@@ -244,7 +224,9 @@ local function drawStaticFrame()
   end
   labelButton(btnScram, "SCRAM")
   labelButton(btnReset, "RESET")
+
   mon.setTextColor(colors.white)
+  centerText(rpsY, "RPS TRIP")
 end
 
 local function drawDynamic()
@@ -268,42 +250,41 @@ local function drawDynamic()
   local heartbeatBlinkOn = heartbeatOk and blinkOn
   local rpsBlinkOn       = scram and blinkOn
 
-  -- LEFT COLUMN
-  drawLampLabel(leftX1, statusY, statusOk and poweredOn,
-                colors.lime, leftX1 + 2, "STATUS")
+  -- LEFT COLUMN: STATUS, HEARTBEAT, REACTOR, MODEM (1), NETWORK
+  drawLampLabel(leftLampX, statusY, statusOk and poweredOn,
+                colors.lime, leftLabelX, "STATUS")
 
   if not heartbeatOk then
-    drawLampLabel(leftX1, heartbeatY, true,
-                  colors.red, leftX1 + 2, "HEARTBEAT")
+    drawLampLabel(leftLampX, heartbeatY, true,
+                  colors.red, leftLabelX, "HEARTBEAT")
   else
-    drawLampLabel(leftX1, heartbeatY, heartbeatBlinkOn,
-                  colors.lime, leftX1 + 2, "HEARTBEAT")
+    drawLampLabel(leftLampX, heartbeatY, heartbeatBlinkOn,
+                  colors.lime, leftLabelX, "HEARTBEAT")
   end
 
-  drawLampLabel(leftX1, reactorY, poweredOn,
-                colors.green, leftX1 + 2, "REACTOR")
+  drawLampLabel(leftLampX, reactorY, poweredOn,
+                colors.green, leftLabelX, "REACTOR")
 
-  drawLampLabel(leftX1, modemY, lastStatus ~= nil,
-                colors.green, leftX1 + 2, "MODEM (1)")
+  drawLampLabel(leftLampX, modemY, lastStatus ~= nil,
+                colors.green, leftLabelX, "MODEM (1)")
 
-  drawLampLabel(leftX1, networkY, statusOk,
+  drawLampLabel(leftLampX, networkY, statusOk,
                 statusOk and colors.green or colors.red,
-                leftX1 + 2, "NETWORK")
+                leftLabelX, "NETWORK")
 
-  -- RPS TRIP lamp: just to the left of RPS label
-  drawLamp(midX1 + 1, rpsBoxY1, rpsBlinkOn, colors.red)
+  -- RPS TRIP lamp just left of the text
+  drawLamp(midX1 + 1, rpsY, rpsBlinkOn, colors.red)
 
-  -- RIGHT COLUMN
+  -- RIGHT COLUMN: MANUAL/AUTOMATIC + alarms
   local manualOn = (lastTripSource == "manual")
   local autoOn   = (lastTripSource == "auto")
 
-  drawLampLabel(rightX1, manualY, manualOn,
-                colors.red, rightX1 + 2, "MANUAL")
+  drawLampLabel(rightLampX, manualY, manualOn,
+                colors.red, rightLabelX, "MANUAL")
 
-  drawLampLabel(rightX1, autoY, autoOn,
-                colors.red, rightX1 + 2, "AUTOMATIC")
+  drawLampLabel(rightLampX, autoY, autoOn,
+                colors.red, rightLabelX, "AUTOMATIC")
 
-  -- Advisory thresholds
   local hiDamage   = damage > 0.0
   local hiTemp     = temp >= 1200
   local loFuel     = fuelFrac < 0.10
@@ -311,23 +292,23 @@ local function drawDynamic()
   local loCoolant  = coolFrac < 0.20
   local hiHcoolant = heatedFrac > 0.95
 
-  drawLampLabel(rightX1, hiDamageY, hiDamage,
-                colors.red, rightX1 + 2, "HI DAMAGE")
+  drawLampLabel(rightLampX, hiDamageY, hiDamage,
+                colors.red, rightLabelX, "HI DAMAGE")
 
-  drawLampLabel(rightX1, hiTempY, hiTemp,
-                colors.red, rightX1 + 2, "HI TEMP")
+  drawLampLabel(rightLampX, hiTempY, hiTemp,
+                colors.red, rightLabelX, "HI TEMP")
 
-  drawLampLabel(rightX1, loFuelY, loFuel,
-                colors.red, rightX1 + 2, "LO FUEL")
+  drawLampLabel(rightLampX, loFuelY, loFuel,
+                colors.red, rightLabelX, "LO FUEL")
 
-  drawLampLabel(rightX1, hiWasteY, hiWaste,
-                colors.red, rightX1 + 2, "HI WASTE")
+  drawLampLabel(rightLampX, hiWasteY, hiWaste,
+                colors.red, rightLabelX, "HI WASTE")
 
-  drawLampLabel(rightX1, loCoolY, loCoolant,
-                colors.red, rightX1 + 2, "LO CCOOLANT")
+  drawLampLabel(rightLampX, loCoolY, loCoolant,
+                colors.red, rightLabelX, "LO CCOOLANT")
 
-  drawLampLabel(rightX1, hiHcoolY, hiHcoolant,
-                colors.red, rightX1 + 2, "HI HCOOLANT")
+  drawLampLabel(rightLampX, hiHcoolY, hiHcoolant,
+                colors.red, rightLabelX, "HI HCOOLANT")
 end
 
 local function redrawAll()

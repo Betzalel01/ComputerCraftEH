@@ -1,288 +1,161 @@
--- status_display.lua
--- Front-panel style status display using cc-mek-scada graphics library.
--- Display-only: no SCRAM / RESET controls here.
+-- reactor/status_display.lua
+-- Simple front-panel style status display (indicator-only)
 
------------------------
---  dependencies
------------------------
+-- === CONFIG =================================================================
 
-local colors      = colors
-local peripheral  = peripheral
+local MONITOR_SIDE = "top"   -- monitor is on top
+local TEXT_SCALE   = 0.5     -- looks good on 57x24
 
-local core_ok, core = pcall(require, "graphics.core")
-if not core_ok then error("graphics.core not found (did update.lua pull graphics/* ?)", 0) end
+-- colours roughly matched to cc-mek-scada sandstone theme
+local COLOR_BG       = colors.gray
+local COLOR_BORDER   = colors.yellow
+local COLOR_TEXT     = colors.white
+local COLOR_LABEL_D  = colors.lightGray
+local COLOR_LED_RED  = colors.red
+local COLOR_LED_GRN  = colors.lime
+local COLOR_LED_OFF  = colors.gray
 
-local Div_ok,     Div     = pcall(require, "graphics.elements.Div")
-local TextBox_ok, TextBox = pcall(require, "graphics.elements.TextBox")
-local LED_ok,     LED     = pcall(require, "graphics.elements.indicators.LED")
-local RGBLED_ok,  RGBLED  = pcall(require, "graphics.elements.indicators.RGBLED")
+-- ============================================================================
 
-if not (Div_ok and TextBox_ok and LED_ok and RGBLED_ok) then
-    error("graphics elements not found (Div/TextBox/LED/RGBLED)", 0)
+local mon = peripheral.wrap(MONITOR_SIDE)
+if not mon then error("No monitor on "..MONITOR_SIDE, 0) end
+
+mon.setTextScale(TEXT_SCALE)
+local W, H = mon.getSize()
+
+-- redirect helpers to the monitor
+local function setBG(c)  mon.setBackgroundColor(c) end
+local function setFG(c)  mon.setTextColor(c)       end
+
+local function fillRect(x1, y1, x2, y2, col)
+  setBG(col)
+  for y = y1, y2 do
+    mon.setCursorPos(x1, y)
+    mon.write(string.rep(" ", x2 - x1 + 1))
+  end
 end
 
-local themes_ok, themes = pcall(require, "graphics.themes")
-if not themes_ok then error("graphics.themes not found", 0) end
-
-local util_ok, util = pcall(require, "scada-common.util")
-local sprintf = util_ok and util.sprintf or function(fmt, ...) return string.format(fmt, ...) end
-
-local ALIGN = core.ALIGN
-local cpair = core.cpair
-local theme = themes.sandstone
-
------------------------
---  monitor + modem
------------------------
-
-local mon = peripheral.wrap("top")
-if not mon then error("no monitor on top", 0) end
-
--- your monitor is 57x24; this scale fits nicely
-mon.setTextScale(0.5)
-local term = mon
-local term_w, term_h = term.getSize()
-
-if term_w < 50 or term_h < 18 then
-    error(sprintf("monitor too small (got %dx%d, need at least 50x18)", term_w, term_h), 0)
+local function drawText(x, y, txt, col)
+  setBG(COLOR_BG)
+  setFG(col or COLOR_TEXT)
+  mon.setCursorPos(x, y)
+  mon.write(txt)
 end
 
--- modem on back for status messages
-local modem = peripheral.wrap("back")
-if not modem then error("no modem on back for status panel", 0) end
-
-local STATUS_CHAN = 9001
-modem.open(STATUS_CHAN)
-
------------------------
---  layout helpers
------------------------
-
-local function make_root_frame()
-    -- fill monitor with border color first
-    term.setBackgroundColor(theme.fp_border)
-    term.setTextColor(theme.fp_fg)
-    term.clear()
-
-    -- inside frame in fp_bg
-    local root = Div{
-        window = term,
-        x = 2, y = 2,
-        width = term_w - 2,
-        height = term_h - 2,
-        fg_bg = cpair(theme.fp_fg, theme.fp_bg)
-    }
-
-    root:fill(theme.fp_bg)
-    return root
+local function led(x, y, col)
+  -- 2x2 LED block
+  fillRect(x,     y,     x + 1, y + 1, col)
 end
 
------------------------
---  UI creation
------------------------
-
-local root = make_root_frame()
-
--- title
-local title = "FISSION REACTOR PLC - UNIT 1"
-TextBox{
-    parent = root,
-    x = math.floor((term_w - #title) / 2),
-    y = 2,
-    text = title,
-    alignment = ALIGN.CENTER,
-    fg_bg = cpair(theme.fp_title_fg, theme.fp_bg)
-}
-
--- left system column
-local sys_x = 4
-local sys_y = 5
-local sys_w = math.floor(term_w / 3)
-
-local system = Div{
-    parent = root,
-    x = sys_x,
-    y = sys_y,
-    width = sys_w,
-    height = term_h - sys_y - 1,
-    fg_bg = cpair(theme.fp_fg, theme.fp_bg)
-}
-
-local ind_red  = cpair(theme.ind_red,  theme.ind_bkg)
-local ind_grn  = cpair(theme.ind_grn,  theme.ind_bkg)
-local ind_yel  = cpair(theme.ind_yel,  theme.ind_bkg)
-
-local status_led    = LED{parent = system, label = "STATUS",    colors = ind_red}
-local heartbeat_led = LED{parent = system, label = "HEARTBEAT", colors = ind_red}
-local reactor_led   = LED{parent = system, label = "REACTOR",   colors = ind_red}
-local modem_led     = LED{parent = system, label = "MODEM (1)", colors = ind_grn}
-local network_led   = RGBLED{
-    parent = system,
-    label  = "NETWORK",
-    colors = {theme.ind_grn, theme.ind_red, theme.ind_yel, theme.ind_org, theme.ind_bkg}
-}
-
-system:line_break()
-
--- middle RPS TRIP area
-local rps_w = math.floor(term_w / 3)
-local rps_x = math.floor(term_w / 2 - rps_w / 2)
-
-local rps_div = Div{
-    parent = root,
-    x = rps_x,
-    y = sys_y + 2,
-    width = rps_w,
-    height = 5,
-    fg_bg = cpair(theme.fp_fg, theme.fp_bg)
-}
-
-TextBox{
-    parent = rps_div,
-    x = 1, y = 1,
-    width = rps_w,
-    text = "RPS TRIP",
-    alignment = ALIGN.CENTER,
-    fg_bg = cpair(theme.fp_fg, theme.fp_bg)
-}
-
-local rps_state_tb = TextBox{
-    parent = rps_div,
-    x = 1, y = 3,
-    width = rps_w,
-    text = "NORMAL",
-    alignment = ALIGN.CENTER,
-    fg_bg = cpair(theme.fp_fg, theme.fp_bg)
-}
-
--- right column with trip mode + alarms
-local right_w = math.floor(term_w / 3) - 3
-local right_x = term_w - right_w - 2
-
-local right = Div{
-    parent = root,
-    x = right_x,
-    y = sys_y,
-    width = right_w,
-    height = term_h - sys_y - 1,
-    fg_bg = cpair(theme.fp_fg, theme.fp_bg)
-}
-
-local manual_led = LED{parent = right, label = "MANUAL",    colors = ind_red}
-local auto_led   = LED{parent = right, label = "AUTOMATIC", colors = ind_grn}
-
-right:line_break()
-
-local hi_damage_led = LED{parent = right, label = "HI DAMAGE", colors = ind_red}
-local hi_temp_led   = LED{parent = right, label = "HI TEMP",   colors = ind_red}
-
-right:line_break()
-
-local lo_fuel_led   = LED{parent = right, label = "LO FUEL",   colors = ind_yel}
-local hi_waste_led  = LED{parent = right, label = "HI WASTE",  colors = ind_red}
-
-right:line_break()
-
-local lo_cool_led   = LED{parent = right, label = "LO CCOOLANT", colors = ind_yel}
-local hi_cool_led   = LED{parent = right, label = "HI HCOOLANT",  colors = ind_red}
-
------------------------
---  state / heartbeat
------------------------
-
-local hb_timeout = 12     -- seconds heartbeat stays GREEN after last packet
-local hb_last    = 0      -- os.clock() of last heartbeat
-
-local function set_safe_defaults()
-    status_led:set_value(true)       -- panel alive
-    heartbeat_led:set_value(false)   -- wait for first heartbeat
-    reactor_led:set_value(false)
-    modem_led:set_value(true)
-    network_led:set_value(1)        -- green
-
-    manual_led:set_value(false)
-    auto_led:set_value(true)
-
-    hi_damage_led:set_value(false)
-    hi_temp_led:set_value(false)
-    lo_fuel_led:set_value(false)
-    hi_waste_led:set_value(false)
-    lo_cool_led:set_value(false)
-    hi_cool_led:set_value(false)
-
-    rps_state_tb:set_value("NORMAL")
+local function clearScreen()
+  setBG(COLOR_BG)
+  setFG(COLOR_TEXT)
+  mon.clear()
 end
 
-set_safe_defaults()
+local function drawBorder()
+  -- outer border
+  fillRect(1,     1,     W,     1,     COLOR_BORDER)
+  fillRect(1,     H,     W,     H,     COLOR_BORDER)
+  fillRect(1,     1,     1,     H,     COLOR_BORDER)
+  fillRect(W,     1,     W,     H,     COLOR_BORDER)
 
-local function update_heartbeat()
-    local now = os.clock()
-    local alive = (now - hb_last) <= hb_timeout
-    heartbeat_led:set_value(alive)
+  -- inner background
+  fillRect(2,     2,     W - 1, H - 1, COLOR_BG)
 end
 
-local function handle_status(msg)
-    -- msg should be a table sent from the core computer; all fields optional.
-    if type(msg) ~= "table" then return end
-    if msg.type ~= "STATUS" then return end
+local function drawStatic()
+  clearScreen()
+  drawBorder()
 
-    if msg.reactor_on ~= nil then
-        reactor_led:set_value(msg.reactor_on)
-    end
+  -- title
+  local title = "FISSION REACTOR PLC - UNIT 1"
+  local tx = math.floor((W - #title) / 2) + 1
+  drawText(tx, 3, title, COLOR_TEXT)
 
-    if msg.trip_manual ~= nil then
-        manual_led:set_value(msg.trip_manual)
-    end
-    if msg.trip_auto ~= nil then
-        auto_led:set_value(msg.trip_auto)
-    end
+  ---------------------------------------------------------------------------
+  -- LEFT COLUMN (status + comms)
+  ---------------------------------------------------------------------------
+  local lx = 6
+  local y = 6
 
-    if msg.hi_damage ~= nil then hi_damage_led:set_value(msg.hi_damage) end
-    if msg.hi_temp   ~= nil then hi_temp_led:set_value(msg.hi_temp)     end
-    if msg.lo_fuel   ~= nil then lo_fuel_led:set_value(msg.lo_fuel)     end
-    if msg.hi_waste  ~= nil then hi_waste_led:set_value(msg.hi_waste)   end
-    if msg.lo_coolant~= nil then lo_cool_led:set_value(msg.lo_coolant)  end
-    if msg.hi_coolant~= nil then hi_cool_led:set_value(msg.hi_coolant)  end
+  -- STATUS
+  led(4, y, COLOR_LED_RED)
+  drawText(lx, y, "STATUS")
 
-    if msg.trip_manual or msg.trip_auto then
-        rps_state_tb:set_value("TRIP")
-    else
-        rps_state_tb:set_value("NORMAL")
-    end
+  -- HEARTBEAT
+  y = y + 2
+  led(4, y, COLOR_LED_RED)
+  drawText(lx, y, "HEARTBEAT")
+
+  -- REACTOR
+  y = y + 2
+  led(4, y, COLOR_LED_RED)
+  drawText(lx, y, "REACTOR")
+
+  -- MODEM (1)
+  y = y + 2
+  led(4, y, COLOR_LED_GRN)
+  drawText(lx, y, "MODEM (1)")
+
+  -- NETWORK
+  y = y + 2
+  led(4, y, COLOR_LED_GRN)
+  drawText(lx, y, "NETWORK")
+
+  ---------------------------------------------------------------------------
+  -- CENTER (RPS TRIP line + status text)
+  ---------------------------------------------------------------------------
+  local cx = math.floor(W / 2) - 4
+  drawText(cx, 10, "RPS TRIP", COLOR_TEXT)
+  drawText(cx + 1, 12, "NORMAL", COLOR_LABEL_D)
+
+  ---------------------------------------------------------------------------
+  -- RIGHT COLUMN (trips / alarms)
+  ---------------------------------------------------------------------------
+  local rx = W - 18
+  y = 6
+
+  drawText(rx, y,     "MANUAL",    COLOR_TEXT)
+  drawText(rx, y + 2, "AUTOMATIC", COLOR_TEXT)
+
+  y = y + 6
+  drawText(rx, y,     "HI DAMAGE", COLOR_TEXT)
+  drawText(rx, y + 2, "HI TEMP",   COLOR_TEXT)
+
+  y = y + 6
+  drawText(rx, y,     "LO FUEL",   COLOR_TEXT)
+  drawText(rx, y + 2, "HI WASTE",  COLOR_TEXT)
+
+  y = y + 6
+  drawText(rx, y,     "LO CCOOLANT", COLOR_TEXT)
+  drawText(rx, y + 2, "HI HCOOLANT", COLOR_TEXT)
+
+  ---------------------------------------------------------------------------
+  -- RIGHT-COLUMN LED placeholders (all off by default)
+  ---------------------------------------------------------------------------
+  -- MANUAL/AUTOMATIC LEDs
+  led(rx - 3, 6, COLOR_LED_OFF)
+  led(rx - 3, 8, COLOR_LED_OFF)
+
+  -- HI DAMAGE / HI TEMP LEDs
+  led(rx - 3, 12, COLOR_LED_OFF)
+  led(rx - 3, 14, COLOR_LED_OFF)
+
+  -- LO FUEL / HI WASTE LEDs
+  led(rx - 3, 18, COLOR_LED_OFF)
+  led(rx - 3, 20, COLOR_LED_OFF)
+
+  -- LO CCOOLANT / HI HCOOLANT LEDs
+  led(rx - 3, 24, COLOR_LED_OFF)
+  led(rx - 3, 26, COLOR_LED_OFF)
 end
 
------------------------
---  event loop
------------------------
+-- For now this is a static front panel: draw once then idle.
+-- Later we can wire it to modem messages (heartbeat, trips, etc.)
+drawStatic()
 
--- start with “missed heartbeat”
-hb_last = os.clock() - hb_timeout * 2
-update_heartbeat()
-
-local STATUS_CHAN = 9001
-local TIMER_PERIOD = 1.0      -- seconds between heartbeat checks
-local timer_id = os.startTimer(TIMER_PERIOD)
-
+-- simple idle loop so the program keeps running
 while true do
-    local ev, p1, p2, p3, p4 = os.pullEventRaw()
-
-    if ev == "terminate" then
-        break
-
-    elseif ev == "timer" and p1 == timer_id then
-        update_heartbeat()
-        timer_id = os.startTimer(TIMER_PERIOD)
-
-    elseif ev == "modem_message" then
-        local side, chan, reply_chan, msg = p1, p2, p3, p4
-
-        if chan == STATUS_CHAN then
-            if msg == "HEARTBEAT" then
-                hb_last = os.clock()
-                update_heartbeat()
-            else
-                handle_status(msg)
-            end
-        end
-    end
+  os.sleep(1)
 end

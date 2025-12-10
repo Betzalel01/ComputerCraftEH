@@ -6,7 +6,7 @@
 ---------------------------
 -- CONFIG
 ---------------------------
-local MODEM_SIDE    = "right"   -- change if your modem is on a different side
+local MODEM_SIDE    = "back"   -- change if your modem is on a different side
 local MONITOR_SIDE  = "top"     -- per your setup
 local CORE_CHANNEL  = 100       -- MUST match reactor_core & control_room scripts
 local PANEL_CHANNEL = 101       -- reply channel for status / heartbeat
@@ -315,4 +315,3 @@ end
 ---------------------------
 redrawAll()
 parallel.waitForAny(statusPollLoop, blinkLoop, eventLoop)
-

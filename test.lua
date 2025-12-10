@@ -1,1 +1,1 @@
-print("Hello from GitHub")
+pastebin get dRf5uzZ3 update.lua

@@ -71,18 +71,18 @@ local d = Div{
     height = 5
 }
 
--- STATUS: green = comm OK AND reactor healthy, red otherwise
+-- IMPORTANT: LED uses cpair(OFF_COLOR, ON_COLOR)
+-- So: false -> RED, true -> GREEN
 local status_led = LED{
     parent = d,
     label  = "STATUS",
-    colors = cpair(colors.green, colors.red)  -- TRUE = green, FALSE = red
+    colors = cpair(colors.red, colors.green)
 }
 
--- HEARTBEAT: green = comm OK (we're seeing frames), red = no frames recently
 local heartbeat_led = LED{
     parent  = d,
     label   = "HEARTBEAT",
-    colors  = cpair(colors.green, colors.red) -- TRUE = green, FALSE = red
+    colors  = cpair(colors.red, colors.green)
 }
 
 -------------------------------------------------
@@ -112,7 +112,7 @@ local function apply_panel_frame(s)
         return
     end
 
-    status_count = status_count + 1
+    status_count   = status_count + 1
     last_frame_time = os.clock()
     last_status_ok  = not not s.status_ok
 
@@ -121,7 +121,6 @@ local function apply_panel_frame(s)
         status_count, last_frame_time, tostring(last_status_ok)
     ))
 
-    -- OPTIONAL: uncomment to see full payload for the first few frames
     if status_count <= 10 then
         print("[FRAME] raw msg: "..textutils.serialize(s))
     end

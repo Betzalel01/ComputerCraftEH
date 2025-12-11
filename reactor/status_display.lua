@@ -1,4 +1,4 @@
--- reactor/status_display.lua
+-- reactor/status_display.lua n
 -- Front-panel style status display using cc-mek-scada graphics engine.
 -- Visual-only: no live wiring yet.
 

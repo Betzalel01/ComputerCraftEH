@@ -6,7 +6,10 @@
 --   * setBurnRate()
 --
 -- It listens for commands over a modem and enforces safety logic locally.
--- Also broadcasts a simplified status packet for the front-panel display.
+-- It also sends:
+--   * status replies back to the control room
+--   * heartbeat packets for liveness
+--   * panel status frames on STATUS_CHANNEL for the front-panel GUI
 
 --------------------------
 -- CONFIG
@@ -17,11 +20,12 @@ local REDSTONE_ACTIVATION_SIDE = "left"   -- side which actually enables reactor
 
 -- Rednet / channel setup
 local REACTOR_CHANNEL  = 100   -- channel this machine listens on
-local CONTROL_CHANNEL  = 101   -- channel it replies to (control room, etc.)
-local STATUS_CHANNEL   = 250   -- channel broadcast to front_panel/status_display
+local CONTROL_CHANNEL  = 101   -- channel it replies to (control room, panel, etc.)
+local STATUS_CHANNEL   = 250   -- broadcast to front-panel status_display
 
 -- Periods
 local SENSOR_POLL_PERIOD = 0.2   -- seconds between sensor/logic ticks
+local HEARTBEAT_PERIOD   = 10.0  -- seconds between heartbeat packets (CONFIGURABLE)
 
 -- Safety thresholds (only enforced if emergencyOn = true)
 local MAX_DAMAGE_PCT   = 5     -- SCRAM if damage > 5%
@@ -41,7 +45,7 @@ local modem = peripheral.wrap(MODEM_SIDE)
 if not modem then
   error("No modem on side "..MODEM_SIDE)
 end
-modem.open(REACTOR_CHANNEL)
+modem.open(REACTOR_CHANNEL)   -- we only *receive* on REACTOR_CHANNEL; others are tx only
 
 --------------------------
 -- STATE
@@ -64,58 +68,6 @@ local sensors = {
 
 local lastRsState  = nil   -- for logging RS changes
 local lastErrorMsg = nil   -- sent back once in status
-
--- simple “trip cause” flags for the panel
-local last_trip = {
-  manual    = false,
-  auto      = false,
-  timeout   = false,
-  rct_fault = false,
-
-  hi_damage = false,
-  hi_temp   = false,
-  lo_fuel   = false,
-  hi_waste  = false,
-  lo_ccool  = false,
-  hi_hcool  = false,
-}
-
-local function reset_trip_flags()
-  for k in pairs(last_trip) do
-    last_trip[k] = false
-  end
-end
-
-local function set_trip_flags(code)
-  reset_trip_flags()
-  if not code then return end
-
-  if code == "manual" then
-    last_trip.manual = true
-
-  elseif code == "damage" then
-    last_trip.auto      = true
-    last_trip.hi_damage = true
-
-  elseif code == "coolant_low" then
-    last_trip.auto     = true
-    last_trip.lo_ccool = true
-
-  elseif code == "waste_high" then
-    last_trip.auto     = true
-    last_trip.hi_waste = true
-
-  elseif code == "heated_high" then
-    last_trip.auto     = true
-    last_trip.hi_hcool = true
-
-  elseif code == "timeout" then
-    last_trip.timeout = true
-
-  elseif code == "rct_fault" then
-    last_trip.rct_fault = true
-  end
-end
 
 --------------------------
 -- HELPERS
@@ -170,50 +122,55 @@ local function zeroOutput()
   pcall(reactor.scram)
 end
 
-local function doScram(reason, cause_code)
+local function doScram(reason)
   log("SCRAM: "..(reason or "unknown"))
   scramLatched = true
   poweredOn    = false
-  set_trip_flags(cause_code)
   zeroOutput()
 end
 
 --------------------------
--- PANEL STATUS BUILDER
--- (matches fields used by status_display.lua)
+-- PANEL STATUS ENCODING
 --------------------------
+-- Build the status table expected by reactor/status_display.lua
 local function buildPanelStatus()
-  local online   = sensors.online
-  local burning  = sensors.burnRate and (sensors.burnRate > 0.01)
-  local status_ok = online and not scramLatched
+  -- "Good" overall if online, emergency protection enabled, and not scrammed
+  local status_ok = sensors.online and emergencyOn and not scramLatched
 
-  local pkt = {
-    status_ok   = status_ok,
-    reactor_on  = burning,
-    modem_ok    = true,   -- if the core is sending this, modem is alive
-    network_ok  = true,   -- panel will mark this false on heartbeat loss
-    rps_enable  = emergencyOn,
-    auto_power  = false,  -- placeholder until you add an auto-power mode
-    emerg_cool  = false,  -- reserved for future emergency cooling system
+  local reactor_on = sensors.online and poweredOn and (sensors.burnRate or 0) > 0
 
-    trip        = scramLatched,
+  -- Right now we don't distinguish manual vs automatic trips, etc.
+  local trip = scramLatched
 
-    manual_trip  = last_trip.manual,
-    auto_trip    = last_trip.auto,
-    timeout_trip = last_trip.timeout,
-    rct_fault    = last_trip.rct_fault,
+  local panel = {
+    -- left column
+    status_ok  = status_ok,
+    reactor_on = reactor_on,
+    modem_ok   = true,          -- if this program is running we assume modem OK
+    network_ok = true,          -- simple: on/off only for now
+    rps_enable = emergencyOn,   -- RPS ENABLE LED
+    auto_power = false,         -- we don't have auto burn-rate control yet
 
-    hi_damage = last_trip.hi_damage or (sensors.damagePct > MAX_DAMAGE_PCT),
-    -- pick a sensible “high temp” threshold; adjust as you like
-    hi_temp   = last_trip.hi_temp   or (sensors.tempK > 1200),
+    -- middle column
+    emerg_cool = false,         -- no separate ECCS signal wired yet
 
-    lo_fuel   = last_trip.lo_fuel,  -- no direct sensor yet
-    hi_waste  = last_trip.hi_waste or (sensors.wasteFrac  > MAX_WASTE_FRAC),
-    lo_ccool  = last_trip.lo_ccool or (sensors.coolantFrac < MIN_COOLANT_FRAC),
-    hi_hcool  = last_trip.hi_hcool or (sensors.heatedFrac  > MAX_HEATED_FRAC),
+    -- trip banner + causes
+    trip        = trip,
+    manual_trip = trip,         -- treat all trips as "manual" until we add detail
+    auto_trip   = false,
+    timeout_trip = false,
+    rct_fault   = not sensors.online,
+
+    -- alarms (use your safety thresholds)
+    hi_damage = sensors.damagePct > MAX_DAMAGE_PCT,
+    hi_temp   = false,          -- Mek temp alarms not wired; keep off for now
+    lo_fuel   = false,          -- not tracked
+    hi_waste  = sensors.wasteFrac > MAX_WASTE_FRAC,
+    lo_ccool  = sensors.coolantFrac < MIN_COOLANT_FRAC,
+    hi_hcool  = sensors.heatedFrac > MAX_HEATED_FRAC,
   }
 
-  return pkt
+  return panel
 end
 
 local function sendPanelStatus()
@@ -234,40 +191,28 @@ local function applyControl()
   -- emergency safety checks
   if emergencyOn then
     if sensors.damagePct > MAX_DAMAGE_PCT then
-      doScram(
-        string.format("Damage %.1f%% > %.1f%%", sensors.damagePct, MAX_DAMAGE_PCT),
-        "damage"
-      )
+      doScram(string.format("Damage %.1f%% > %.1f%%", sensors.damagePct, MAX_DAMAGE_PCT))
       return
     end
     if sensors.coolantFrac < MIN_COOLANT_FRAC then
-      doScram(
-        string.format(
-          "Coolant %.0f%% < %.0f%%",
-          sensors.coolantFrac*100, MIN_COOLANT_FRAC*100
-        ),
-        "coolant_low"
-      )
+      doScram(string.format(
+        "Coolant %.0f%% < %.0f%%",
+        sensors.coolantFrac*100, MIN_COOLANT_FRAC*100
+      ))
       return
     end
     if sensors.wasteFrac > MAX_WASTE_FRAC then
-      doScram(
-        string.format(
-          "Waste %.0f%% > %.0f%%",
-          sensors.wasteFrac*100, MAX_WASTE_FRAC*100
-        ),
-        "waste_high"
-      )
+      doScram(string.format(
+        "Waste %.0f%% > %.0f%%",
+        sensors.wasteFrac*100, MAX_WASTE_FRAC*100
+      ))
       return
     end
     if sensors.heatedFrac > MAX_HEATED_FRAC then
-      doScram(
-        string.format(
-          "Heated %.0f%% > %.0f%%",
-          sensors.heatedFrac*100, MAX_HEATED_FRAC*100
-        ),
-        "heated_high"
-      )
+      doScram(string.format(
+        "Heated %.0f%% > %.0f%%",
+        sensors.heatedFrac*100, MAX_HEATED_FRAC*100
+      ))
       return
     end
   end
@@ -301,18 +246,29 @@ local function sendStatus(replyChannel)
     lastError    = lastErrorMsg,
   }
   lastErrorMsg = nil  -- only report once
+
   modem.transmit(replyChannel or CONTROL_CHANNEL, REACTOR_CHANNEL, msg)
+
+  -- Also broadcast a panel-friendly status frame
+  sendPanelStatus()
+end
+
+local function sendHeartbeat()
+  local msg = {
+    type      = "heartbeat",
+    timestamp = os.clock(),
+  }
+  modem.transmit(CONTROL_CHANNEL, REACTOR_CHANNEL, msg)
 end
 
 local function handleCommand(cmd, data, replyChannel)
   if cmd == "scram" then
-    doScram("Remote SCRAM", "manual")
+    doScram("Remote SCRAM")
 
   elseif cmd == "power_on" then
     -- POWER ON always clears SCRAM latch and brings the reactor back.
     scramLatched = false
     poweredOn    = true
-    reset_trip_flags()
 
     if targetBurn <= 0 then
       targetBurn = 1.0
@@ -334,7 +290,6 @@ local function handleCommand(cmd, data, replyChannel)
 
   elseif cmd == "clear_scram" then
     scramLatched = false
-    reset_trip_flags()
     log("SCRAM latch cleared")
 
   elseif cmd == "set_target_burn" then
@@ -367,6 +322,7 @@ local function handleCommand(cmd, data, replyChannel)
     -- just reply below
   end
 
+  -- reply + panel broadcast
   sendStatus(replyChannel)
 end
 
@@ -378,7 +334,8 @@ readSensors() -- populate sensors, including reactor max burn
 term.clear()
 log("Reactor core online. Listening on channel "..REACTOR_CHANNEL)
 
-local sensorTimerId = os.startTimer(SENSOR_POLL_PERIOD)
+local sensorTimerId    = os.startTimer(SENSOR_POLL_PERIOD)
+local heartbeatTimerId = os.startTimer(HEARTBEAT_PERIOD)
 
 while true do
   local ev, p1, p2, p3, p4 = os.pullEvent()
@@ -387,11 +344,13 @@ while true do
     if p1 == sensorTimerId then
       readSensors()
       applyControl()
-
-      -- broadcast compact status for the front-panel
+      -- periodic panel update even if no commands come in
       sendPanelStatus()
-
       sensorTimerId = os.startTimer(SENSOR_POLL_PERIOD)
+
+    elseif p1 == heartbeatTimerId then
+      sendHeartbeat()
+      heartbeatTimerId = os.startTimer(HEARTBEAT_PERIOD)
     end
 
   elseif ev == "modem_message" then

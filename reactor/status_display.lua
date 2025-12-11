@@ -102,12 +102,15 @@ local status_led = LED{
     colors = cpair(colors.red, colors.green)
 }
 
--- HEARTBEAT – alive if core is reporting
+-- HEARTBEAT – alive if core is reporting (flashing when alive)
 local heartbeat_led = LED{
-    parent = system,
-    label  = "HEARTBEAT",
-    colors = ind_grn
+    parent  = system,
+    label   = "HEARTBEAT",
+    colors  = ind_grn,
+    flash   = true,
+    period  = flasher.PERIOD.BLINK_250_MS  -- use same period style uses
 }
+
 
 system.line_break()
 

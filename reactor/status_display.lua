@@ -1,4 +1,4 @@
--- reactor/status_display.lua n
+-- reactor/status_display.lua
 -- Front-panel style status display using cc-mek-scada graphics engine.
 -- Visual-only: no live wiring yet.
 
@@ -46,7 +46,7 @@ if not mon then error("No monitor on top for status_display", 0) end
 mon.setTextScale(0.5)
 local mw, mh = mon.getSize()
 
--- CLEAR the monitor so old text like "MODEM (4)" is removed
+-- Clear the monitor so no stale text remains
 mon.setBackgroundColor(theme.fp_bg or colors.black)
 mon.setTextColor(theme.fp_fg or colors.white)
 mon.clear()
@@ -168,16 +168,7 @@ local auto_power_led = LED{
 }
 
 system.line_break()
-
--- Computer ID tag
-TextBox{
-    parent = system,
-    x      = 10,
-    y      = 5,
-    width  = 6,
-    text   = "(" .. os.getComputerID() .. ")",
-    fg_bg  = disabled_fg
-}
+-- (Computer ID tag removed to avoid "(4)" being shown here)
 
 -------------------------------------------------
 -- MIDDLE COLUMN

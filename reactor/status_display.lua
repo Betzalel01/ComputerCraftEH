@@ -73,17 +73,21 @@ local d = Div{
 
 -- IMPORTANT: LED uses cpair(OFF_COLOR, ON_COLOR)
 -- So: false -> RED, true -> GREEN
+-- IMPORTANT: LED uses cpair(ON_COLOR, OFF_COLOR)
+-- So: true  -> GREEN (on)
+--      false -> RED   (off)
 local status_led = LED{
     parent = d,
     label  = "STATUS",
-    colors = cpair(colors.red, colors.green)
+    colors = cpair(colors.green, colors.red)
 }
 
 local heartbeat_led = LED{
     parent  = d,
     label   = "HEARTBEAT",
-    colors  = cpair(colors.red, colors.green)
+    colors  = cpair(colors.green, colors.red)
 }
+
 
 -------------------------------------------------
 -- Internal state

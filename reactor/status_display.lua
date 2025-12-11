@@ -38,11 +38,18 @@ local ind_red     = style.ind_red
 local disabled_fg = style.fp.disabled_fg
 
 -------------------------------------------------
--- Modem / channel config
+-- Channels / thresholds (must match reactor_core.lua)
 -------------------------------------------------
-local STATUS_CHANNEL       = 250      -- core -> panel status
+local STATUS_CHANNEL       = 250      -- core -> panel compact status
+local CORE_STATUS_CHANNEL  = 101      -- full status replies (same as CONTROL_CHANNEL)
 local HEARTBEAT_TIMEOUT    = 10       -- seconds without packet => heartbeat lost
 local HEARTBEAT_CHECK_STEP = 1        -- check every 1 second
+
+-- Safety thresholds copied from reactor_core.lua so we can derive alarms
+local MAX_DAMAGE_PCT   = 5     -- SCRAM if damage > 5%
+local MIN_COOLANT_FRAC = 0.20  -- SCRAM if coolant < 20% full
+local MAX_WASTE_FRAC   = 0.90  -- SCRAM if waste > 90% full
+local MAX_HEATED_FRAC  = 0.95  -- SCRAM if heated coolant > 95% full
 
 -------------------------------------------------
 -- Peripherals
@@ -53,6 +60,7 @@ if not mon then error("No monitor on top for status_display", 0) end
 local modem = peripheral.wrap("back")
 if not modem then error("No modem on back for status_display", 0) end
 modem.open(STATUS_CHANNEL)
+modem.open(CORE_STATUS_CHANNEL)
 
 -------------------------------------------------
 -- Monitor setup
@@ -108,12 +116,12 @@ local heartbeat_led = LED{
     label   = "HEARTBEAT",
     colors  = ind_grn,
     flash   = true,
-    period  = flasher.PERIOD.BLINK_250_MS  -- use same period style uses
+    period  = flasher.PERIOD.BLINK_250_MS
 }
 
 system.line_break()
 
--- REACTOR – off/on (we’ll use green=on, red=off; yellow unused for now)
+-- REACTOR – off/on (green=on, red=off)
 local reactor_led = LEDPair{
     parent = system,
     label  = "REACTOR",
@@ -122,29 +130,28 @@ local reactor_led = LEDPair{
     c2     = colors.green
 }
 
--- MODEM – single local modem, no count
+-- MODEM – single local modem
 local modem_led_el = LED{
     parent = system,
     label  = "MODEM",
     colors = ind_grn
 }
 
--- NETWORK – comms state (we’ll just use green/fault/off for now)
+-- NETWORK – comms state
 local network_led
 if not style.colorblind then
     network_led = RGBLED{
         parent = system,
         label  = "NETWORK",
         colors = {
-            colors.green,       -- index 1: OK
+            colors.green,       -- 1: OK
             colors.red,         -- 2: fault
-            colors.yellow,      -- 3: degraded/warn
+            colors.yellow,      -- 3: warn
             colors.orange,      -- 4: other warn
             style.ind_bkg       -- 5: off
         }
     }
 else
-    -- fallback, but we probably won’t use CB mode
     LEDPair{
         parent = system,
         label  = "NT LINKED",
@@ -185,7 +192,7 @@ local auto_power_led = LED{
 }
 
 system.line_break()
--- computer ID tag removed to avoid "(4)" visual
+-- computer ID tag intentionally omitted
 
 -------------------------------------------------
 -- MIDDLE COLUMN
@@ -329,7 +336,7 @@ local hi_hcool_led = LED{
 }
 
 -------------------------------------------------
--- Footer: your own version labels
+-- Footer: version labels
 -------------------------------------------------
 local about = Div{
     parent = panel,
@@ -354,13 +361,10 @@ TextBox{
 -------------------------------------------------
 local last_heartbeat = 0
 
--- safe setter wrappers; use the engine's .update(...) API
 local function set_led_bool(el, val)
     if not el then return end
     local v = val and true or false
-    if el.update then
-        el:update(v)
-    elseif el.set_value then
+    if el.set_value then
         el:set_value(v)
     elseif el.setState then
         el:setState(v)
@@ -369,11 +373,8 @@ end
 
 local function set_ledpair_bool(el, val)
     if not el then return end
-    -- LEDPair takes an index: 0 = off, 1 = first color, 2 = second color
-    local v = val and 2 or 0
-    if el.update then
-        el:update(v)
-    elseif el.set_value then
+    local v = val and 2 or 0      -- 0=off, 1=yellow, 2=green in LEDPair
+    if el.set_value then
         el:set_value(v)
     elseif el.setState then
         el:setState(v)
@@ -381,38 +382,30 @@ local function set_ledpair_bool(el, val)
 end
 
 local function set_rgb_state(ok)
-    if not network_led then return end
-
-    local idx
+    if not network_led or not network_led.set_value then return end
     if ok == nil then
-        idx = 5      -- off
+        network_led:set_value(5)      -- off
     elseif ok then
-        idx = 1      -- green
+        network_led:set_value(1)      -- green
     else
-        idx = 2      -- red
-    end
-
-    if network_led.update then
-        network_led:update(idx)
-    elseif network_led.set_value then
-        network_led:set_value(idx)
-    elseif network_led.setState then
-        network_led:setState(idx)
+        network_led:set_value(2)      -- red
     end
 end
 
--- apply a status table from core
-local function apply_status(s)
+-------------------------------------------------
+-- Apply a unified panel-status table
+-------------------------------------------------
+local function apply_panel_status(s)
     if type(s) ~= "table" then return end
+
+    -- packet received = heartbeat
+    last_heartbeat = os.clock()
+    set_led_bool(heartbeat_led, true)
 
     -- overall status
     if s.status_ok ~= nil then
         set_led_bool(status_led, s.status_ok)
     end
-
-    -- heartbeat is handled separately by timer; but if we got a packet, we consider it alive
-    last_heartbeat = os.clock()
-    set_led_bool(heartbeat_led, true)
 
     -- reactor state
     if s.reactor_on ~= nil then
@@ -420,7 +413,7 @@ local function apply_status(s)
         set_led_bool(rct_active_led, s.reactor_on)
     end
 
-    -- modem/network
+    -- modem / network
     if s.modem_ok ~= nil then
         set_led_bool(modem_led_el, s.modem_ok)
     end
@@ -441,7 +434,7 @@ local function apply_status(s)
         set_led_bool(emerg_cool_led, s.emerg_cool)
     end
 
-    -- trip + trip causes
+    -- trip + causes
     if s.trip ~= nil then
         set_led_bool(trip_led, s.trip)
     end
@@ -481,7 +474,53 @@ local function apply_status(s)
 end
 
 -------------------------------------------------
--- Event loop: handle modem messages + heartbeat timeout
+-- Convert full core status (type=\"status\") to panel struct
+-------------------------------------------------
+local function core_status_to_panel(msg)
+    if type(msg) ~= "table" then return nil end
+    if msg.type ~= "status" then return nil end
+
+    local sens = msg.sensors or {}
+    local online = not not sens.online
+    local powered = not not msg.poweredOn
+    local scram = not not msg.scramLatched
+    local emerg = not not msg.emergencyOn
+
+    local burnRate = sens.burnRate or 0
+
+    local panel = {
+        -- left column
+        status_ok  = online and emerg and not scram,
+        reactor_on = online and powered and (burnRate > 0),
+        modem_ok   = true,
+        network_ok = true,
+        rps_enable = emerg,
+        auto_power = false,
+
+        -- middle
+        emerg_cool = false,
+
+        -- trip + causes
+        trip         = scram,
+        manual_trip  = scram,
+        auto_trip    = false,
+        timeout_trip = false,
+        rct_fault    = not online,
+
+        -- alarms (same thresholds as core)
+        hi_damage = (sens.damagePct or 0) > MAX_DAMAGE_PCT,
+        hi_temp   = false,
+        lo_fuel   = false,
+        hi_waste  = (sens.wasteFrac or 0) > MAX_WASTE_FRAC,
+        lo_ccool  = (sens.coolantFrac or 1) < MIN_COOLANT_FRAC,
+        hi_hcool  = (sens.heatedFrac or 0) > MAX_HEATED_FRAC,
+    }
+
+    return panel
+end
+
+-------------------------------------------------
+-- Event loop: modem messages + heartbeat timeout
 -------------------------------------------------
 local hb_timer = os.startTimer(HEARTBEAT_CHECK_STEP)
 
@@ -490,18 +529,26 @@ while true do
 
     if ev == "modem_message" then
         local side, ch, rch, msg, dist = p1, p2, p3, p4, p5
+
         if ch == STATUS_CHANNEL and type(msg) == "table" then
-            apply_status(msg)
+            -- direct panel struct from reactor_core.lua (sendPanelStatus)
+            apply_panel_status(msg)
+
+        elseif ch == CORE_STATUS_CHANNEL and type(msg) == "table" and msg.type == "status" then
+            -- full core status; derive panel fields here
+            local p = core_status_to_panel(msg)
+            if p then
+                apply_panel_status(p)
+            end
         end
 
     elseif ev == "timer" and p1 == hb_timer then
-        -- heartbeat timeout check
         local now = os.clock()
         local alive = (last_heartbeat > 0) and ((now - last_heartbeat) <= HEARTBEAT_TIMEOUT)
 
         set_led_bool(heartbeat_led, alive)
         if not alive then
-            -- if heartbeat lost, mark network as fault and status as bad
+            -- heartbeat lost: show network fault + bad status
             set_rgb_state(false)
             set_led_bool(status_led, false)
         end

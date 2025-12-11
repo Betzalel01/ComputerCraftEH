@@ -46,6 +46,12 @@ if not mon then error("No monitor on top for status_display", 0) end
 mon.setTextScale(0.5)
 local mw, mh = mon.getSize()
 
+-- CLEAR the monitor so old text like "MODEM (4)" is removed
+mon.setBackgroundColor(theme.fp_bg or colors.black)
+mon.setTextColor(theme.fp_fg or colors.white)
+mon.clear()
+mon.setCursorPos(1, 1)
+
 -- Draw directly on the monitor
 local panel = DisplayBox{
     window = mon,
@@ -77,14 +83,14 @@ local system = Div{
 }
 
 -- STATUS – overall health
-LED{
+local status_led = LED{
     parent = system,
     label  = "STATUS",
     colors = cpair(colors.red, colors.green)
 }
 
 -- HEARTBEAT – alive if core is reporting
-LED{
+local heartbeat_led = LED{
     parent = system,
     label  = "HEARTBEAT",
     colors = ind_grn
@@ -93,7 +99,7 @@ LED{
 system.line_break()
 
 -- REACTOR – off/warn/on
-LEDPair{
+local reactor_led = LEDPair{
     parent = system,
     label  = "REACTOR",
     off    = colors.red,
@@ -101,8 +107,8 @@ LEDPair{
     c2     = colors.green
 }
 
--- MODEM – updated label (previously “MODEM (4)”)
-LED{
+-- MODEM – single local modem, no count
+local modem_led = LED{
     parent = system,
     label  = "MODEM",
     colors = ind_grn
@@ -110,15 +116,15 @@ LED{
 
 -- NETWORK – comms state
 if not style.colorblind then
-    RGBLED{
+    local network_led = RGBLED{
         parent = system,
         label  = "NETWORK",
         colors = {
-            colors.green,
-            colors.red,
-            colors.yellow,
-            colors.orange,
-            style.ind_bkg
+            colors.green,       -- OK
+            colors.red,         -- fault
+            colors.yellow,      -- degraded
+            colors.orange,      -- warning
+            style.ind_bkg       -- off
         }
     }
 else
@@ -147,15 +153,15 @@ end
 
 system.line_break()
 
--- RPS ENABLE – emergency auto-trip armed
-LED{
+-- RPS ENABLE – emergency protection / auto-trip armed
+local rps_enable_led = LED{
     parent = system,
     label  = "RPS ENABLE",
     colors = ind_grn
 }
 
 -- AUTO POWER CTRL – automatic burn-rate enabled
-LED{
+local auto_power_led = LED{
     parent = system,
     label  = "AUTO POWER CTRL",
     colors = ind_grn
@@ -184,7 +190,8 @@ local mid = Div{
     height = 18
 }
 
-LED{
+-- RCT ACTIVE – reactor actually burning
+local rct_active_led = LED{
     parent = mid,
     x      = 2,
     width  = 12,
@@ -192,7 +199,8 @@ LED{
     colors = ind_grn
 }
 
-LED{
+-- EMERG COOL – Emergency Cooling active
+local emerg_cool_led = LED{
     parent = mid,
     x      = 2,
     width  = 14,
@@ -207,6 +215,7 @@ local hi_box = cpair(
     theme.hi_bg or colors.gray
 )
 
+-- TRIP banner
 local trip_frame = Rectangle{
     parent     = mid,
     x          = 1,
@@ -222,7 +231,7 @@ local trip_div = Div{
     fg_bg  = hi_box
 }
 
-LED{
+local trip_led = LED{
     parent = trip_div,
     width  = 10,
     label  = "TRIP",
@@ -245,45 +254,91 @@ local rps_cause = Rectangle{
     fg_bg  = hi_box
 }
 
-LED{ parent = rps_cause, label = "MANUAL",     colors = ind_red }
-LED{ parent = rps_cause, label = "AUTOMATIC",  colors = ind_red }
-LED{ parent = rps_cause, label = "TIMEOUT",    colors = ind_red }
-LED{ parent = rps_cause, label = "RCT FAULT",  colors = ind_red }
+local manual_led = LED{
+    parent = rps_cause,
+    label  = "MANUAL",
+    colors = ind_red
+}
+
+local auto_trip_led = LED{
+    parent = rps_cause,
+    label  = "AUTOMATIC",
+    colors = ind_red
+}
+
+local timeout_led = LED{
+    parent = rps_cause,
+    label  = "TIMEOUT",
+    colors = ind_red
+}
+
+local rct_fault_led = LED{
+    parent = rps_cause,
+    label  = "RCT FAULT",
+    colors = ind_red
+}
 
 rps_cause.line_break()
 
-LED{ parent = rps_cause, label = "HI DAMAGE",  colors = ind_red }
-LED{ parent = rps_cause, label = "HI TEMP",    colors = ind_red }
+local hi_damage_led = LED{
+    parent = rps_cause,
+    label  = "HI DAMAGE",
+    colors = ind_red
+}
+
+local hi_temp_led = LED{
+    parent = rps_cause,
+    label  = "HI TEMP",
+    colors = ind_red
+}
 
 rps_cause.line_break()
 
-LED{ parent = rps_cause, label = "LO FUEL",    colors = ind_red }
-LED{ parent = rps_cause, label = "HI WASTE",   colors = ind_red }
+local lo_fuel_led = LED{
+    parent = rps_cause,
+    label  = "LO FUEL",
+    colors = ind_red
+}
+
+local hi_waste_led = LED{
+    parent = rps_cause,
+    label  = "HI WASTE",
+    colors = ind_red
+}
 
 rps_cause.line_break()
 
-LED{ parent = rps_cause, label = "LO CCOOLANT", colors = ind_red }
-LED{ parent = rps_cause, label = "HI HCOOLANT", colors = ind_red }
+local lo_ccool_led = LED{
+    parent = rps_cause,
+    label  = "LO CCOOLANT",
+    colors = ind_red
+}
+
+local hi_hcool_led = LED{
+    parent = rps_cause,
+    label  = "HI HCOOLANT",
+    colors = ind_red
+}
 
 -------------------------------------------------
--- Footer
+-- Footer: your own version labels
 -------------------------------------------------
 local about = Div{
     parent = panel,
     y      = mh - 1,
-    width  = 18,
+    width  = 24,
     height = 2,
     fg_bg  = disabled_fg
 }
 
 TextBox{
     parent = about,
-    text   = "FW: v1.9.1"
+    text   = "CORE:  v1.0.0"
 }
 
 TextBox{
     parent = about,
-    text   = "NT: v3.0.8"
+    text   = "PANEL: v1.0.0"
 }
 
 -------------------------------------------------

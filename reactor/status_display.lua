@@ -1,7 +1,7 @@
 -- reactor/status_display.lua
--- Minimal, heavily instrumented status-only panel.
--- HEARTBEAT comes from core heartbeat packets on CONTROL_CHANNEL (101).
--- STATUS comes from panel frames on STATUS_CHANNEL (250) via status_ok.
+-- Minimal status + heartbeat panel driven only by STATUS_CHANNEL (250).
+-- HEARTBEAT = "have we seen recent status frames?"
+-- STATUS    = "have we seen recent status frames AND status_ok is true?"
 
 -------------------------------------------------
 -- Require path so graphics/* can be found
@@ -23,15 +23,11 @@ local LED        = require("graphics.elements.indicators.LED")
 local cpair      = core.cpair
 
 -------------------------------------------------
--- Channels / heartbeat
+-- Channels / timing
 -------------------------------------------------
-local REACTOR_CHANNEL        = 100    -- used as reply channel in core (not needed here)
-local CONTROL_CHANNEL        = 101    -- core sends heartbeat here
-local STATUS_CHANNEL         = 250    -- core sends panel frames here
-
-local HEARTBEAT_TIMEOUT      = 15.0   -- seconds since last heartbeat => lost core
-local STATUS_TIMEOUT         = 15.0   -- seconds since last status frame => stale status
-local CHECK_STEP             = 1.0    -- timer tick
+local STATUS_CHANNEL       = 250      -- reactor_core -> panel (sendPanelStatus)
+local STATUS_TIMEOUT       = 10.0     -- seconds since last frame => lost comms
+local CHECK_STEP           = 1.0      -- timer tick
 
 -------------------------------------------------
 -- Peripherals
@@ -41,7 +37,6 @@ if not mon then error("No monitor on TOP for status_display", 0) end
 
 local modem = peripheral.wrap("back")
 if not modem then error("No modem on BACK for status_display", 0) end
-modem.open(CONTROL_CHANNEL)
 modem.open(STATUS_CHANNEL)
 
 -------------------------------------------------
@@ -50,7 +45,7 @@ modem.open(STATUS_CHANNEL)
 term.clear()
 term.setCursorPos(1,1)
 print("[STATUS_DISPLAY] starting")
-print("[STATUS_DISPLAY] listening on CONTROL="..CONTROL_CHANNEL.." STATUS="..STATUS_CHANNEL)
+print("[STATUS_DISPLAY] listening on STATUS="..STATUS_CHANNEL)
 print("[STATUS_DISPLAY] monitor side = top, modem side = back")
 print("---------------------------------------------------")
 
@@ -94,56 +89,43 @@ local heartbeat_led = LED{
 -------------------------------------------------
 -- Internal state
 -------------------------------------------------
-local last_hb_time     = 0      -- last time we saw a heartbeat packet
-local last_status_time = 0      -- last time we saw a panel status frame
-local last_status_ok   = false  -- last s.status_ok value
-local hb_count         = 0
-local status_count     = 0
+local last_frame_time = 0      -- last time we saw ANY panel frame on 250
+local last_status_ok  = false  -- last s.status_ok from core
+local frame_count     = 0
 
 local function led_bool(el, v, name)
     if not el or not el.set_value then return end
     local b = v and true or false
-    el.set_value(b)  -- NOTE: dot, not colon
+    el.set_value(b)  -- NOTE: function style, not method-style
 
     if name then
         print(string.format("[LED] %s := %s", name, tostring(b)))
     end
 end
 
--- Apply a heartbeat packet from reactor_core.lua (type="heartbeat" on CONTROL_CHANNEL)
-local function apply_heartbeat(msg)
-    hb_count     = hb_count + 1
-    last_hb_time = os.clock()
-
-    print(string.format(
-        "[HB] #%d at t=%.2f (msg.type=%s)",
-        hb_count, last_hb_time, tostring(msg.type)
-    ))
-end
-
--- Apply a panel frame from reactor_core.lua:buildPanelStatus() (on STATUS_CHANNEL)
+-- Apply a single panel frame from reactor_core.lua:buildPanelStatus()
 local function apply_panel_frame(s)
     if type(s) ~= "table" then
         print("[FRAME] apply_panel_frame called with non-table")
         return
     end
 
-    status_count     = status_count + 1
-    last_status_time = os.clock()
+    frame_count      = frame_count + 1
+    last_frame_time  = os.clock()
     last_status_ok   = not not s.status_ok
 
     print(string.format(
         "[FRAME] #%d at t=%.2f, status_ok=%s",
-        status_count, last_status_time, tostring(last_status_ok)
+        frame_count, last_frame_time, tostring(last_status_ok)
     ))
 
-    if status_count <= 10 then
+    if frame_count <= 5 then
         print("[FRAME] raw msg: "..textutils.serialize(s))
     end
 end
 
 -------------------------------------------------
--- Timers
+-- Timer
 -------------------------------------------------
 local check_timer = os.startTimer(CHECK_STEP)
 
@@ -165,41 +147,29 @@ while true do
             tostring(side), tostring(ch), tostring(rch), tostring(dist)
         ))
 
-        if type(msg) == "table" and (hb_count < 10 or status_count < 10) then
-            print("[EVENT] msg preview: "..textutils.serialize(msg))
-        end
-
-        if ch == CONTROL_CHANNEL and type(msg) == "table" and msg.type == "heartbeat" then
-            print("[EVENT] -> heartbeat accepted")
-            apply_heartbeat(msg)
-
-        elseif ch == STATUS_CHANNEL and type(msg) == "table" then
+        if ch == STATUS_CHANNEL and type(msg) == "table" then
             print("[EVENT] -> panel frame accepted")
             apply_panel_frame(msg)
-
         else
-            print("[EVENT] -> ignored (channel/type mismatch)")
+            print("[EVENT] -> ignored (wrong channel or non-table)")
         end
 
     elseif ev == "timer" and p1 == check_timer then
-        local now         = os.clock()
-        local hb_alive    = (last_hb_time     > 0) and ((now - last_hb_time)     <= HEARTBEAT_TIMEOUT)
-        local status_fresh= (last_status_time > 0) and ((now - last_status_time) <= STATUS_TIMEOUT)
+        local now    = os.clock()
+        local alive  = (last_frame_time > 0) and ((now - last_frame_time) <= STATUS_TIMEOUT)
 
-        -- HEARTBEAT = "core code is alive" (based ONLY on heartbeat packets)
+        -- HEARTBEAT = comms alive (recent panel frames)
+        -- STATUS    = comms alive AND reactor healthy per core
+        local status_on = alive and last_status_ok
+
         print(string.format(
-            "[CHECK] t=%.2f hb_last=%.2f hb_alive=%s status_last=%.2f status_fresh=%s last_status_ok=%s",
-            now,
-            last_hb_time, tostring(hb_alive),
-            last_status_time, tostring(status_fresh),
-            tostring(last_status_ok)
+            "[CHECK] t=%.2f last_frame=%.2f alive=%s last_status_ok=%s STATUS=%s",
+            now, last_frame_time, tostring(alive),
+            tostring(last_status_ok), tostring(status_on)
         ))
 
-        led_bool(heartbeat_led, hb_alive, "HEARTBEAT")
-
-        -- STATUS = comms fresh AND core says reactor is healthy
-        local status_on = status_fresh and last_status_ok
-        led_bool(status_led, status_on, "STATUS")
+        led_bool(heartbeat_led, alive,      "HEARTBEAT")
+        led_bool(status_led,    status_on,  "STATUS")
 
         check_timer = os.startTimer(CHECK_STEP)
     end

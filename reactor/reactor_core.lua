@@ -134,13 +134,23 @@ end
 --------------------------
 -- Build the status table expected by reactor/status_display.lua
 local function buildPanelStatus()
-  -- "Good" overall if online, emergency protection enabled, and not scrammed
-  local status_ok = sensors.online and emergencyOn and not scramLatched
+  -- basic reactor / power state
+  local online    = sensors.online
+  local burn      = sensors.burnRate or 0
+  local reactor_on = online and poweredOn and (burn > 0)
 
-  local reactor_on = sensors.online and poweredOn and (sensors.burnRate or 0) > 0
+  -- check safety limits
+  local within_limits = true
+  if sensors.damagePct > MAX_DAMAGE_PCT   then within_limits = false end
+  if sensors.coolantFrac < MIN_COOLANT_FRAC then within_limits = false end
+  if sensors.wasteFrac   > MAX_WASTE_FRAC   then within_limits = false end
+  if sensors.heatedFrac  > MAX_HEATED_FRAC  then within_limits = false end
 
-  -- Right now we don't distinguish manual vs automatic trips, etc.
-  local trip = scramLatched
+  -- "status_ok" = reactor running safely with protection enabled & not scrammed
+  local status_ok = reactor_on
+                    and emergencyOn
+                    and (not scramLatched)
+                    and within_limits
 
   local panel = {
     -- left column
@@ -155,23 +165,24 @@ local function buildPanelStatus()
     emerg_cool = false,         -- no separate ECCS signal wired yet
 
     -- trip banner + causes
-    trip        = trip,
-    manual_trip = trip,         -- treat all trips as "manual" until we add detail
-    auto_trip   = false,
+    trip         = scramLatched,
+    manual_trip  = scramLatched,  -- treat all trips as "manual" until we add detail
+    auto_trip    = false,
     timeout_trip = false,
-    rct_fault   = not sensors.online,
+    rct_fault    = not online,
 
     -- alarms (use your safety thresholds)
-    hi_damage = sensors.damagePct > MAX_DAMAGE_PCT,
-    hi_temp   = false,          -- Mek temp alarms not wired; keep off for now
-    lo_fuel   = false,          -- not tracked
-    hi_waste  = sensors.wasteFrac > MAX_WASTE_FRAC,
+    hi_damage = sensors.damagePct   > MAX_DAMAGE_PCT,
+    hi_temp   = false,              -- Mek temp alarms not wired; keep off for now
+    lo_fuel   = false,              -- not tracked
+    hi_waste  = sensors.wasteFrac   > MAX_WASTE_FRAC,
     lo_ccool  = sensors.coolantFrac < MIN_COOLANT_FRAC,
-    hi_hcool  = sensors.heatedFrac > MAX_HEATED_FRAC,
+    hi_hcool  = sensors.heatedFrac  > MAX_HEATED_FRAC,
   }
 
   return panel
 end
+
 
 local function sendPanelStatus()
   local pkt = buildPanelStatus()

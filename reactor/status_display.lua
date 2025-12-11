@@ -1,7 +1,6 @@
 -- reactor/status_display.lua
--- Minimal status + heartbeat panel driven only by STATUS_CHANNEL (250).
--- HEARTBEAT = "have we seen recent status frames?"
--- STATUS    = "have we seen recent status frames AND status_ok is true?"
+-- Minimal, instrumented status-only panel.
+-- Driven solely by STATUS_CHANNEL (250) frames from reactor_core.lua.
 
 -------------------------------------------------
 -- Require path so graphics/* can be found
@@ -25,9 +24,9 @@ local cpair      = core.cpair
 -------------------------------------------------
 -- Channels / timing
 -------------------------------------------------
-local STATUS_CHANNEL       = 250      -- reactor_core -> panel (sendPanelStatus)
-local STATUS_TIMEOUT       = 10.0     -- seconds since last frame => lost comms
-local CHECK_STEP           = 1.0      -- timer tick
+local STATUS_CHANNEL    = 250      -- reactor_core -> panel (sendPanelStatus)
+local STATUS_TIMEOUT    = 10.0     -- seconds since last frame => lost comms
+local CHECK_STEP        = 1.0      -- timer tick
 
 -------------------------------------------------
 -- Peripherals
@@ -96,8 +95,8 @@ local frame_count     = 0
 local function led_bool(el, v, name)
     if not el or not el.set_value then return end
     local b = v and true or false
-    el.set_value(b)  -- NOTE: function style, not method-style
-
+    -- IMPORTANT: function-style call, NOT method-style
+    el.set_value(b)
     if name then
         print(string.format("[LED] %s := %s", name, tostring(b)))
     end
@@ -110,9 +109,9 @@ local function apply_panel_frame(s)
         return
     end
 
-    frame_count      = frame_count + 1
-    last_frame_time  = os.clock()
-    last_status_ok   = not not s.status_ok
+    frame_count     = frame_count + 1
+    last_frame_time = os.clock()
+    last_status_ok  = not not s.status_ok
 
     print(string.format(
         "[FRAME] #%d at t=%.2f, status_ok=%s",
@@ -155,11 +154,11 @@ while true do
         end
 
     elseif ev == "timer" and p1 == check_timer then
-        local now    = os.clock()
-        local alive  = (last_frame_time > 0) and ((now - last_frame_time) <= STATUS_TIMEOUT)
+        local now   = os.clock()
+        local alive = (last_frame_time > 0) and ((now - last_frame_time) <= STATUS_TIMEOUT)
 
-        -- HEARTBEAT = comms alive (recent panel frames)
-        -- STATUS    = comms alive AND reactor healthy per core
+        -- HEARTBEAT = “we are receiving frames”
+        -- STATUS    = “we are receiving frames AND core says status_ok”
         local status_on = alive and last_status_ok
 
         print(string.format(

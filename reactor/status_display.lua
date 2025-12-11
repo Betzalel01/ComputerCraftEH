@@ -357,17 +357,25 @@ local last_heartbeat = 0
 
 -- safe setter wrappers; if the engine uses a different method name, you can adjust here
 local function set_led_bool(el, val)
-    if el and el.set_value then
-        el:set_value(val and true or false)
-    end
+  if not el then return end
+  local v = val and true or false
+  if el.set_value then
+      el:set_value(v)
+  elseif el.setState then
+      el:setState(v)
+  end
 end
 
 local function set_ledpair_bool(el, val)
-    if el and el.set_value then
-        -- false -> off, true -> "on" (we'll use the green state)
-        el:set_value(val and 2 or 0)
-    end
+  if not el then return end
+  local v = val and 2 or 0      -- 0=off, 1=yellow, 2=green in LEDPair
+  if el.set_value then
+      el:set_value(v)
+  elseif el.setState then
+      el:setState(v)
+  end
 end
+
 
 local function set_rgb_state(ok)
     if not network_led or not network_led.set_value then return end

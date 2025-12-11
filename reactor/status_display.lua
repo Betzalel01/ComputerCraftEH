@@ -79,13 +79,13 @@ local d = Div{
 local status_led = LED{
     parent = d,
     label  = "STATUS",
-    colors = cpair(colors.green, colors.red)
+    colors = cpair(colors.red, colors.green)
 }
 
 local heartbeat_led = LED{
     parent  = d,
     label   = "HEARTBEAT",
-    colors  = cpair(colors.green, colors.red)
+    colors  = cpair(colors.red, colors.green)
 }
 
 

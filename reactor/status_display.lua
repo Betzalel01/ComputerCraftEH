@@ -1,22 +1,17 @@
--- status_display.lua
--- Stand-alone front-panel GUI using cc-mek-scada graphics library.
--- Expects:
---   /graphics/*               (from cc-mek-scada)
---   /reactor-plc/panel/style.lua  (theme + color definitions)
+-- ============================================================
+-- status_display.lua  (clean full version)
+-- ============================================================
 
--- ========= dependencies =========
-
--- ensure require() can load /graphics/* when running from /reactor
+-- ensure require() can load /graphics/*
 if package and package.path then
     package.path = "/?.lua;/?/init.lua;" .. package.path
 else
     package = { path = "/?.lua;/?/init.lua" }
 end
 
+-- graphics engine
 local ok_core, core = pcall(require, "graphics.core")
-if not ok_core then
-    error("graphics.core not found – make sure /graphics is present")
-end
+if not ok_core then error("graphics.core not found – make sure /graphics exists") end
 
 local style      = require("reactor-plc.panel.style")
 
@@ -28,6 +23,7 @@ local PushButton = require("graphics.elements.controls.PushButton")
 local LED        = require("graphics.elements.indicators.LED")
 local LEDPair    = require("graphics.elements.indicators.LEDPair")
 local RGBLED     = require("graphics.elements.indicators.RGBLED")
+local flasher    = require("graphics.flasher")
 
 local ALIGN  = core.ALIGN
 local cpair  = core.cpair
@@ -38,29 +34,34 @@ local ind_grn     = style.ind_grn
 local ind_red     = style.ind_red
 local disabled_fg = style.fp.disabled_fg
 
--- ========= base display =========
+-- ============================================================
+-- WINDOW
+-- ============================================================
 
-local disp_w, disp_h = term.getSize()
+local w, h = term.getSize()
 
--- main display box – everything is drawn inside this
 local panel = DisplayBox{
     window = term.current(),
     fg_bg  = cpair(theme.fp_fg or colors.white, theme.fp_bg or colors.black)
 }
 
--- ========= header =========
+-- ============================================================
+-- HEADER
+-- ============================================================
 
 TextBox{
     parent    = panel,
     x         = 1,
     y         = 1,
-    width     = disp_w,
+    width     = w,
     text      = "FISSION REACTOR PLC - UNIT 1",
     alignment = ALIGN.CENTER,
     fg_bg     = theme.header
 }
 
--- ========= left: system / modem / RT indicators =========
+-- ============================================================
+-- LEFT COLUMN (system indicators)
+-- ============================================================
 
 local system = Div{
     parent = panel,
@@ -70,70 +71,24 @@ local system = Div{
     height = 18
 }
 
--- “STATUS” + “HEARTBEAT”
-local status_led = LED{
-    parent = system,
-    label  = "STATUS",
-    colors = cpair(colors.red, colors.green)
-}
-
-local heartbeat = LED{
-    parent = system,
-    label  = "HEARTBEAT",
-    colors = ind_grn
-}
+LED{ parent = system, label = "STATUS",    colors = cpair(colors.red, colors.green) }
+LED{ parent = system, label = "HEARTBEAT", colors = ind_grn }
 
 system.line_break()
 
--- reactor present / state and modem / network indicators
-local reactor = LEDPair{
-    parent = system,
-    label  = "REACTOR",
-    off    = colors.red,
-    c1     = colors.yellow,
-    c2     = colors.green
-}
-
-local modem = LED{
-    parent = system,
-    label  = "MODEM (1)",
-    colors = ind_grn
-}
+LEDPair{ parent = system, label = "REACTOR", off = colors.red, c1 = colors.yellow, c2 = colors.green }
+LED{     parent = system, label = "MODEM (1)", colors = ind_grn }
 
 if not style.colorblind then
     RGBLED{
         parent = system,
         label  = "NETWORK",
-        colors = {
-            colors.green,
-            colors.red,
-            colors.yellow,
-            colors.orange,
-            style.ind_bkg
-        }
+        colors = { colors.green, colors.red, colors.yellow, colors.orange, style.ind_bkg }
     }
 else
-    LEDPair{
-        parent = system,
-        label  = "NT LINKED",
-        off    = style.ind_bkg,
-        c1     = colors.red,
-        c2     = colors.green
-    }
-
-    LEDPair{
-        parent = system,
-        label  = "NT VERSION",
-        off    = style.ind_bkg,
-        c1     = colors.red,
-        c2     = colors.green
-    }
-
-    LED{
-        parent = system,
-        label  = "NT COLLISION",
-        colors = ind_red
-    }
+    LEDPair{ parent = system, label = "NT LINKED",  off = style.ind_bkg, c1 = colors.red,   c2 = colors.green }
+    LEDPair{ parent = system, label = "NT VERSION", off = style.ind_bkg, c1 = colors.red,   c2 = colors.green }
+    LED{     parent = system, label = "NT COLLISION", colors = ind_red }
 end
 
 system.line_break()
@@ -146,51 +101,38 @@ LED{ parent = system, label = "RT SPCTL",    colors = ind_grn }
 
 system.line_break()
 
--- computer ID text
-local comp_id = string.format("(%d)", os.getComputerID())
 TextBox{
     parent = system,
     x      = 9,
     y      = 5,
     width  = 6,
-    text   = comp_id,
+    text   = "(" .. os.getComputerID() .. ")",
     fg_bg  = disabled_fg
 }
 
--- ========= middle: ACTIVE + RPS TRIP + SCRAM / RESET =========
+-- ============================================================
+-- MIDDLE COLUMN (ACTIVE / TRIP / SCRAM+RESET)
+-- ============================================================
 
-local status = Div{
+local mid = Div{
     parent = panel,
     x      = 17,
     y      = 3,
-    width  = disp_w - 32,
+    width  = w - 32,
     height = 18
 }
 
-LED{
-    parent = status,
-    x      = 2,
-    width  = 12,
-    label  = "RCT ACTIVE",
-    colors = ind_grn
-}
+LED{ parent = mid, x = 2, width = 12, label = "RCT ACTIVE", colors = ind_grn }
+LED{ parent = mid, x = 2, width = 12, label = "EMERG COOL", colors = ind_grn }
 
-LED{
-    parent = status,
-    x      = 2,
-    width  = 12,
-    label  = "EMERG COOL",
-    colors = ind_grn
-}
-
-status.line_break()
+mid.line_break()
 
 local hi_box = cpair(theme.hi_fg or colors.white, theme.hi_bg or colors.gray)
 
 local trip_frame = Rectangle{
-    parent     = status,
+    parent     = mid,
     x          = 1,
-    width      = status.get_width() - 2,
+    width      = mid.get_width() - 2,
     height     = 3,
     border     = border(1, hi_box.bkg, true),
     even_inner = true
@@ -202,8 +144,6 @@ local trip_div = Div{
     fg_bg  = hi_box
 }
 
-local flasher = require("graphics.flasher")
-
 LED{
     parent = trip_div,
     width  = 10,
@@ -214,9 +154,9 @@ LED{
 }
 
 local controls_frame = Rectangle{
-    parent     = status,
+    parent     = mid,
     x          = 1,
-    width      = status.get_width() - 2,
+    width      = mid.get_width() - 2,
     height     = 3,
     border     = border(1, hi_box.bkg, true),
     even_inner = true
@@ -229,11 +169,11 @@ local controls = Div{
     fg_bg  = hi_box
 }
 
-local button_space = math.floor((controls.get_width() - 14) / 3)
+local spacing = math.floor((controls.get_width() - 14) / 3)
 
 PushButton{
     parent       = controls,
-    x            = button_space + 1,
+    x            = spacing + 1,
     y            = 1,
     min_width    = 7,
     text         = "SCRAM",
@@ -244,7 +184,7 @@ PushButton{
 
 PushButton{
     parent       = controls,
-    x            = (2 * button_space) + 9,
+    x            = spacing * 2 + 9,
     y            = 1,
     min_width    = 7,
     text         = "RESET",
@@ -253,11 +193,51 @@ PushButton{
     active_fg_bg = cpair(colors.black, colors.yellow)
 }
 
--- ========= footer (FW / NT versions – static placeholders) =========
+-- ============================================================
+-- RIGHT COLUMN (RPS TRIP REASONS)
+-- ============================================================
+
+local rps = Rectangle{
+    parent = panel,
+    x      = w - 15,
+    y      = 3,
+    width  = 16,
+    height = 16,
+    thin   = true,
+    border = border(1, hi_box.bkg),
+    fg_bg  = hi_box
+}
+
+local rps_labels1 = {
+    "MANUAL", "AUTOMATIC", "TIMEOUT", "PLC FAULT", "RCT FAULT"
+}
+
+for _, lbl in ipairs(rps_labels1) do
+    LED{ parent = rps, label = lbl, colors = ind_red }
+end
+
+rps.line_break()
+
+LED{ parent = rps, label = "HI DAMAGE", colors = ind_red }
+LED{ parent = rps, label = "HI TEMP",   colors = ind_red }
+
+rps.line_break()
+
+LED{ parent = rps, label = "LO FUEL",  colors = ind_red }
+LED{ parent = rps, label = "HI WASTE", colors = ind_red }
+
+rps.line_break()
+
+LED{ parent = rps, label = "LO CCOOLANT", colors = ind_red }
+LED{ parent = rps, label = "HI HCOOLANT", colors = ind_red }
+
+-- ============================================================
+-- FOOTER
+-- ============================================================
 
 local about = Div{
     parent = panel,
-    y      = disp_h - 1,
+    y      = h - 1,
     width  = 15,
     height = 2,
     fg_bg  = disabled_fg
@@ -266,26 +246,10 @@ local about = Div{
 TextBox{ parent = about, text = "FW: v1.9.1" }
 TextBox{ parent = about, text = "NT: v3.0.8" }
 
--- ========= right: RPS trip reason list =========
+-- ============================================================
+-- MAIN LOOP
+-- ============================================================
 
-local rps_box = Rectangle{
-    parent = panel,
-    x      = disp_w - 15,
-    y      = 3,
-    width  = 16,
-    height = 16,
-    border = border(1, hi_box.bkg),
-    thin   = true,
-    fg_bg  = hi_box
-}
-
-local rps_labels_top = {
-    "MANUAL",
-    "AUTOMATIC",
-    "TIMEOUT",
-    "PLC FAULT",
-    "RCT FAULT"
-}
-
-for _, lbl in ipairs(rps_labels_top) do
-    LED{ parent = rps_box, label = lbl, co_
+while true do
+    os.pullEvent("terminate")
+end

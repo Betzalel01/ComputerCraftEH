@@ -1,6 +1,6 @@
 -- reactor/status_display.lua
--- Front-panel status display for Mekanism fission reactor.
--- Polls reactor_core.lua over modem and drives cc-mek-scada LEDs.
+-- Front-panel status display using cc-mek-scada graphics engine.
+-- Listens passively on STATUS_CHANNEL for panel frames from reactor_core.lua.
 
 -------------------------------------------------
 -- Require path so graphics/* can be found
@@ -38,20 +38,11 @@ local ind_red     = style.ind_red
 local disabled_fg = style.fp.disabled_fg
 
 -------------------------------------------------
--- Channels / thresholds (match reactor_core.lua)
+-- Channels / heartbeat
 -------------------------------------------------
-local REACTOR_CHANNEL        = 100   -- core listens here
-local CONTROL_CHANNEL        = 101   -- core replies here
-
-local STATUS_POLL_PERIOD     = 1.0   -- s between status polls
-local HEARTBEAT_TIMEOUT      = 10.0  -- s since last status => lost
-local HEARTBEAT_CHECK_PERIOD = 1.0
-
--- Safety thresholds (copied from reactor_core.lua so alarms match)
-local MAX_DAMAGE_PCT   = 5
-local MIN_COOLANT_FRAC = 0.20
-local MAX_WASTE_FRAC   = 0.90
-local MAX_HEATED_FRAC  = 0.95
+local STATUS_CHANNEL       = 250      -- reactor_core.lua -> panel frames
+local HEARTBEAT_TIMEOUT    = 10.0     -- s since last frame => lost comms
+local HEARTBEAT_CHECK_STEP = 1.0
 
 -------------------------------------------------
 -- Peripherals
@@ -61,7 +52,7 @@ if not mon then error("No monitor on top for status_display", 0) end
 
 local modem = peripheral.wrap("back")
 if not modem then error("No modem on back for status_display", 0) end
-modem.open(CONTROL_CHANNEL)
+modem.open(STATUS_CHANNEL)
 
 -------------------------------------------------
 -- Monitor setup
@@ -103,14 +94,14 @@ local system = Div{
     height = 18
 }
 
--- STATUS: green = comm OK AND reactor healthy; red = otherwise
+-- STATUS: green = comm OK AND reactor healthy, red otherwise
 local status_led = LED{
     parent = system,
     label  = "STATUS",
-    colors = cpair(colors.green, colors.red)   -- TRUE=green, FALSE=red
+    colors = cpair(colors.green, colors.red)  -- TRUE=green, FALSE=red
 }
 
--- HEARTBEAT: green when alive (just comm); red when timed out
+-- HEARTBEAT: green if we are seeing frames, red if timed out
 local heartbeat_led = LED{
     parent  = system,
     label   = "HEARTBEAT",
@@ -121,7 +112,6 @@ local heartbeat_led = LED{
 
 system.line_break()
 
--- REACTOR – off/on (pair: 0=off,1=yellow,2=green)
 local reactor_led = LEDPair{
     parent = system,
     label  = "REACTOR",
@@ -130,14 +120,12 @@ local reactor_led = LEDPair{
     c2     = colors.green
 }
 
--- MODEM – local modem health (assume OK while program runs)
 local modem_led_el = LED{
     parent = system,
     label  = "MODEM",
     colors = ind_grn
 }
 
--- NETWORK – comm status (green=alive, red=lost, grey=off)
 local network_led
 if not style.colorblind then
     network_led = RGBLED{
@@ -147,7 +135,7 @@ if not style.colorblind then
             colors.green,       -- 1: OK
             colors.red,         -- 2: fault
             colors.yellow,      -- 3: warn
-            colors.orange,      -- 4: other warn
+            colors.orange,      -- 4: warn2
             style.ind_bkg       -- 5: off
         }
     }
@@ -159,7 +147,6 @@ else
         c1     = colors.red,
         c2     = colors.green
     }
-
     LEDPair{
         parent = system,
         label  = "NT VERSION",
@@ -167,7 +154,6 @@ else
         c1     = colors.red,
         c2     = colors.green
     }
-
     LED{
         parent = system,
         label  = "NT COLLISION",
@@ -177,14 +163,12 @@ end
 
 system.line_break()
 
--- RPS ENABLE – emergency protection active
 local rps_enable_led = LED{
     parent = system,
     label  = "RPS ENABLE",
     colors = ind_grn
 }
 
--- AUTO POWER CTRL – placeholder (unused for now)
 local auto_power_led = LED{
     parent = system,
     label  = "AUTO POWER CTRL",
@@ -227,7 +211,6 @@ local hi_box = cpair(
     theme.hi_bg or colors.gray
 )
 
--- TRIP banner
 local trip_frame = Rectangle{
     parent     = mid,
     x          = 1,
@@ -354,26 +337,17 @@ TextBox{
 }
 
 -------------------------------------------------
--- LED helper functions
+-- Helpers
 -------------------------------------------------
 local function led_bool(el, v)
     if not el then return end
     v = not not v
-    if el.set_value then
-        el:set_value(v)
-    elseif el.setState then
-        el:setState(v)
-    end
+    if el.set_value then el:set_value(v) elseif el.setState then el:setState(v) end
 end
 
-local function ledpair_onoff(el, on)
+local function ledpair_state(el, idx)
     if not el then return end
-    local idx = on and 2 or 0  -- 2 = green, 0 = off
-    if el.set_value then
-        el:set_value(idx)
-    elseif el.setState then
-        el:setState(idx)
-    end
+    if el.set_value then el:set_value(idx) elseif el.setState then el:setState(idx) end
 end
 
 local function net_state(idx)
@@ -382,120 +356,94 @@ local function net_state(idx)
 end
 
 -------------------------------------------------
--- STATUS / HEALTH tracking
+-- Panel status state (from reactor_core.lua buildPanelStatus)
 -------------------------------------------------
-local last_status_time = 0        -- last time we received a status
-local last_health_ok   = false    -- last computed reactor health
+local last_frame_time = 0       -- last time we saw ANY frame
+local last_status_ok   = false  -- reactor health flag from last frame
 
--- Convert full core status (type="status") into health + alarm fields
-local function handle_core_status(msg)
-    if type(msg) ~= "table" or msg.type ~= "status" then return end
+local function apply_panel_frame(s)
+    if type(s) ~= "table" then return end
 
-    local sens    = msg.sensors or {}
-    local online  = not not sens.online
-    local powered = not not msg.poweredOn
-    local scram   = not not msg.scramLatched
-    local emerg   = not not msg.emergencyOn
-    local burn    = sens.burnRate or 0
+    -- remember comm time and health flag
+    last_frame_time = os.clock()
+    last_status_ok  = not not s.status_ok
 
-    -- reactor health: online, emergency protection ON, not scrammed
-    last_health_ok = online and emerg and not scram
+    -- left column (except STATUS / HEARTBEAT, handled in timer)
+    ledpair_state(reactor_led, s.reactor_on and 2 or 0)
+    led_bool(modem_led_el,  true)
+    net_state(1)                       -- seeing frames => network OK
 
-    -- record comm time
-    last_status_time = os.clock()
-
-    -- left column (except STATUS / HEARTBEAT, done in timers)
-    ledpair_onoff(reactor_led, online and powered and burn > 0)
-    led_bool(modem_led_el, true)          -- if this is running, local modem OK
-    net_state(1)                          -- got a reply => network OK (green)
-
-    led_bool(rps_enable_led, emerg)
-    led_bool(auto_power_led, false)       -- no auto power ctrl yet
+    led_bool(rps_enable_led, s.rps_enable)
+    led_bool(auto_power_led, s.auto_power)
 
     -- middle column
-    led_bool(rct_active_led, online and powered and burn > 0)
-    led_bool(emerg_cool_led, false)       -- no ECCS wired
+    led_bool(rct_active_led, s.reactor_on)
+    led_bool(emerg_cool_led, s.emerg_cool)
 
     -- trip + causes
-    led_bool(trip_led, scram)
-    led_bool(manual_led, scram)
-    led_bool(auto_trip_led, false)
-    led_bool(timeout_led, false)
-    led_bool(rct_fault_led, not online)
+    led_bool(trip_led,       s.trip)
+    led_bool(manual_led,     s.manual_trip)
+    led_bool(auto_trip_led,  s.auto_trip)
+    led_bool(timeout_led,    s.timeout_trip)
+    led_bool(rct_fault_led,  s.rct_fault)
 
-    -- alarms from thresholds
-    local dmg   = sens.damagePct   or 0
-    local cool  = sens.coolantFrac or 1
-    local heated= sens.heatedFrac  or 0
-    local waste = sens.wasteFrac   or 0
-
-    led_bool(hi_damage_led, dmg > MAX_DAMAGE_PCT)
-    led_bool(hi_temp_led, false)                 -- not wired
-    led_bool(lo_fuel_led, false)                 -- not tracked
-    led_bool(hi_waste_led, waste > MAX_WASTE_FRAC)
-    led_bool(lo_ccool_led, cool < MIN_COOLANT_FRAC)
-    led_bool(hi_hcool_led, heated > MAX_HEATED_FRAC)
-end
-
--------------------------------------------------
--- Networking helpers
--------------------------------------------------
-local function send_cmd(cmd, data)
-    local msg = { type = "cmd", cmd = cmd, data = data }
-    modem.transmit(REACTOR_CHANNEL, CONTROL_CHANNEL, msg)
+    -- alarms
+    led_bool(hi_damage_led, s.hi_damage)
+    led_bool(hi_temp_led,   s.hi_temp)
+    led_bool(lo_fuel_led,   s.lo_fuel)
+    led_bool(hi_waste_led,  s.hi_waste)
+    led_bool(lo_ccool_led,  s.lo_ccool)
+    led_bool(hi_hcool_led,  s.hi_hcool)
 end
 
 -------------------------------------------------
 -- Timers
 -------------------------------------------------
-local poll_timer = os.startTimer(0)  -- immediate first poll
-local hb_timer   = os.startTimer(HEARTBEAT_CHECK_PERIOD)
+local hb_timer = os.startTimer(HEARTBEAT_CHECK_STEP)
+
+-- initialise LEDs to "no comms"
+led_bool(status_led,    false)
+led_bool(heartbeat_led, false)
+net_state(5)
+ledpair_state(reactor_led, 0)
 
 -------------------------------------------------
--- MAIN EVENT LOOP
+-- MAIN LOOP
 -------------------------------------------------
 while true do
     local ev, p1, p2, p3, p4, p5 = os.pullEvent()
 
     if ev == "modem_message" then
         local side, ch, rch, msg, dist = p1, p2, p3, p4, p5
-        if ch == CONTROL_CHANNEL and type(msg) == "table" and msg.type == "status" then
-            handle_core_status(msg)
+        if ch == STATUS_CHANNEL and type(msg) == "table" then
+            apply_panel_frame(msg)
         end
 
-    elseif ev == "timer" then
-        if p1 == poll_timer then
-            -- poll reactor for fresh status
-            send_cmd("request_status")
-            poll_timer = os.startTimer(STATUS_POLL_PERIOD)
+    elseif ev == "timer" and p1 == hb_timer then
+        local now   = os.clock()
+        local alive = (last_frame_time > 0) and ((now - last_frame_time) <= HEARTBEAT_TIMEOUT)
 
-        elseif p1 == hb_timer then
-            -- communication liveness
-            local now   = os.clock()
-            local alive = (last_status_time > 0) and ((now - last_status_time) <= HEARTBEAT_TIMEOUT)
+        -- HEARTBEAT: comm only
+        led_bool(heartbeat_led, alive)
 
-            -- HEARTBEAT LED: comm only
-            led_bool(heartbeat_led, alive)
-
-            -- NETWORK LED: green if alive, red if dead, grey if never seen
-            if last_status_time == 0 then
-                net_state(5)   -- off
-            elseif alive then
-                net_state(1)   -- green
-            else
-                net_state(2)   -- red
-            end
-
-            -- STATUS LED: Option C = comm OK AND reactor healthy
-            local status_ok = alive and last_health_ok
-            led_bool(status_led, status_ok)
-
-            -- if comm lost, blank reactor indicator
-            if not alive then
-                ledpair_onoff(reactor_led, false)
-            end
-
-            hb_timer = os.startTimer(HEARTBEAT_CHECK_PERIOD)
+        -- NETWORK LED
+        if last_frame_time == 0 then
+            net_state(5)     -- never seen anything
+        elseif alive then
+            net_state(1)     -- green
+        else
+            net_state(2)     -- red
         end
+
+        -- STATUS = comm OK AND reactor healthy (Option C)
+        local status_ok = alive and last_status_ok
+        led_bool(status_led, status_ok)
+
+        -- if comm lost, blank reactor indicator
+        if not alive then
+            ledpair_state(reactor_led, 0)
+        end
+
+        hb_timer = os.startTimer(HEARTBEAT_CHECK_STEP)
     end
 end

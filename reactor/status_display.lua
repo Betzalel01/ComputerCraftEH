@@ -46,7 +46,7 @@ if not mon then error("No monitor on top for status_display", 0) end
 mon.setTextScale(0.5)
 local mw, mh = mon.getSize()
 
--- IMPORTANT: draw directly on the monitor (no hidden window)
+-- Draw directly on the monitor
 local panel = DisplayBox{
     window = mon,
     fg_bg  = cpair(theme.fp_fg or colors.white, theme.fp_bg or colors.black)
@@ -76,15 +76,15 @@ local system = Div{
     height = 18
 }
 
--- STATUS – overall health (green when all major conditions OK)
-local status_led = LED{
+-- STATUS – overall health
+LED{
     parent = system,
     label  = "STATUS",
     colors = cpair(colors.red, colors.green)
 }
 
--- HEARTBEAT – alive if we are receiving periodic status from core
-local heartbeat_led = LED{
+-- HEARTBEAT – alive if core is reporting
+LED{
     parent = system,
     label  = "HEARTBEAT",
     colors = ind_grn
@@ -92,33 +92,33 @@ local heartbeat_led = LED{
 
 system.line_break()
 
--- REACTOR – 3-state (off / warn / on)
-local reactor_led = LEDPair{
+-- REACTOR – off/warn/on
+LEDPair{
     parent = system,
     label  = "REACTOR",
-    off    = colors.red,     -- off/scrammed
-    c1     = colors.yellow,  -- transitioning / warning
-    c2     = colors.green    -- running
+    off    = colors.red,
+    c1     = colors.yellow,
+    c2     = colors.green
 }
 
--- MODEM – local modem hardware OK
-local modem_led = LED{
+-- MODEM – updated label (previously “MODEM (4)”)
+LED{
     parent = system,
     label  = "MODEM",
     colors = ind_grn
 }
 
--- NETWORK – multi-computer comms state
+-- NETWORK – comms state
 if not style.colorblind then
     RGBLED{
         parent = system,
         label  = "NETWORK",
         colors = {
-            colors.green,       -- OK
-            colors.red,         -- fault
-            colors.yellow,      -- degraded
-            colors.orange,      -- warning
-            style.ind_bkg       -- off
+            colors.green,
+            colors.red,
+            colors.yellow,
+            colors.orange,
+            style.ind_bkg
         }
     }
 else
@@ -147,15 +147,15 @@ end
 
 system.line_break()
 
--- RPS ENABLE – emergency protection / auto-trip armed
-local rps_enable_led = LED{
+-- RPS ENABLE – emergency auto-trip armed
+LED{
     parent = system,
     label  = "RPS ENABLE",
     colors = ind_grn
 }
 
--- AUTO POWER CTRL – automatic burn-rate control enabled
-local auto_power_led = LED{
+-- AUTO POWER CTRL – automatic burn-rate enabled
+LED{
     parent = system,
     label  = "AUTO POWER CTRL",
     colors = ind_grn
@@ -163,7 +163,7 @@ local auto_power_led = LED{
 
 system.line_break()
 
--- Local computer ID tag
+-- Computer ID tag
 TextBox{
     parent = system,
     x      = 10,
@@ -174,7 +174,7 @@ TextBox{
 }
 
 -------------------------------------------------
--- MIDDLE COLUMN: Reactor Active / Cooling / Trip
+-- MIDDLE COLUMN
 -------------------------------------------------
 local mid = Div{
     parent = panel,
@@ -184,8 +184,7 @@ local mid = Div{
     height = 18
 }
 
--- RCT ACTIVE – reactor actually burning fuel
-local rct_active_led = LED{
+LED{
     parent = mid,
     x      = 2,
     width  = 12,
@@ -193,8 +192,7 @@ local rct_active_led = LED{
     colors = ind_grn
 }
 
--- EMERG COOL – Emergency Cooling System active
-local emerg_cool_led = LED{
+LED{
     parent = mid,
     x      = 2,
     width  = 14,
@@ -209,7 +207,6 @@ local hi_box = cpair(
     theme.hi_bg or colors.gray
 )
 
--- TRIP banner (generic, covers auto + manual shutdown)
 local trip_frame = Rectangle{
     parent     = mid,
     x          = 1,
@@ -225,7 +222,7 @@ local trip_div = Div{
     fg_bg  = hi_box
 }
 
-local trip_led = LED{
+LED{
     parent = trip_div,
     width  = 10,
     label  = "TRIP",
@@ -248,84 +245,28 @@ local rps_cause = Rectangle{
     fg_bg  = hi_box
 }
 
--- MANUAL – last trip was from operator command
-local manual_led = LED{
-    parent = rps_cause,
-    label  = "MANUAL",
-    colors = ind_red
-}
-
--- AUTOMATIC – last trip was automatic protection
-local auto_trip_led = LED{
-    parent = rps_cause,
-    label  = "AUTOMATIC",
-    colors = ind_red
-}
-
--- TIMEOUT – watchdog / comms-based trip (optional use)
-local timeout_led = LED{
-    parent = rps_cause,
-    label  = "TIMEOUT",
-    colors = ind_red
-}
-
--- RCT FAULT – reactor internal fault / meltdown state
-local rct_fault_led = LED{
-    parent = rps_cause,
-    label  = "RCT FAULT",
-    colors = ind_red
-}
+LED{ parent = rps_cause, label = "MANUAL",     colors = ind_red }
+LED{ parent = rps_cause, label = "AUTOMATIC",  colors = ind_red }
+LED{ parent = rps_cause, label = "TIMEOUT",    colors = ind_red }
+LED{ parent = rps_cause, label = "RCT FAULT",  colors = ind_red }
 
 rps_cause.line_break()
 
--- HI DAMAGE – damage above threshold
-local hi_damage_led = LED{
-    parent = rps_cause,
-    label  = "HI DAMAGE",
-    colors = ind_red
-}
-
--- HI TEMP – high temperature alarm
-local hi_temp_led = LED{
-    parent = rps_cause,
-    label  = "HI TEMP",
-    colors = ind_red
-}
+LED{ parent = rps_cause, label = "HI DAMAGE",  colors = ind_red }
+LED{ parent = rps_cause, label = "HI TEMP",    colors = ind_red }
 
 rps_cause.line_break()
 
--- LO FUEL – fuel nearly depleted
-local lo_fuel_led = LED{
-    parent = rps_cause,
-    label  = "LO FUEL",
-    colors = ind_red
-}
-
--- HI WASTE – waste tank almost full
-local hi_waste_led = LED{
-    parent = rps_cause,
-    label  = "HI WASTE",
-    colors = ind_red
-}
+LED{ parent = rps_cause, label = "LO FUEL",    colors = ind_red }
+LED{ parent = rps_cause, label = "HI WASTE",   colors = ind_red }
 
 rps_cause.line_break()
 
--- LO CCOOLANT – insufficient cold coolant/inlet inventory
-local lo_ccool_led = LED{
-    parent = rps_cause,
-    label  = "LO CCOOLANT",
-    colors = ind_red
-}
-
--- HI HCOOLANT – hot coolant/steam system too full / over limit
-local hi_hcool_led = LED{
-    parent = rps_cause,
-    label  = "HI HCOOLANT",
-    colors = ind_red
-}
+LED{ parent = rps_cause, label = "LO CCOOLANT", colors = ind_red }
+LED{ parent = rps_cause, label = "HI HCOOLANT", colors = ind_red }
 
 -------------------------------------------------
--- Footer (version text)
+-- Footer
 -------------------------------------------------
 local about = Div{
     parent = panel,
@@ -346,7 +287,7 @@ TextBox{
 }
 
 -------------------------------------------------
--- Idle loop (visual-only for now)
+-- Idle loop
 -------------------------------------------------
 while true do
     os.pullEvent("terminate")

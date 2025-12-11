@@ -1,161 +1,281 @@
--- reactor/status_display.lua
--- Simple front-panel style status display (indicator-only)
+-- status_display.lua
+-- Stand-alone front-panel GUI using cc-mek-scada graphics library.
+-- Expects:
+--   /graphics/*               (from cc-mek-scada)
+--   /reactor-plc/panel/style.lua  (theme + color definitions)
 
--- === CONFIG =================================================================
+-- ========= dependencies =========
 
-local MONITOR_SIDE = "top"   -- monitor is on top
-local TEXT_SCALE   = 0.5     -- looks good on 57x24
-
--- colours roughly matched to cc-mek-scada sandstone theme
-local COLOR_BG       = colors.gray
-local COLOR_BORDER   = colors.yellow
-local COLOR_TEXT     = colors.white
-local COLOR_LABEL_D  = colors.lightGray
-local COLOR_LED_RED  = colors.red
-local COLOR_LED_GRN  = colors.lime
-local COLOR_LED_OFF  = colors.gray
-
--- ============================================================================
-
-local mon = peripheral.wrap(MONITOR_SIDE)
-if not mon then error("No monitor on "..MONITOR_SIDE, 0) end
-
-mon.setTextScale(TEXT_SCALE)
-local W, H = mon.getSize()
-
--- redirect helpers to the monitor
-local function setBG(c)  mon.setBackgroundColor(c) end
-local function setFG(c)  mon.setTextColor(c)       end
-
-local function fillRect(x1, y1, x2, y2, col)
-  setBG(col)
-  for y = y1, y2 do
-    mon.setCursorPos(x1, y)
-    mon.write(string.rep(" ", x2 - x1 + 1))
-  end
+local ok_core, core = pcall(require, "graphics.core")
+if not ok_core then
+    error("graphics.core not found – make sure /graphics is present")
 end
 
-local function drawText(x, y, txt, col)
-  setBG(COLOR_BG)
-  setFG(col or COLOR_TEXT)
-  mon.setCursorPos(x, y)
-  mon.write(txt)
+local style      = require("reactor-plc.panel.style")
+
+local DisplayBox = require("graphics.elements.DisplayBox")
+local Div        = require("graphics.elements.Div")
+local Rectangle  = require("graphics.elements.Rectangle")
+local TextBox    = require("graphics.elements.TextBox")
+local PushButton = require("graphics.elements.controls.PushButton")
+local LED        = require("graphics.elements.indicators.LED")
+local LEDPair    = require("graphics.elements.indicators.LEDPair")
+local RGBLED     = require("graphics.elements.indicators.RGBLED")
+
+local ALIGN  = core.ALIGN
+local cpair  = core.cpair
+local border = core.border
+
+local theme      = style.theme
+local ind_grn    = style.ind_grn
+local ind_red    = style.ind_red
+local disabled_fg = style.fp.disabled_fg
+
+-- ========= monitor / base window =========
+
+local mon = peripheral.wrap("top")
+if not mon then error("no monitor on top") end
+
+-- you already checked this is 57x24; don’t touch text scale
+local mw, mh = mon.getSize()
+
+-- full-screen window on the monitor
+local win = window.create(mon, 1, 1, mw, mh, false)
+
+-- main display box – everything is drawn inside this
+local panel = DisplayBox{
+    window = win,
+    fg_bg  = cpair(theme.fp_fg or colors.white, theme.fp_bg or colors.black)
+}
+
+-- ========= header =========
+
+TextBox{
+    parent    = panel,
+    x         = 1,
+    y         = 1,
+    width     = mw,
+    text      = "FISSION REACTOR PLC - UNIT 1",
+    alignment = ALIGN.CENTER,
+    fg_bg     = theme.header
+}
+
+-- ========= left: system / modem / RT indicators =========
+
+local system = Div{
+    parent = panel,
+    x      = 2,
+    y      = 3,
+    width  = 14,
+    height = 18
+}
+
+-- “STATUS” + “HEARTBEAT”
+local degraded  = LED{parent = system, label = "STATUS",    colors = cpair(colors.red, colors.green)}
+local heartbeat = LED{parent = system, label = "HEARTBEAT", colors = ind_grn}
+
+system.line_break()
+
+-- reactor present / state and modem / network indicators
+local reactor = LEDPair{
+    parent = system,
+    label  = "REACTOR",
+    off    = colors.red,
+    c1     = colors.yellow,
+    c2     = colors.green
+}
+
+local modem = LED{
+    parent = system,
+    label  = "MODEM (1)",
+    colors = ind_grn
+}
+
+if not style.colorblind then
+    RGBLED{
+        parent = system,
+        label  = "NETWORK",
+        colors = { colors.green, colors.red, colors.yellow, colors.orange, style.ind_bkg }
+    }
+else
+    -- colour-blind alternative – kept for completeness, not wired yet
+    LEDPair{ parent = system, label = "NT LINKED",   off = style.ind_bkg, c1 = colors.red,   c2 = colors.green }
+    LEDPair{ parent = system, label = "NT VERSION",  off = style.ind_bkg, c1 = colors.red,   c2 = colors.green }
+    LED{     parent = system, label = "NT COLLISION",                colors = ind_red }
 end
 
-local function led(x, y, col)
-  -- 2x2 LED block
-  fillRect(x,     y,     x + 1, y + 1, col)
+system.line_break()
+
+-- RT status row (visual only for now)
+LED{ parent = system, label = "RT MAIN",     colors = ind_grn }
+LED{ parent = system, label = "RT RPS",      colors = ind_grn }
+LED{ parent = system, label = "RT COMMS TX", colors = ind_grn }
+LED{ parent = system, label = "RT COMMS RX", colors = ind_grn }
+LED{ parent = system, label = "RT SPCTL",    colors = ind_grn }
+
+system.line_break()
+
+-- show local computer ID in the same place the original panel does
+local comp_id = string.format("(%d)", os.getComputerID())
+TextBox{
+    parent = system,
+    x      = 9,
+    y      = 5,
+    width  = 6,
+    text   = comp_id,
+    fg_bg  = disabled_fg
+}
+
+-- ========= middle: ACTIVE + RPS TRIP + SCRAM / RESET =========
+
+local status = Div{
+    parent = panel,
+    x      = 17,
+    y      = 3,
+    width  = mw - 32,
+    height = 18
+}
+
+-- “RCT ACTIVE”
+LED{
+    parent = status,
+    x      = 2,
+    width  = 12,
+    label  = "RCT ACTIVE",
+    colors = ind_grn
+}
+
+-- emergency coolant indicator (always present visually)
+LED{
+    parent = status,
+    x      = 2,
+    width  = 14,
+    label  = "EMER COOLANT",
+    colors = cpair(colors.yellow, colors.yellow)
+}
+
+-- RPS TRIP bar with blinking red LED (blink wiring later)
+local hi_box = theme.highlight_box
+
+local trip_frame = Rectangle{
+    parent     = status,
+    x          = 1,
+    height     = 3,
+    border     = border(1, hi_box.bkg, true),
+    even_inner = true
+}
+
+local trip_div = Div{
+    parent = trip_frame,
+    height = 1,
+    fg_bg  = hi_box
+}
+
+LED{
+    parent = trip_div,
+    width  = 10,
+    label  = "RPS TRIP",
+    colors = ind_red,
+    flash  = true,                     -- flasher handled by graphics engine
+    period = require("graphics.flasher").PERIOD.BLINK_250_MS
+}
+
+-- framed area for SCRAM and RESET buttons
+local controls_frame = Rectangle{
+    parent     = status,
+    x          = 1,
+    width      = status.get_width() - 2,
+    height     = 3,
+    border     = border(1, hi_box.bkg, true),
+    even_inner = true
+}
+
+local controls = Div{
+    parent = controls_frame,
+    width  = controls_frame.get_width() - 2,
+    height = 1,
+    fg_bg  = hi_box
+}
+
+local button_space = math.floor((controls.get_width() - 14) / 3)
+
+-- SCRAM (no callback yet – wiring later)
+PushButton{
+    parent       = controls,
+    x            = button_space + 1,
+    y            = 1,
+    min_width    = 7,
+    text         = "SCRAM",
+    callback     = function() end, -- hook to your modem/databus later
+    fg_bg        = cpair(colors.black, colors.red),
+    active_fg_bg = cpair(colors.black, colors.red_off or colors.red)
+}
+
+-- RESET (visual only for now)
+PushButton{
+    parent       = controls,
+    x            = (2 * button_space) + 9,
+    y            = 1,
+    min_width    = 7,
+    text         = "RESET",
+    callback     = function() end,
+    fg_bg        = cpair(colors.black, colors.yellow),
+    active_fg_bg = cpair(colors.black, colors.yellow_off or colors.yellow)
+}
+
+-- ========= footer (FW / NT versions – static placeholders) =========
+
+local about = Div{
+    parent = panel,
+    y      = mh - 1,
+    width  = 15,
+    height = 2,
+    fg_bg  = disabled_fg
+}
+
+TextBox{ parent = about, text = "FW: v1.9.1" }
+TextBox{ parent = about, text = "NT: v3.0.8" }
+
+-- ========= right: RPS trip reason list =========
+
+local rps_box = Rectangle{
+    parent = panel,
+    x      = mw - 15,
+    y      = 3,
+    width  = 16,
+    height = 16,
+    border = border(1, hi_box.bkg),
+    thin   = true,
+    fg_bg  = hi_box
+}
+
+-- first column: MANUAL / AUTOMATIC / TIMEOUT / PLC FAULT / RCT FAULT
+local rps_labels_top = { "MANUAL", "AUTOMATIC", "TIMEOUT", "PLC FAULT", "RCT FAULT" }
+for _, lbl in ipairs(rps_labels_top) do
+    LED{ parent = rps_box, label = lbl, colors = ind_red }
 end
 
-local function clearScreen()
-  setBG(COLOR_BG)
-  setFG(COLOR_TEXT)
-  mon.clear()
-end
+rps_box.line_break()
 
-local function drawBorder()
-  -- outer border
-  fillRect(1,     1,     W,     1,     COLOR_BORDER)
-  fillRect(1,     H,     W,     H,     COLOR_BORDER)
-  fillRect(1,     1,     1,     H,     COLOR_BORDER)
-  fillRect(W,     1,     W,     H,     COLOR_BORDER)
+-- HI DAMAGE / HI TEMP
+LED{ parent = rps_box, label = "HI DAMAGE", colors = ind_red }
+LED{ parent = rps_box, label = "HI TEMP",   colors = ind_red }
 
-  -- inner background
-  fillRect(2,     2,     W - 1, H - 1, COLOR_BG)
-end
+rps_box.line_break()
 
-local function drawStatic()
-  clearScreen()
-  drawBorder()
+-- LO FUEL / HI WASTE
+LED{ parent = rps_box, label = "LO FUEL", colors = ind_red }
+LED{ parent = rps_box, label = "HI WASTE", colors = ind_red }
 
-  -- title
-  local title = "FISSION REACTOR PLC - UNIT 1"
-  local tx = math.floor((W - #title) / 2) + 1
-  drawText(tx, 3, title, COLOR_TEXT)
+rps_box.line_break()
 
-  ---------------------------------------------------------------------------
-  -- LEFT COLUMN (status + comms)
-  ---------------------------------------------------------------------------
-  local lx = 6
-  local y = 6
+-- LO CCOOLANT / HI HCOOLANT
+LED{ parent = rps_box, label = "LO CCOOLANT", colors = ind_red }
+LED{ parent = rps_box, label = "HI HCOOLANT", colors = ind_red }
 
-  -- STATUS
-  led(4, y, COLOR_LED_RED)
-  drawText(lx, y, "STATUS")
+-- ========= simple idle loop =========
+-- No dynamic data yet – this just keeps the program alive so the GUI stays up.
 
-  -- HEARTBEAT
-  y = y + 2
-  led(4, y, COLOR_LED_RED)
-  drawText(lx, y, "HEARTBEAT")
-
-  -- REACTOR
-  y = y + 2
-  led(4, y, COLOR_LED_RED)
-  drawText(lx, y, "REACTOR")
-
-  -- MODEM (1)
-  y = y + 2
-  led(4, y, COLOR_LED_GRN)
-  drawText(lx, y, "MODEM (1)")
-
-  -- NETWORK
-  y = y + 2
-  led(4, y, COLOR_LED_GRN)
-  drawText(lx, y, "NETWORK")
-
-  ---------------------------------------------------------------------------
-  -- CENTER (RPS TRIP line + status text)
-  ---------------------------------------------------------------------------
-  local cx = math.floor(W / 2) - 4
-  drawText(cx, 10, "RPS TRIP", COLOR_TEXT)
-  drawText(cx + 1, 12, "NORMAL", COLOR_LABEL_D)
-
-  ---------------------------------------------------------------------------
-  -- RIGHT COLUMN (trips / alarms)
-  ---------------------------------------------------------------------------
-  local rx = W - 18
-  y = 6
-
-  drawText(rx, y,     "MANUAL",    COLOR_TEXT)
-  drawText(rx, y + 2, "AUTOMATIC", COLOR_TEXT)
-
-  y = y + 6
-  drawText(rx, y,     "HI DAMAGE", COLOR_TEXT)
-  drawText(rx, y + 2, "HI TEMP",   COLOR_TEXT)
-
-  y = y + 6
-  drawText(rx, y,     "LO FUEL",   COLOR_TEXT)
-  drawText(rx, y + 2, "HI WASTE",  COLOR_TEXT)
-
-  y = y + 6
-  drawText(rx, y,     "LO CCOOLANT", COLOR_TEXT)
-  drawText(rx, y + 2, "HI HCOOLANT", COLOR_TEXT)
-
-  ---------------------------------------------------------------------------
-  -- RIGHT-COLUMN LED placeholders (all off by default)
-  ---------------------------------------------------------------------------
-  -- MANUAL/AUTOMATIC LEDs
-  led(rx - 3, 6, COLOR_LED_OFF)
-  led(rx - 3, 8, COLOR_LED_OFF)
-
-  -- HI DAMAGE / HI TEMP LEDs
-  led(rx - 3, 12, COLOR_LED_OFF)
-  led(rx - 3, 14, COLOR_LED_OFF)
-
-  -- LO FUEL / HI WASTE LEDs
-  led(rx - 3, 18, COLOR_LED_OFF)
-  led(rx - 3, 20, COLOR_LED_OFF)
-
-  -- LO CCOOLANT / HI HCOOLANT LEDs
-  led(rx - 3, 24, COLOR_LED_OFF)
-  led(rx - 3, 26, COLOR_LED_OFF)
-end
-
--- For now this is a static front panel: draw once then idle.
--- Later we can wire it to modem messages (heartbeat, trips, etc.)
-drawStatic()
-
--- simple idle loop so the program keeps running
 while true do
-  os.sleep(1)
+    os.pullEvent("terminate") -- CTRL-T will exit
 end

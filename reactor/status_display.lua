@@ -71,9 +71,9 @@ local d = Div{
     height = 5
 }
 
--- NOTE: LED in this library uses cpair(ON_COLOR, OFF_COLOR).
--- So: true  -> colors.a  (green)
---      false -> colors.b (red)
+-- LED uses colors = cpair(ON_COLOR, OFF_COLOR)
+-- true  -> green (OK)
+-- false -> red   (not OK)
 local status_led = LED{
     parent = d,
     label  = "STATUS",
@@ -94,18 +94,11 @@ local last_status_ok  = false   -- last s.status_ok value
 local status_count    = 0       -- number of frames received on 250
 
 local function led_bool(el, v, name)
-    if not el then return end
-    local b = not not v
+    if not el or not el.set_value then return end
+    local b = v and true or false
 
-    -- force value + redraw through the element
-    if el.set_value then
-        el:set_value(b)
-    elseif el.setState then
-        el:setState(b)
-    end
-    if el.redraw then
-        el:redraw()
-    end
+    -- IMPORTANT: set_value is NOT a method; call with dot, not colon.
+    el.set_value(b)
 
     if name then
         print(string.format("[LED] %s := %s", name, tostring(b)))

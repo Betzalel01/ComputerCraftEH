@@ -1,5 +1,5 @@
 -- ============================================================
--- status_display.lua  (monitor version)
+-- status_display.lua  (monitor-on-top version)
 -- ============================================================
 
 -- ensure require() can load /graphics/*
@@ -35,29 +35,29 @@ local ind_red     = style.ind_red
 local disabled_fg = style.fp.disabled_fg
 
 -- ============================================================
--- WINDOW / MONITOR TARGET
+-- REDIRECT TERM TO MONITOR ON TOP
 -- ============================================================
 
-local term_native = term.current()
-local mon = peripheral.find("monitor")   -- use any attached monitor
-
-local target
+local native_term = term.current()
+local mon = peripheral.wrap("top")
 
 if mon then
-    -- draw on the monitor above
+    -- your getsize program already confirmed 57x24 at scale 0.5
     mon.setTextScale(0.5)
-    local mw, mh = mon.getSize()
-    target = window.create(mon, 1, 1, mw, mh, false)
+    term.redirect(mon)
 else
-    -- fallback: draw on the local computer screen
-    local tw, th = term_native.getSize()
-    target = window.create(term_native, 1, 1, tw, th, false)
+    -- if no monitor on top, we just draw on the computer as a fallback
+    native_term = term.current()
 end
 
-local w, h = target.getSize()
+-- ============================================================
+-- WINDOW
+-- ============================================================
+
+local w, h = term.getSize()
 
 local panel = DisplayBox{
-    window = target,
+    window = term.current(),
     fg_bg  = cpair(theme.fp_fg or colors.white, theme.fp_bg or colors.black)
 }
 

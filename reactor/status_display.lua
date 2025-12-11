@@ -1,10 +1,17 @@
 -- status_display.lua
 -- Stand-alone front-panel GUI using cc-mek-scada graphics library.
 -- Expects:
---   /graphics/*               (from cc-mek-scada)
+--   /graphics/*                   (from cc-mek-scada)
 --   /reactor-plc/panel/style.lua  (theme + color definitions)
 
 -- ========= dependencies =========
+
+-- ensure require() also searches from filesystem root so /graphics works
+if package and package.path then
+    package.path = "/?.lua;/?/init.lua;" .. package.path
+else
+    package = { path = "/?.lua;/?/init.lua" }
+end
 
 local ok_core, core = pcall(require, "graphics.core")
 if not ok_core then
@@ -26,9 +33,9 @@ local ALIGN  = core.ALIGN
 local cpair  = core.cpair
 local border = core.border
 
-local theme      = style.theme
-local ind_grn    = style.ind_grn
-local ind_red    = style.ind_red
+local theme       = style.theme
+local ind_grn     = style.ind_grn
+local ind_red     = style.ind_red
 local disabled_fg = style.fp.disabled_fg
 
 -- ========= monitor / base window =========
@@ -64,7 +71,7 @@ TextBox{
 
 local system = Div{
     parent = panel,
-    x      = 2,
+    x      = 1,
     y      = 3,
     width  = 14,
     height = 18
@@ -149,17 +156,20 @@ LED{
 LED{
     parent = status,
     x      = 2,
-    width  = 14,
-    label  = "EMER COOLANT",
-    colors = cpair(colors.yellow, colors.yellow)
+    width  = 12,
+    label  = "EMERG COOL",
+    colors = ind_grn
 }
 
--- RPS TRIP bar with blinking red LED (blink wiring later)
-local hi_box = theme.highlight_box
+status.line_break()
+
+-- frame for RPS TRIP row
+local hi_box = cpair(theme.hi_fg or colors.white, theme.hi_bg or colors.gray)
 
 local trip_frame = Rectangle{
     parent     = status,
     x          = 1,
+    width      = status.get_width() - 2,
     height     = 3,
     border     = border(1, hi_box.bkg, true),
     even_inner = true
@@ -176,7 +186,8 @@ LED{
     width  = 10,
     label  = "RPS TRIP",
     colors = ind_red,
-    flash  = true,                     -- flasher handled by graphics engine
+    flash  = true,
+    -- flasher handled by graphics engine
     period = require("graphics.flasher").PERIOD.BLINK_250_MS
 }
 
@@ -264,7 +275,7 @@ LED{ parent = rps_box, label = "HI TEMP",   colors = ind_red }
 rps_box.line_break()
 
 -- LO FUEL / HI WASTE
-LED{ parent = rps_box, label = "LO FUEL", colors = ind_red }
+LED{ parent = rps_box, label = "LO FUEL",  colors = ind_red }
 LED{ parent = rps_box, label = "HI WASTE", colors = ind_red }
 
 rps_box.line_break()
@@ -279,4 +290,3 @@ LED{ parent = rps_box, label = "HI HCOOLANT", colors = ind_red }
 while true do
     os.pullEvent("terminate") -- CTRL-T will exit
 end
-

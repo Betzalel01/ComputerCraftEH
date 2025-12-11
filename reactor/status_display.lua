@@ -71,23 +71,20 @@ local d = Div{
     height = 5
 }
 
--- IMPORTANT: LED uses cpair(OFF_COLOR, ON_COLOR)
--- So: false -> RED, true -> GREEN
--- IMPORTANT: LED uses cpair(ON_COLOR, OFF_COLOR)
--- So: true  -> GREEN (on)
---      false -> RED   (off)
+-- NOTE: LED in this library uses cpair(ON_COLOR, OFF_COLOR).
+-- So: true  -> colors.a  (green)
+--      false -> colors.b (red)
 local status_led = LED{
     parent = d,
     label  = "STATUS",
-    colors = cpair(colors.red, colors.green)
+    colors = cpair(colors.green, colors.red)
 }
 
 local heartbeat_led = LED{
     parent  = d,
     label   = "HEARTBEAT",
-    colors  = cpair(colors.red, colors.green)
+    colors  = cpair(colors.green, colors.red)
 }
-
 
 -------------------------------------------------
 -- Internal state
@@ -99,11 +96,17 @@ local status_count    = 0       -- number of frames received on 250
 local function led_bool(el, v, name)
     if not el then return end
     local b = not not v
+
+    -- force value + redraw through the element
     if el.set_value then
         el:set_value(b)
     elseif el.setState then
         el:setState(b)
     end
+    if el.redraw then
+        el:redraw()
+    end
+
     if name then
         print(string.format("[LED] %s := %s", name, tostring(b)))
     end
@@ -116,7 +119,7 @@ local function apply_panel_frame(s)
         return
     end
 
-    status_count   = status_count + 1
+    status_count    = status_count + 1
     last_frame_time = os.clock()
     last_status_ok  = not not s.status_ok
 
@@ -136,8 +139,8 @@ end
 local hb_timer = os.startTimer(HEARTBEAT_CHECK_STEP)
 
 -- initial state: assume no comms, unhealthy
-led_bool(status_led,    false, "STATUS")
-led_bool(heartbeat_led, false, "HEARTBEAT")
+led_bool(status_led,    false, "STATUS (init)")
+led_bool(heartbeat_led, false, "HEARTBEAT (init)")
 
 -------------------------------------------------
 -- MAIN LOOP

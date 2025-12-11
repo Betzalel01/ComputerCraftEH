@@ -43,16 +43,12 @@ local disabled_fg = style.fp.disabled_fg
 local mon = peripheral.wrap("top")
 if not mon then error("No monitor on top for status_display", 0) end
 
--- Your monitor is 57x24 at scale 0.5
 mon.setTextScale(0.5)
 local mw, mh = mon.getSize()
 
--- Create a window for the graphics engine
-local win = window.create(mon, 1, 1, mw, mh, false)
-
--- Root display container
+-- IMPORTANT: draw directly on the monitor (no hidden window)
 local panel = DisplayBox{
-    window = win,
+    window = mon,
     fg_bg  = cpair(theme.fp_fg or colors.white, theme.fp_bg or colors.black)
 }
 
@@ -279,8 +275,6 @@ local rct_fault_led = LED{
     label  = "RCT FAULT",
     colors = ind_red
 }
-
--- (PLC FAULT removed)
 
 rps_cause.line_break()
 

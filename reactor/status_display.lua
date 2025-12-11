@@ -94,21 +94,19 @@ local system = Div{
     height = 18
 }
 
--- STATUS: green = comm OK AND reactor healthy, red otherwise
+-- TEST MODE: Purple/Black blinking LEDs
 local status_led = LED{
     parent = system,
     label  = "STATUS",
-    colors = cpair(colors.green, colors.red)  -- TRUE=green, FALSE=red
+    colors = cpair(colors.purple, colors.black) -- TRUE = purple, FALSE = black
 }
 
--- HEARTBEAT: green if we are seeing frames, red if timed out
 local heartbeat_led = LED{
     parent  = system,
     label   = "HEARTBEAT",
-    colors  = cpair(colors.green, colors.red),
-    flash   = true,
-    period  = flasher.PERIOD.BLINK_250_MS
+    colors  = cpair(colors.purple, colors.black) -- TRUE = purple, FALSE = black
 }
+
 
 system.line_break()
 
@@ -410,40 +408,16 @@ ledpair_state(reactor_led, 0)
 -------------------------------------------------
 -- MAIN LOOP
 -------------------------------------------------
+-------------------------------------------------
+-- TEST LOOP: Blink STATUS + HEARTBEAT forever
+-------------------------------------------------
+local blink = false
 while true do
-    local ev, p1, p2, p3, p4, p5 = os.pullEvent()
+    blink = not blink
 
-    if ev == "modem_message" then
-        local side, ch, rch, msg, dist = p1, p2, p3, p4, p5
-        if ch == STATUS_CHANNEL and type(msg) == "table" then
-            apply_panel_frame(msg)
-        end
+    status_led.set_value(blink)
+    heartbeat_led.set_value(blink)
 
-    elseif ev == "timer" and p1 == hb_timer then
-        local now   = os.clock()
-        local alive = (last_frame_time > 0) and ((now - last_frame_time) <= HEARTBEAT_TIMEOUT)
-
-        -- HEARTBEAT: comm only
-        led_bool(heartbeat_led, alive)
-
-        -- NETWORK LED
-        if last_frame_time == 0 then
-            net_state(5)     -- never seen anything
-        elseif alive then
-            net_state(1)     -- green
-        else
-            net_state(2)     -- red
-        end
-
-        -- STATUS = comm OK AND reactor healthy (Option C)
-        local status_ok = alive and last_status_ok
-        led_bool(status_led, status_ok)
-
-        -- if comm lost, blank reactor indicator
-        if not alive then
-            ledpair_state(reactor_led, 0)
-        end
-
-        hb_timer = os.startTimer(HEARTBEAT_CHECK_STEP)
-    end
+    sleep(1) -- switch every second
 end
+

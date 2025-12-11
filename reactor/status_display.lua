@@ -111,7 +111,6 @@ local heartbeat_led = LED{
     period  = flasher.PERIOD.BLINK_250_MS  -- use same period style uses
 }
 
-
 system.line_break()
 
 -- REACTOR – off/on (we’ll use green=on, red=off; yellow unused for now)
@@ -355,36 +354,50 @@ TextBox{
 -------------------------------------------------
 local last_heartbeat = 0
 
--- safe setter wrappers; if the engine uses a different method name, you can adjust here
+-- safe setter wrappers; use the engine's .update(...) API
 local function set_led_bool(el, val)
-  if not el then return end
-  local v = val and true or false
-  if el.set_value then
-      el:set_value(v)
-  elseif el.setState then
-      el:setState(v)
-  end
+    if not el then return end
+    local v = val and true or false
+    if el.update then
+        el:update(v)
+    elseif el.set_value then
+        el:set_value(v)
+    elseif el.setState then
+        el:setState(v)
+    end
 end
 
 local function set_ledpair_bool(el, val)
-  if not el then return end
-  local v = val and 2 or 0      -- 0=off, 1=yellow, 2=green in LEDPair
-  if el.set_value then
-      el:set_value(v)
-  elseif el.setState then
-      el:setState(v)
-  end
+    if not el then return end
+    -- LEDPair takes an index: 0 = off, 1 = first color, 2 = second color
+    local v = val and 2 or 0
+    if el.update then
+        el:update(v)
+    elseif el.set_value then
+        el:set_value(v)
+    elseif el.setState then
+        el:setState(v)
+    end
 end
 
-
 local function set_rgb_state(ok)
-    if not network_led or not network_led.set_value then return end
+    if not network_led then return end
+
+    local idx
     if ok == nil then
-        network_led:set_value(5)      -- off
+        idx = 5      -- off
     elseif ok then
-        network_led:set_value(1)      -- green
+        idx = 1      -- green
     else
-        network_led:set_value(2)      -- red
+        idx = 2      -- red
+    end
+
+    if network_led.update then
+        network_led:update(idx)
+    elseif network_led.set_value then
+        network_led:set_value(idx)
+    elseif network_led.setState then
+        network_led:setState(idx)
     end
 end
 

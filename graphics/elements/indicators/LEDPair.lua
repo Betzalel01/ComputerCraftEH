@@ -69,7 +69,8 @@ return function (args)
     -- on state change
     ---@param new_state integer indicator state
     function e.on_update(new_state)
-        local was_off = e.value <= 1
+        local was_off = (tonumber(e.value) or 0) <= 1
+
 
         e.value = new_state
         e.w_set_cur(1, 1)

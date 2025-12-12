@@ -151,7 +151,7 @@ while true do
 
     elseif ev == "timer" and p1 == check_timer then
         local now = now_ms()
-        local alive = (last_frame_ms > 0) and ((now - last_frame_ms) <= STATUS_TIMEOUT_MS)
+        local alive = (last_frame_ms >= 0) and ((now - last_frame_ms) <= STATUS_TIMEOUT_MS)
 
         -- HEARTBEAT = “we are receiving frames”
         -- STATUS    = “we are receiving frames AND core says status_ok”

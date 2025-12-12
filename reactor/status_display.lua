@@ -155,7 +155,7 @@ while true do
 
     elseif ev == "timer" and p1 == check_timer then
         local now   = os.clock()
-        local alive = (last_frame_time > 0) and ((now - last_frame_time) <= STATUS_TIMEOUT)
+        local alive = ((now - last_frame_time) <= STATUS_TIMEOUT)
 
         -- HEARTBEAT = “we are receiving frames”
         -- STATUS    = “we are receiving frames AND core says status_ok”

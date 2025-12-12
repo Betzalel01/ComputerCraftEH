@@ -26,7 +26,7 @@ local cpair      = core.cpair
 -- Channels / timing
 -------------------------------------------------
 local STATUS_CHANNEL      = 250         -- reactor_core -> panel (sendPanelStatus)
-local STATUS_TIMEOUT_MS   = 10 * 1000   -- 10 seconds
+local STATUS_TIMEOUT_MS   = 11 * 1000   -- 10 seconds
 local CHECK_STEP          = 1.0         -- timer tick seconds
 
 -------------------------------------------------
@@ -145,13 +145,13 @@ while true do
     if ev == "modem_message" then
         local side, ch, rch, msg, dist = p1, p2, p3, p4, p5
 
-        if ch == STATUS_CHANNEL and type(msg) == "table" then
+        if ch == STATUS_CHANNEL then
             apply_panel_frame(msg)
         end
 
     elseif ev == "timer" and p1 == check_timer then
         local now = now_ms()
-        local alive = (last_frame_ms >= 0) and ((now - last_frame_ms) <= STATUS_TIMEOUT_MS)
+        local alive = ((now - last_frame_ms) <= STATUS_TIMEOUT_MS)
 
         -- HEARTBEAT = “we are receiving frames”
         -- STATUS    = “we are receiving frames AND core says status_ok”
@@ -166,6 +166,7 @@ while true do
             tostring(status_on)
         ))
 
+        
         led_bool(heartbeat_led, alive,     "HEARTBEAT")
         led_bool(status_led,    status_on, "STATUS")
 

@@ -108,13 +108,8 @@ local function led_bool(el, v, name)
 end
 
 local function apply_panel_frame(s)
-    if type(s) ~= "table" then
-        print("[FRAME] non-table ignored")
-        return
-    end
-
+    -- s is guaranteed to be a table here
     frame_count    = frame_count + 1
-    last_frame_ms  = now_ms()
     last_status_ok = not not s.status_ok
 
     print(string.format(
@@ -126,6 +121,7 @@ local function apply_panel_frame(s)
         print("[FRAME] raw: "..textutils.serialize(s))
     end
 end
+
 
 -------------------------------------------------
 -- Timer
@@ -142,34 +138,19 @@ led_bool(heartbeat_led, false, "HEARTBEAT (init)")
 while true do
     local ev, p1, p2, p3, p4, p5 = os.pullEvent()
 
-    if ev == "modem_message" then
-        local side, ch, rch, msg, dist = p1, p2, p3, p4, p5
+   if ev == "modem_message" then
+    local side, ch, rch, msg, dist = p1, p2, p3, p4, p5
 
-        if ch == STATUS_CHANNEL then
+    if ch == STATUS_CHANNEL then
+        -- Always count traffic as "alive"
+        last_frame_ms = now_ms()
+
+        -- Only parse status_ok if it’s the expected table frame
+        if type(msg) == "table" then
             apply_panel_frame(msg)
+        else
+            -- Optional: debug what else is arriving on 250
+            print(string.format("[FRAME] non-table on 250: %s", type(msg)))
         end
-
-    elseif ev == "timer" and p1 == check_timer then
-        local now = now_ms()
-        local alive = ((now - last_frame_ms) <= STATUS_TIMEOUT_MS)
-
-        -- HEARTBEAT = “we are receiving frames”
-        -- STATUS    = “we are receiving frames AND core says status_ok”
-        local status_on = alive and last_status_ok
-
-        print(string.format(
-            "[CHECK] ms=%d last_frame=%d age=%dms alive=%s last_status_ok=%s STATUS=%s",
-            now, last_frame_ms,
-            (last_frame_ms > 0) and (now - last_frame_ms) or -1,
-            tostring(alive),
-            tostring(last_status_ok),
-            tostring(status_on)
-        ))
-
-        
-        led_bool(heartbeat_led, alive,     "HEARTBEAT")
-        led_bool(status_led,    status_on, "STATUS")
-
-        check_timer = os.startTimer(CHECK_STEP)
     end
 end

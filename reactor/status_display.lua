@@ -116,7 +116,7 @@ local status_led = LED{
 local heartbeat_led = LED{
   parent  = system,
   label   = "HEARTBEAT",
-  colors  = cpair(colors.green, colors.red),
+  colors  = cpair(colors.red, colors.green),
   flash   = true,
   period  = flasher.PERIOD.BLINK_250_MS
 }

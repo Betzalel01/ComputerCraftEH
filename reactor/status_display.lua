@@ -285,30 +285,56 @@ local last = {}
 -------------------------------------------------
 -- LED setters (function-style calls)
 -------------------------------------------------
-local function led_bool(el, v, name)
-  if not el or not el.set_value then return end
-  local b = v and true or false
-  el.set_value(b)
-  if name then
-    print(string.format("[LED] %s := %s", name, tostring(b)))
+-- Robust setter: try method-style first, then function-style, then setState
+local function set_bool(el, b)
+  if not el then return end
+  b = b and true or false
+
+  if type(el.set_value) == "function" then
+    local ok = pcall(function() el:set_value(b) end)
+    if ok then return end
+    pcall(function() el.set_value(el, b) end)
+    return
   end
+
+  if type(el.setState) == "function" then
+    pcall(function() el:setState(b) end)
+  end
+end
+
+local function set_num(el, n)
+  if not el then return end
+  if type(el.set_value) == "function" then
+    local ok = pcall(function() el:set_value(n) end)
+    if ok then return end
+    pcall(function() el.set_value(el, n) end)
+    return
+  end
+  if type(el.setState) == "function" then
+    pcall(function() el:setState(n) end)
+  end
+end
+
+-- Replace your led_bool/ledpair_bool/rgb_state bodies with these:
+local function led_bool(el, v, name)
+  set_bool(el, v)
+  if name then print(string.format("[LED] %s := %s", name, tostring(v and true or false))) end
 end
 
 local function ledpair_bool(el, v)
-  if not el or not el.set_value then return end
-  el.set_value((v and true) and 2 or 0)   -- 0=off/red, 2=green
+  set_num(el, (v and true) and 2 or 0)
 end
 
 local function rgb_state(ok)
-  if not network_led or not network_led.set_value then return end
   if ok == nil then
-    network_led.set_value(5)             -- off
+    set_num(network_led, 5)
   elseif ok then
-    network_led.set_value(1)             -- green
+    set_num(network_led, 1)
   else
-    network_led.set_value(2)             -- red
+    set_num(network_led, 2)
   end
 end
+
 
 -------------------------------------------------
 -- Apply message (heartbeat/status logic SAME AS 1.0.5)

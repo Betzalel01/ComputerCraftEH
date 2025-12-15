@@ -1,7 +1,10 @@
 -- reactor/status_display.lua
+-- VERSION: 1.0.3 (2025-12-14)
 -- Minimal, instrumented status-only panel.
--- Driven solely by STATUS_CHANNEL (250) frames from reactor_core.lua.
--- FIX: use os.epoch() wall time (ms) instead of os.clock() CPU time.
+-- Driven by STATUS_CHANNEL (250) frames/traffic from reactor_core.lua.
+-- Timing uses os.epoch("utc") (wall time) to avoid os.clock() CPU-time jitter.
+-- HEARTBEAT = any traffic on channel 250 within timeout window
+-- STATUS    = (HEARTBEAT alive) AND (last valid table frame had status_ok=true)
 
 -------------------------------------------------
 -- Require path so graphics/* can be found
@@ -25,18 +28,21 @@ local cpair      = core.cpair
 -------------------------------------------------
 -- Channels / timing
 -------------------------------------------------
-local STATUS_CHANNEL      = 250         -- reactor_core -> panel (sendPanelStatus)
-local STATUS_TIMEOUT_MS   = 11 * 1000   -- 10 seconds
-local CHECK_STEP          = 1.0         -- timer tick seconds
+local STATUS_CHANNEL      = 250          -- reactor_core -> panel (sendPanelStatus)
+local STATUS_TIMEOUT_MS   = 11 * 1000    -- ms without traffic => heartbeat lost
+local CHECK_STEP          = 1.0          -- seconds
 
 -------------------------------------------------
 -- Peripherals
 -------------------------------------------------
-local mon = peripheral.wrap("top")
-if not mon then error("No monitor on TOP for status_display", 0) end
+local MONITOR_SIDE = "top"
+local MODEM_SIDE   = "back"
 
-local modem = peripheral.wrap("back")
-if not modem then error("No modem on BACK for status_display", 0) end
+local mon = peripheral.wrap(MONITOR_SIDE)
+if not mon then error("No monitor on "..MONITOR_SIDE.." for status_display", 0) end
+
+local modem = peripheral.wrap(MODEM_SIDE)
+if not modem then error("No modem on "..MODEM_SIDE.." for status_display", 0) end
 modem.open(STATUS_CHANNEL)
 
 -------------------------------------------------
@@ -44,9 +50,9 @@ modem.open(STATUS_CHANNEL)
 -------------------------------------------------
 term.clear()
 term.setCursorPos(1,1)
-print("[STATUS_DISPLAY] starting")
+print("[STATUS_DISPLAY] VERSION 1.0.3 (2025-12-14)")
 print("[STATUS_DISPLAY] listening on STATUS="..STATUS_CHANNEL)
-print("[STATUS_DISPLAY] monitor side = top, modem side = back")
+print("[STATUS_DISPLAY] monitor side = "..MONITOR_SIDE..", modem side = "..MODEM_SIDE)
 print("---------------------------------------------------")
 
 -------------------------------------------------
@@ -72,8 +78,8 @@ local d = Div{
 }
 
 -- LED uses colors = cpair(ON_COLOR, OFF_COLOR)
--- true  -> green (OK)
--- false -> red   (not OK)
+-- true  -> green
+-- false -> red
 local status_led = LED{
     parent = d,
     label  = "STATUS",
@@ -81,9 +87,9 @@ local status_led = LED{
 }
 
 local heartbeat_led = LED{
-    parent  = d,
-    label   = "HEARTBEAT",
-    colors  = cpair(colors.green, colors.red)
+    parent = d,
+    label  = "HEARTBEAT",
+    colors = cpair(colors.green, colors.red)
 }
 
 -------------------------------------------------
@@ -93,14 +99,14 @@ local function now_ms()
     return os.epoch("utc")
 end
 
-local last_frame_ms = 0        -- last time we saw ANY panel frame on 250 (ms)
-local last_status_ok = false   -- last s.status_ok from core
-local frame_count = 0
+local last_frame_ms  = 0        -- last time we saw ANY traffic on 250 (ms)
+local last_status_ok = false    -- last status_ok from a valid table frame
+local frame_count    = 0
 
 local function led_bool(el, v, name)
     if not el or not el.set_value then return end
     local b = v and true or false
-    -- IMPORTANT: function-style call, NOT method-style
+    -- IMPORTANT: call as a plain function, not el:set_value(...)
     el.set_value(b)
     if name then
         print(string.format("[LED] %s := %s", name, tostring(b)))
@@ -122,7 +128,6 @@ local function apply_panel_frame(s)
     end
 end
 
-
 -------------------------------------------------
 -- Timer
 -------------------------------------------------
@@ -135,9 +140,6 @@ led_bool(heartbeat_led, false, "HEARTBEAT (init)")
 -------------------------------------------------
 -- MAIN LOOP
 -------------------------------------------------
--------------------------------------------------
--- MAIN LOOP
--------------------------------------------------
 while true do
     local ev, p1, p2, p3, p4, p5 = os.pullEvent()
 
@@ -145,10 +147,10 @@ while true do
         local side, ch, rch, msg, dist = p1, p2, p3, p4, p5
 
         if ch == STATUS_CHANNEL then
-            -- Always count traffic as "alive"
+            -- Any traffic counts as "alive"
             last_frame_ms = now_ms()
 
-            -- Only parse status_ok if it’s the expected table frame
+            -- Only table frames update status_ok
             if type(msg) == "table" then
                 apply_panel_frame(msg)
             else
@@ -160,8 +162,8 @@ while true do
         local now = now_ms()
         local alive = (last_frame_ms > 0) and ((now - last_frame_ms) <= STATUS_TIMEOUT_MS)
 
-        -- HEARTBEAT = “we are receiving frames/traffic”
-        -- STATUS    = “we are receiving traffic AND last valid frame said status_ok”
+        -- HEARTBEAT = receiving traffic
+        -- STATUS    = receiving traffic AND last valid frame said status_ok
         local status_on = alive and last_status_ok
 
         print(string.format(
@@ -179,4 +181,3 @@ while true do
         check_timer = os.startTimer(CHECK_STEP)
     end
 end
-

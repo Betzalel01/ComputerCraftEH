@@ -114,12 +114,11 @@ local status_led = LED{
 }
 
 local heartbeat_led = LED{
-  parent  = system,
-  label   = "HEARTBEAT",
-  colors  = cpair(colors.red, colors.green),
-  flash   = true,
-  period  = flasher.PERIOD.BLINK_250_MS
+  parent = system,
+  label  = "HEARTBEAT",
+  colors = cpair(colors.green, colors.red)
 }
+
 
 system.line_break()
 
@@ -261,6 +260,10 @@ TextBox{ parent = about, text = "PANEL: v1.1.2" }
 -------------------------------------------------
 -- Internal state (same as 1.0.5)
 -------------------------------------------------
+local BLINK_STEP = 0.25        -- seconds (250ms blink)
+local blink_on   = false
+local blink_timer = os.startTimer(BLINK_STEP)
+
 local function now_ms() return os.epoch("utc") end
 
 local start_ms       = now_ms()
@@ -348,7 +351,8 @@ end
 -------------------------------------------------
 local check_timer = os.startTimer(CHECK_STEP)
 led_bool(status_led,    false, "STATUS (init)")
-led_bool(heartbeat_led, false, "HEARTBEAT (init)")
+led_bool(heartbeat_led, (alive_latched and blink_on), "HEARTBEAT")
+
 
 -------------------------------------------------
 -- MAIN LOOP
@@ -430,4 +434,11 @@ while true do
 
     check_timer = os.startTimer(CHECK_STEP)
   end
+  elseif ev == "timer" and p1 == blink_timer then
+  if alive_latched then
+    blink_on = not blink_on
+  else
+    blink_on = false
+  end
+  blink_timer = os.startTimer(BLINK_STEP)
 end

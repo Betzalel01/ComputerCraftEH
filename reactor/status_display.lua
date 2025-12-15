@@ -1,9 +1,14 @@
 -- reactor/status_display.lua
--- VERSION: 1.1.0 (2025-12-15)
--- Full panel indicators restored.
--- Heartbeat = any traffic on STATUS_CHANNEL.
--- Status    = alive AND (last known msg.status_ok == true).
--- No table required for heartbeat. status_ok only updates when explicitly provided.
+-- VERSION: 1.1.1 (2025-12-15)
+-- Heartbeat/Status logic is EXACTLY the same as VERSION 1.0.5:
+--   - HEARTBEAT is based on any traffic on channel 250 (alive_latched)
+--   - STATUS is alive_latched AND last_status_ok
+--   - last_status_ok updates ONLY when msg is a table AND msg.status_ok is a boolean
+-- Flicker fixes (same as 1.0.5):
+--   (2) Hysteresis: N misses => dead, N hits => alive
+--   (3) Startup grace: ignore "dead" decisions for first GRACE_MS
+--
+-- Only addition: all other indicators restored (driven by fields in the 250 frame).
 
 -------------------------------------------------
 -- Require path so graphics/* can be found
@@ -32,48 +37,25 @@ local cpair  = core.cpair
 local border = core.border
 
 -------------------------------------------------
--- Optional style (fallbacks if missing)
+-- Channels / timing
 -------------------------------------------------
-local theme = {
-  fp_bg  = colors.black,
-  fp_fg  = colors.white,
-  header = cpair(colors.white, colors.gray),
-  hi_fg  = colors.white,
-  hi_bg  = colors.gray,
-}
+local STATUS_CHANNEL      = 250
+local STATUS_TIMEOUT_MS   = 11 * 1000
+local CHECK_STEP          = 1.0
 
-local ind_grn = cpair(colors.green, colors.red)
-local ind_red = cpair(colors.red, colors.black)
-
-do
-  local ok_style, style = pcall(require, "reactor-plc.panel.style")
-  if ok_style and style then
-    theme = style.theme or theme
-    ind_grn = style.ind_grn or ind_grn
-    ind_red = style.ind_red or ind_red
-  end
-end
-
--------------------------------------------------
--- Modem / channel config
--------------------------------------------------
-local STATUS_CHANNEL       = 250
-local STATUS_TIMEOUT_MS    = 11 * 1000
-local CHECK_STEP           = 1.0
-
--- flicker control
-local GRACE_MS             = 5 * 1000
-local MISSES_TO_DEAD       = 3
-local HITS_TO_ALIVE        = 1
+-- Flicker control (same as 1.0.5)
+local GRACE_MS            = 5 * 1000
+local MISSES_TO_DEAD      = 3
+local HITS_TO_ALIVE       = 1
 
 -------------------------------------------------
 -- Peripherals
 -------------------------------------------------
 local mon = peripheral.wrap("top")
-if not mon then error("No monitor on top for status_display", 0) end
+if not mon then error("No monitor on TOP for status_display", 0) end
 
 local modem = peripheral.wrap("back")
-if not modem then error("No modem on back for status_display", 0) end
+if not modem then error("No modem on BACK for status_display", 0) end
 modem.open(STATUS_CHANNEL)
 
 -------------------------------------------------
@@ -81,27 +63,28 @@ modem.open(STATUS_CHANNEL)
 -------------------------------------------------
 term.clear()
 term.setCursorPos(1,1)
-print("[STATUS_DISPLAY] VERSION 1.1.0 (2025-12-15)")
+print("[STATUS_DISPLAY] VERSION 1.1.1 (2025-12-15)")
+print("[STATUS_DISPLAY] heartbeat/status logic = SAME AS 1.0.5")
 print("[STATUS_DISPLAY] listening on STATUS="..STATUS_CHANNEL)
-print("[STATUS_DISPLAY] monitor=top modem=back")
-print(string.format("[STATUS_DISPLAY] grace=%dms timeout=%dms misses=%d hits=%d",
+print("[STATUS_DISPLAY] monitor side = top, modem side = back")
+print(string.format("[STATUS_DISPLAY] grace=%dms timeout=%dms misses_to_dead=%d hits_to_alive=%d",
   GRACE_MS, STATUS_TIMEOUT_MS, MISSES_TO_DEAD, HITS_TO_ALIVE))
 print("---------------------------------------------------")
 
 -------------------------------------------------
--- Monitor setup
+-- Monitor + UI setup
 -------------------------------------------------
 mon.setTextScale(0.5)
 local mw, mh = mon.getSize()
 
-mon.setBackgroundColor(theme.fp_bg or colors.black)
-mon.setTextColor(theme.fp_fg or colors.white)
+mon.setBackgroundColor(colors.black)
+mon.setTextColor(colors.white)
 mon.clear()
 mon.setCursorPos(1, 1)
 
 local panel = DisplayBox{
   window = mon,
-  fg_bg  = cpair(theme.fp_fg or colors.white, theme.fp_bg or colors.black)
+  fg_bg  = cpair(colors.white, colors.black)
 }
 
 -------------------------------------------------
@@ -114,11 +97,11 @@ TextBox{
   width     = mw,
   text      = "FISSION REACTOR PLC - UNIT 1",
   alignment = ALIGN.CENTER,
-  fg_bg     = theme.header
+  fg_bg     = cpair(colors.white, colors.gray)
 }
 
 -------------------------------------------------
--- LEFT COLUMN: System / Control Availability
+-- LEFT COLUMN
 -------------------------------------------------
 local system = Div{
   parent = panel,
@@ -128,18 +111,19 @@ local system = Div{
   height = 18
 }
 
+-- LED uses colors = cpair(ON_COLOR, OFF_COLOR)
 local status_led = LED{
   parent = system,
   label  = "STATUS",
-  colors = cpair(colors.green, colors.red)  -- on=green, off=red
+  colors = cpair(colors.green, colors.red)
 }
 
 local heartbeat_led = LED{
-  parent = system,
-  label  = "HEARTBEAT",
-  colors = cpair(colors.green, colors.red),
-  flash  = true,
-  period = flasher.PERIOD.BLINK_250_MS
+  parent  = system,
+  label   = "HEARTBEAT",
+  colors  = cpair(colors.green, colors.red),
+  flash   = true,
+  period  = flasher.PERIOD.BLINK_250_MS
 }
 
 system.line_break()
@@ -161,13 +145,7 @@ local modem_led_el = LED{
 local network_led = RGBLED{
   parent = system,
   label  = "NETWORK",
-  colors = {
-    colors.green,   -- 1 OK
-    colors.red,     -- 2 fault
-    colors.yellow,  -- 3 warn
-    colors.orange,  -- 4 warn2
-    colors.black    -- 5 off
-  }
+  colors = { colors.green, colors.red, colors.yellow, colors.orange, colors.black }
 }
 
 system.line_break()
@@ -213,7 +191,7 @@ local emerg_cool_led = LED{
 
 mid.line_break()
 
-local hi_box = cpair(theme.hi_fg or colors.white, theme.hi_bg or colors.gray)
+local hi_box = cpair(colors.white, colors.gray)
 
 local trip_frame = Rectangle{
   parent     = mid,
@@ -240,7 +218,7 @@ local trip_led = LED{
 }
 
 -------------------------------------------------
--- RIGHT COLUMN: Trip Causes / Alarms
+-- RIGHT COLUMN
 -------------------------------------------------
 local rps_cause = Rectangle{
   parent = panel,
@@ -253,25 +231,25 @@ local rps_cause = Rectangle{
   fg_bg  = hi_box
 }
 
-local manual_led = LED{ parent = rps_cause, label = "MANUAL",    colors = cpair(colors.red, colors.black) }
-local auto_trip_led = LED{ parent = rps_cause, label = "AUTOMATIC", colors = cpair(colors.red, colors.black) }
-local timeout_led = LED{ parent = rps_cause, label = "TIMEOUT",   colors = cpair(colors.red, colors.black) }
-local rct_fault_led = LED{ parent = rps_cause, label = "RCT FAULT", colors = cpair(colors.red, colors.black) }
+local manual_led     = LED{ parent = rps_cause, label = "MANUAL",     colors = cpair(colors.red, colors.black) }
+local auto_trip_led  = LED{ parent = rps_cause, label = "AUTOMATIC",  colors = cpair(colors.red, colors.black) }
+local timeout_led    = LED{ parent = rps_cause, label = "TIMEOUT",    colors = cpair(colors.red, colors.black) }
+local rct_fault_led  = LED{ parent = rps_cause, label = "RCT FAULT",  colors = cpair(colors.red, colors.black) }
 
 rps_cause.line_break()
 
-local hi_damage_led = LED{ parent = rps_cause, label = "HI DAMAGE", colors = cpair(colors.red, colors.black) }
-local hi_temp_led   = LED{ parent = rps_cause, label = "HI TEMP",   colors = cpair(colors.red, colors.black) }
+local hi_damage_led  = LED{ parent = rps_cause, label = "HI DAMAGE",  colors = cpair(colors.red, colors.black) }
+local hi_temp_led    = LED{ parent = rps_cause, label = "HI TEMP",    colors = cpair(colors.red, colors.black) }
 
 rps_cause.line_break()
 
-local lo_fuel_led   = LED{ parent = rps_cause, label = "LO FUEL",   colors = cpair(colors.red, colors.black) }
-local hi_waste_led  = LED{ parent = rps_cause, label = "HI WASTE",  colors = cpair(colors.red, colors.black) }
+local lo_fuel_led    = LED{ parent = rps_cause, label = "LO FUEL",    colors = cpair(colors.red, colors.black) }
+local hi_waste_led   = LED{ parent = rps_cause, label = "HI WASTE",   colors = cpair(colors.red, colors.black) }
 
 rps_cause.line_break()
 
-local lo_ccool_led  = LED{ parent = rps_cause, label = "LO CCOOLANT", colors = cpair(colors.red, colors.black) }
-local hi_hcool_led  = LED{ parent = rps_cause, label = "HI HCOOLANT", colors = cpair(colors.red, colors.black) }
+local lo_ccool_led   = LED{ parent = rps_cause, label = "LO CCOOLANT", colors = cpair(colors.red, colors.black) }
+local hi_hcool_led   = LED{ parent = rps_cause, label = "HI HCOOLANT", colors = cpair(colors.red, colors.black) }
 
 -------------------------------------------------
 -- Footer
@@ -279,108 +257,106 @@ local hi_hcool_led  = LED{ parent = rps_cause, label = "HI HCOOLANT", colors = c
 local about = Div{
   parent = panel,
   y      = mh - 1,
-  width  = 24,
+  width  = 28,
   height = 2,
   fg_bg  = cpair(colors.lightGray, colors.black)
 }
 
-TextBox{ parent = about, text = "CORE:  v1.1.x" }
-TextBox{ parent = about, text = "PANEL: v1.1.0" }
+TextBox{ parent = about, text = "PANEL: v1.1.1" }
 
 -------------------------------------------------
--- Internal state
+-- Internal state (SAME AS 1.0.5)
 -------------------------------------------------
 local function now_ms() return os.epoch("utc") end
 
 local start_ms       = now_ms()
-local last_any_ms    = 0
-local last_status_ok = false
+local last_frame_ms  = 0              -- last time we saw ANY traffic on 250
+local last_status_ok = false          -- last known status_ok (only changes if msg provides it)
+local frame_count    = 0
 
--- last-known indicator fields (only update when present)
+-- Hysteresis counters / latched state (SAME AS 1.0.5)
+local miss_count     = 0
+local hit_count      = 0
+local alive_latched  = false
+
+-- store other indicator fields; only update when msg provides them
 local last = {}
 
-local miss_count    = 0
-local hit_count     = 0
-local alive_latched = false
-
 -------------------------------------------------
--- LED setters (IMPORTANT: function-style calls)
+-- LED setters (function-style calls)
 -------------------------------------------------
-local function set_led_bool(el, v)
-  if el and el.set_value then el.set_value(v and true or false) end
-end
-
-local function set_ledpair_bool(el, v)
+local function led_bool(el, v, name)
   if not el or not el.set_value then return end
-  el.set_value((v and true) and 2 or 0) -- 0=off/red, 2=green
+  local b = v and true or false
+  el.set_value(b)
+  if name then
+    print(string.format("[LED] %s := %s", name, tostring(b)))
+  end
 end
 
-local function set_rgb_state(ok)
+local function ledpair_bool(el, v)
+  if not el or not el.set_value then return end
+  el.set_value((v and true) and 2 or 0)   -- 0=off/red, 2=green
+end
+
+local function rgb_state(ok)
   if not network_led or not network_led.set_value then return end
   if ok == nil then
-    network_led.set_value(5)
+    network_led.set_value(5)             -- off
   elseif ok then
-    network_led.set_value(1)
+    network_led.set_value(1)             -- green
   else
-    network_led.set_value(2)
+    network_led.set_value(2)             -- red
   end
 end
 
 -------------------------------------------------
--- Message apply
+-- Apply message (heartbeat/status logic SAME AS 1.0.5)
 -------------------------------------------------
 local function apply_panel_msg(msg)
-  last_any_ms = now_ms()
+  frame_count   = frame_count + 1
+  last_frame_ms = now_ms()
 
-  if type(msg) ~= "table" then
-    return
+  if type(msg) == "table" then
+    -- SAME AS 1.0.5: only accept explicit boolean status_ok
+    if type(msg.status_ok) == "boolean" then
+      last_status_ok = msg.status_ok
+    end
+
+    -- other indicators: only update when provided
+    local keys = {
+      "reactor_on","modem_ok","network_ok","rps_enable","auto_power","emerg_cool",
+      "trip","manual_trip","auto_trip","timeout_trip","rct_fault",
+      "hi_damage","hi_temp","lo_fuel","hi_waste","lo_ccool","hi_hcool"
+    }
+    for _, k in ipairs(keys) do
+      if msg[k] ~= nil then last[k] = msg[k] end
+    end
   end
 
-  -- STATUS_OK is special for STATUS lamp
-  if type(msg.status_ok) == "boolean" then
-    last_status_ok = msg.status_ok
-  end
-
-  -- store fields only when they exist (no nil overwrites)
-  local keys = {
-    "reactor_on","modem_ok","network_ok","rps_enable","auto_power","emerg_cool",
-    "trip","manual_trip","auto_trip","timeout_trip","rct_fault",
-    "hi_damage","hi_temp","lo_fuel","hi_waste","lo_ccool","hi_hcool"
-  }
-  for _, k in ipairs(keys) do
-    if msg[k] ~= nil then last[k] = msg[k] end
+  if frame_count <= 5 then
+    print(string.format("[MSG] #%d ms=%d type=%s status_ok=%s",
+      frame_count, last_frame_ms, type(msg), tostring(last_status_ok)))
+    if type(msg) == "table" then
+      print("[MSG] raw: "..textutils.serialize(msg))
+    else
+      print("[MSG] raw(non-table): "..tostring(msg))
+    end
   end
 end
 
 -------------------------------------------------
--- Initial state
--------------------------------------------------
-set_led_bool(status_led, false)
-set_led_bool(heartbeat_led, false)
-set_ledpair_bool(reactor_led, false)
-set_led_bool(modem_led_el, false)
-set_rgb_state(false)
-set_led_bool(rps_enable_led, false)
-set_led_bool(auto_power_led, false)
-set_led_bool(rct_active_led, false)
-set_led_bool(emerg_cool_led, false)
-set_led_bool(trip_led, false)
-set_led_bool(manual_led, false)
-set_led_bool(auto_trip_led, false)
-set_led_bool(timeout_led, false)
-set_led_bool(rct_fault_led, false)
-set_led_bool(hi_damage_led, false)
-set_led_bool(hi_temp_led, false)
-set_led_bool(lo_fuel_led, false)
-set_led_bool(hi_waste_led, false)
-set_led_bool(lo_ccool_led, false)
-set_led_bool(hi_hcool_led, false)
-
--------------------------------------------------
--- Main loop
+-- Timer
 -------------------------------------------------
 local check_timer = os.startTimer(CHECK_STEP)
 
+-- initial state (same intent as 1.0.5)
+led_bool(status_led,    false, "STATUS (init)")
+led_bool(heartbeat_led, false, "HEARTBEAT (init)")
+
+-------------------------------------------------
+-- MAIN LOOP
+-------------------------------------------------
 while true do
   local ev, p1, p2, p3, p4, p5 = os.pullEvent()
 
@@ -392,11 +368,11 @@ while true do
 
   elseif ev == "timer" and p1 == check_timer then
     local now = now_ms()
-    local age = (last_any_ms > 0) and (now - last_any_ms) or 999999999
-    local within = (last_any_ms > 0) and (age <= STATUS_TIMEOUT_MS)
-    local in_grace = (now - start_ms) <= GRACE_MS
+    local age = (last_frame_ms > 0) and (now - last_frame_ms) or 999999999
+    local within_timeout = (last_frame_ms > 0) and (age <= STATUS_TIMEOUT_MS)
 
-    if within then
+    -- hysteresis update (SAME AS 1.0.5)
+    if within_timeout then
       hit_count  = hit_count + 1
       miss_count = 0
     else
@@ -404,53 +380,61 @@ while true do
       hit_count  = 0
     end
 
-    if within and hit_count >= HITS_TO_ALIVE then
+    local in_grace = (now - start_ms) <= GRACE_MS
+
+    if within_timeout and hit_count >= HITS_TO_ALIVE then
       alive_latched = true
-    elseif (not in_grace) and (not within) and miss_count >= MISSES_TO_DEAD then
+    elseif (not in_grace) and (not within_timeout) and miss_count >= MISSES_TO_DEAD then
       alive_latched = false
     end
 
+    -- SAME AS 1.0.5:
     local status_on = alive_latched and last_status_ok
 
-    -- core lamps
-    set_led_bool(heartbeat_led, alive_latched)
-    set_led_bool(status_led, status_on)
+    print(string.format(
+      "[CHECK] age=%.2fs within=%s grace=%s hits=%d misses=%d alive=%s status_ok=%s STATUS=%s",
+      age/1000,
+      tostring(within_timeout),
+      tostring(in_grace),
+      hit_count, miss_count,
+      tostring(alive_latched),
+      tostring(last_status_ok),
+      tostring(status_on)
+    ))
 
-    -- other indicators: only meaningful if alive; otherwise force "safe off"
+    -- SAME AS 1.0.5 lamps:
+    led_bool(heartbeat_led, alive_latched, "HEARTBEAT")
+    led_bool(status_led,    status_on,     "STATUS")
+
+    -- Other indicators (restored)
     local alive = alive_latched
 
-    set_ledpair_bool(reactor_led, alive and (last.reactor_on == true))
-    set_led_bool(rct_active_led, alive and (last.reactor_on == true))
+    ledpair_bool(reactor_led, alive and (last.reactor_on == true))
+    led_bool(rct_active_led,  alive and (last.reactor_on == true))
 
-    set_led_bool(modem_led_el, alive and (last.modem_ok == true))
+    led_bool(modem_led_el,    alive and (last.modem_ok == true))
     if alive then
-      if last.network_ok == nil then set_rgb_state(nil) else set_rgb_state(last.network_ok == true) end
+      if last.network_ok == nil then rgb_state(nil) else rgb_state(last.network_ok == true) end
     else
-      set_rgb_state(false)
+      rgb_state(false)
     end
 
-    set_led_bool(rps_enable_led, alive and (last.rps_enable == true))
-    set_led_bool(auto_power_led, alive and (last.auto_power == true))
-    set_led_bool(emerg_cool_led, alive and (last.emerg_cool == true))
+    led_bool(rps_enable_led,  alive and (last.rps_enable == true))
+    led_bool(auto_power_led,  alive and (last.auto_power == true))
+    led_bool(emerg_cool_led,  alive and (last.emerg_cool == true))
 
-    set_led_bool(trip_led, alive and (last.trip == true))
-    set_led_bool(manual_led, alive and (last.manual_trip == true))
-    set_led_bool(auto_trip_led, alive and (last.auto_trip == true))
-    set_led_bool(timeout_led, alive and (last.timeout_trip == true))
-    set_led_bool(rct_fault_led, alive and (last.rct_fault == true))
+    led_bool(trip_led,        alive and (last.trip == true))
+    led_bool(manual_led,      alive and (last.manual_trip == true))
+    led_bool(auto_trip_led,   alive and (last.auto_trip == true))
+    led_bool(timeout_led,     alive and (last.timeout_trip == true))
+    led_bool(rct_fault_led,   alive and (last.rct_fault == true))
 
-    set_led_bool(hi_damage_led, alive and (last.hi_damage == true))
-    set_led_bool(hi_temp_led,   alive and (last.hi_temp == true))
-    set_led_bool(lo_fuel_led,   alive and (last.lo_fuel == true))
-    set_led_bool(hi_waste_led,  alive and (last.hi_waste == true))
-    set_led_bool(lo_ccool_led,  alive and (last.lo_ccool == true))
-    set_led_bool(hi_hcool_led,  alive and (last.hi_hcool == true))
-
-    -- concise terminal debug (seconds)
-    print(string.format(
-      "[CHECK] age=%.2fs alive=%s status_ok=%s STATUS=%s",
-      age/1000, tostring(alive_latched), tostring(last_status_ok), tostring(status_on)
-    ))
+    led_bool(hi_damage_led,   alive and (last.hi_damage == true))
+    led_bool(hi_temp_led,     alive and (last.hi_temp == true))
+    led_bool(lo_fuel_led,     alive and (last.lo_fuel == true))
+    led_bool(hi_waste_led,    alive and (last.hi_waste == true))
+    led_bool(lo_ccool_led,    alive and (last.lo_ccool == true))
+    led_bool(hi_hcool_led,    alive and (last.hi_hcool == true))
 
     check_timer = os.startTimer(CHECK_STEP)
   end

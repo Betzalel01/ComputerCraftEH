@@ -47,7 +47,7 @@ local MISSES_TO_DEAD      = 3
 local HITS_TO_ALIVE       = 1
 
 -- Manual blink (replaces engine flash)
-local BLINK_STEP          = 0.25  -- seconds
+local BLINK_STEP          = 0.1  -- seconds
 
 -------------------------------------------------
 -- Peripherals

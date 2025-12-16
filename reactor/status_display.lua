@@ -1,13 +1,18 @@
 -- reactor/status_display.lua
--- VERSION: 1.2.1 (2025-12-15)
--- MERGED VERSION:
---   - Two independent loops:
---       * loop_status(): comms + timeout/hysteresis + ALL indicators + STATUS LED
---       * loop_blink(): manual HEARTBEAT blink (no engine flash)
---   - Heartbeat/Status semantics match your working design:
---       * hb_enabled (alive_latched) comes from traffic on channel 250 + hysteresis
---       * STATUS = hb_enabled AND last_status_ok
---       * last_status_ok updates only when msg.status_ok is explicitly boolean
+-- VERSION: 1.2.2 (2025-12-15)
+--
+-- Color policy (per your request):
+--   LEFT SIDE "normal" indicators:
+--     OFF = GREEN
+--     ON  = LIME
+--   SCRAM/TRIP indicators (right side + TRIP banner):
+--     OFF = BLACK
+--     ON  = RED
+--     TRIP should BLINK RED when active
+--
+-- Architecture:
+--   - loop_status(): comms + timeout/hysteresis + computes states + updates non-blinking LEDs
+--   - loop_blink(): manual blinking for HEARTBEAT and TRIP (no engine flasher)
 
 -------------------------------------------------
 -- Require path so graphics/* can be found
@@ -37,26 +42,31 @@ local border = core.border
 -------------------------------------------------
 -- CONFIG
 -------------------------------------------------
-local STATUS_CHANNEL      = 250
+local STATUS_CHANNEL   = 250
 
 -- heartbeat/alive logic
-local STATUS_TIMEOUT_S    = 11          -- seconds since last traffic => dead
-local CHECK_STEP_S        = 1.0         -- status check cadence
+local STATUS_TIMEOUT_S = 11
+local CHECK_STEP_S     = 1.0
 
--- Flicker control (same concept as your 1.0.5)
-local GRACE_S             = 5
-local MISSES_TO_DEAD      = 3
-local HITS_TO_ALIVE       = 1
+-- Flicker control
+local GRACE_S          = 5
+local MISSES_TO_DEAD   = 3
+local HITS_TO_ALIVE    = 1
 
--- Manual heartbeat blink timing (independent of status loop)
-local BLINK_ON_S          = 0.12
-local BLINK_OFF_S         = 0.12
+-- Manual blink timing (independent)
+local BLINK_ON_S       = 0.12
+local BLINK_OFF_S      = 0.12
 
--- Colors
-local HB_ON_COLOR         = colors.green
-local HB_OFF_COLOR        = colors.lime     -- "dark-ish" green idle state
-local OK_ON_COLOR         = colors.green
-local OK_OFF_COLOR        = colors.red
+-------------------------------------------------
+-- Color policy
+-------------------------------------------------
+-- Left-side "normal" indicators (OFF green, ON lime)
+local LEFT_ON  = colors.lime
+local LEFT_OFF = colors.green
+
+-- Scram/trip indicators
+local SCRAM_ON  = colors.red
+local SCRAM_OFF = colors.black
 
 -------------------------------------------------
 -- Peripherals
@@ -71,19 +81,15 @@ modem.open(STATUS_CHANNEL)
 -------------------------------------------------
 -- Helpers
 -------------------------------------------------
-local function now_s()
-  return os.epoch("utc") / 1000
-end
+local function now_s() return os.epoch("utc") / 1000 end
 
 -- graphics engine elements expect function-style set_value
 local function set_led(el, v)
   if el and el.set_value then el.set_value(v and true or false) end
 end
-
 local function set_ledpair(el, n)
   if el and el.set_value then el.set_value(n) end
 end
-
 local function set_rgb(el, n)
   if el and el.set_value then el.set_value(n) end
 end
@@ -126,36 +132,42 @@ local system = Div{
 local status_led = LED{
   parent = system,
   label  = "STATUS",
-  colors = cpair(OK_ON_COLOR, OK_OFF_COLOR)
+  colors = cpair(LEFT_ON, LEFT_OFF)
 }
 
--- Non-engine blink (manual loop controls true/false)
+-- Heartbeat is non-engine blink (manual loop drives true/false)
 local heartbeat_led = LED{
   parent = system,
   label  = "HEARTBEAT",
-  colors = cpair(HB_ON_COLOR, HB_OFF_COLOR)
+  colors = cpair(LEFT_ON, LEFT_OFF)
 }
 
 system.line_break()
 
+-- LEDPair: 0=off, 1=c1, 2=c2
+-- You want OFF=green, ON=lime, so off=green, c2=lime.
 local reactor_led = LEDPair{
   parent = system,
   label  = "REACTOR",
-  off    = colors.red,
-  c1     = colors.yellow,
-  c2     = colors.green
+  off    = LEFT_OFF,
+  c1     = LEFT_OFF,
+  c2     = LEFT_ON
 }
 
 local modem_led_el = LED{
   parent = system,
   label  = "MODEM",
-  colors = cpair(colors.green, colors.red)
+  colors = cpair(LEFT_ON, LEFT_OFF)
 }
 
+-- RGBLED indices are engine-defined; we will use:
+--   1 = OK (lime)
+--   2 = fault (red)
+--   5 = off/unknown (green)
 local network_led = RGBLED{
   parent = system,
   label  = "NETWORK",
-  colors = { colors.green, colors.red, colors.yellow, colors.orange, colors.black }
+  colors = { LEFT_ON, SCRAM_ON, colors.yellow, colors.orange, LEFT_OFF }
 }
 
 system.line_break()
@@ -163,13 +175,13 @@ system.line_break()
 local rps_enable_led = LED{
   parent = system,
   label  = "RPS ENABLE",
-  colors = cpair(colors.green, colors.red)
+  colors = cpair(LEFT_ON, LEFT_OFF)
 }
 
 local auto_power_led = LED{
   parent = system,
   label  = "AUTO POWER CTRL",
-  colors = cpair(colors.green, colors.red)
+  colors = cpair(LEFT_ON, LEFT_OFF)
 }
 
 -- MIDDLE COLUMN
@@ -186,7 +198,7 @@ local rct_active_led = LED{
   x      = 2,
   width  = 12,
   label  = "RCT ACTIVE",
-  colors = cpair(colors.green, colors.red)
+  colors = cpair(LEFT_ON, LEFT_OFF)
 }
 
 local emerg_cool_led = LED{
@@ -194,7 +206,7 @@ local emerg_cool_led = LED{
   x      = 2,
   width  = 14,
   label  = "EMERG COOL",
-  colors = cpair(colors.green, colors.red)
+  colors = cpair(LEFT_ON, LEFT_OFF)
 }
 
 mid.line_break()
@@ -216,14 +228,15 @@ local trip_div = Div{
   fg_bg  = hi_box
 }
 
+-- TRIP should blink red when active (manual loop)
 local trip_led = LED{
   parent = trip_div,
   width  = 10,
   label  = "TRIP",
-  colors = cpair(colors.red, colors.black)
+  colors = cpair(SCRAM_ON, SCRAM_OFF)
 }
 
--- RIGHT COLUMN
+-- RIGHT COLUMN (scram/trip causes + alarms)
 local rps_cause = Rectangle{
   parent = panel,
   x      = mw - 16,
@@ -235,35 +248,35 @@ local rps_cause = Rectangle{
   fg_bg  = hi_box
 }
 
-local manual_led     = LED{ parent = rps_cause, label = "MANUAL",      colors = cpair(colors.red, colors.black) }
-local auto_trip_led  = LED{ parent = rps_cause, label = "AUTOMATIC",   colors = cpair(colors.red, colors.black) }
-local timeout_led    = LED{ parent = rps_cause, label = "TIMEOUT",     colors = cpair(colors.red, colors.black) }
-local rct_fault_led  = LED{ parent = rps_cause, label = "RCT FAULT",   colors = cpair(colors.red, colors.black) }
+local manual_led     = LED{ parent = rps_cause, label = "MANUAL",      colors = cpair(SCRAM_ON, SCRAM_OFF) }
+local auto_trip_led  = LED{ parent = rps_cause, label = "AUTOMATIC",   colors = cpair(SCRAM_ON, SCRAM_OFF) }
+local timeout_led    = LED{ parent = rps_cause, label = "TIMEOUT",     colors = cpair(SCRAM_ON, SCRAM_OFF) }
+local rct_fault_led  = LED{ parent = rps_cause, label = "RCT FAULT",   colors = cpair(SCRAM_ON, SCRAM_OFF) }
 
 rps_cause.line_break()
 
-local hi_damage_led  = LED{ parent = rps_cause, label = "HI DAMAGE",   colors = cpair(colors.red, colors.black) }
-local hi_temp_led    = LED{ parent = rps_cause, label = "HI TEMP",     colors = cpair(colors.red, colors.black) }
+local hi_damage_led  = LED{ parent = rps_cause, label = "HI DAMAGE",   colors = cpair(SCRAM_ON, SCRAM_OFF) }
+local hi_temp_led    = LED{ parent = rps_cause, label = "HI TEMP",     colors = cpair(SCRAM_ON, SCRAM_OFF) }
 
 rps_cause.line_break()
 
-local lo_fuel_led    = LED{ parent = rps_cause, label = "LO FUEL",     colors = cpair(colors.red, colors.black) }
-local hi_waste_led   = LED{ parent = rps_cause, label = "HI WASTE",    colors = cpair(colors.red, colors.black) }
+local lo_fuel_led    = LED{ parent = rps_cause, label = "LO FUEL",     colors = cpair(SCRAM_ON, SCRAM_OFF) }
+local hi_waste_led   = LED{ parent = rps_cause, label = "HI WASTE",    colors = cpair(SCRAM_ON, SCRAM_OFF) }
 
 rps_cause.line_break()
 
-local lo_ccool_led   = LED{ parent = rps_cause, label = "LO CCOOLANT", colors = cpair(colors.red, colors.black) }
-local hi_hcool_led   = LED{ parent = rps_cause, label = "HI HCOOLANT", colors = cpair(colors.red, colors.black) }
+local lo_ccool_led   = LED{ parent = rps_cause, label = "LO CCOOLANT", colors = cpair(SCRAM_ON, SCRAM_OFF) }
+local hi_hcool_led   = LED{ parent = rps_cause, label = "HI HCOOLANT", colors = cpair(SCRAM_ON, SCRAM_OFF) }
 
 -- Footer
 local about = Div{
   parent = panel,
   y      = mh - 1,
-  width  = 32,
+  width  = 40,
   height = 2,
   fg_bg  = cpair(colors.lightGray, colors.black)
 }
-TextBox{ parent = about, text = "PANEL: v1.2.1" }
+TextBox{ parent = about, text = "PANEL: v1.2.2" }
 
 -------------------------------------------------
 -- Shared state between loops
@@ -277,11 +290,13 @@ local shared = {
   miss_count     = 0,
   hb_enabled     = false,     -- alive_latched equivalent
 
-  -- last known values for other indicators (from core frames)
-  last = {}
+  -- these are updated from incoming frames (if present)
+  last = {},
+
+  -- computed state for blink loop
+  trip_active = false
 }
 
--- expected indicator keys from reactor_core buildPanelStatus()
 local IND_KEYS = {
   "reactor_on","modem_ok","network_ok","rps_enable","auto_power","emerg_cool",
   "trip","manual_trip","auto_trip","timeout_trip","rct_fault",
@@ -289,59 +304,62 @@ local IND_KEYS = {
 }
 
 -------------------------------------------------
--- Indicator mapping helpers (no engine flash)
+-- Indicator updater (non-blinking indicators)
 -------------------------------------------------
 local function update_other_indicators(alive)
   local L = shared.last
 
-  -- REACTOR (LEDPair) + RCT ACTIVE
+  -- REACTOR + RCT ACTIVE
   set_ledpair(reactor_led, (alive and (L.reactor_on == true)) and 2 or 0)
   set_led(rct_active_led, alive and (L.reactor_on == true))
 
   -- MODEM / NETWORK
   set_led(modem_led_el, alive and (L.modem_ok == true))
   if not alive then
-    set_rgb(network_led, 2)  -- red (fault)
+    set_rgb(network_led, 2)      -- red fault
   else
     if L.network_ok == nil then
-      set_rgb(network_led, 5) -- off
+      set_rgb(network_led, 5)    -- green "off/unknown"
     elseif L.network_ok == true then
-      set_rgb(network_led, 1) -- green
+      set_rgb(network_led, 1)    -- lime OK
     else
-      set_rgb(network_led, 2) -- red
+      set_rgb(network_led, 2)    -- red fault
     end
   end
 
-  -- protection / control
+  -- protection/control
   set_led(rps_enable_led, alive and (L.rps_enable == true))
   set_led(auto_power_led, alive and (L.auto_power == true))
 
   -- emergency cooling
   set_led(emerg_cool_led, alive and (L.emerg_cool == true))
 
-  -- trip + causes
-  set_led(trip_led,       alive and (L.trip == true))
-  set_led(manual_led,     alive and (L.manual_trip == true))
-  set_led(auto_trip_led,  alive and (L.auto_trip == true))
-  set_led(timeout_led,    alive and (L.timeout_trip == true))
-  set_led(rct_fault_led,  alive and (L.rct_fault == true))
+  -- trip causes (solid; TRIP banner itself blinks in blink loop)
+  set_led(manual_led,    alive and (L.manual_trip == true))
+  set_led(auto_trip_led, alive and (L.auto_trip == true))
+  set_led(timeout_led,   alive and (L.timeout_trip == true))
+  set_led(rct_fault_led, alive and (L.rct_fault == true))
 
   -- alarms
-  set_led(hi_damage_led,  alive and (L.hi_damage == true))
-  set_led(hi_temp_led,    alive and (L.hi_temp == true))
-  set_led(lo_fuel_led,    alive and (L.lo_fuel == true))
-  set_led(hi_waste_led,   alive and (L.hi_waste == true))
-  set_led(lo_ccool_led,   alive and (L.lo_ccool == true))
-  set_led(hi_hcool_led,   alive and (L.hi_hcool == true))
+  set_led(hi_damage_led, alive and (L.hi_damage == true))
+  set_led(hi_temp_led,   alive and (L.hi_temp == true))
+  set_led(lo_fuel_led,   alive and (L.lo_fuel == true))
+  set_led(hi_waste_led,  alive and (L.hi_waste == true))
+  set_led(lo_ccool_led,  alive and (L.lo_ccool == true))
+  set_led(hi_hcool_led,  alive and (L.hi_hcool == true))
+
+  -- store for blink loop
+  shared.trip_active = alive and (L.trip == true)
 end
 
 -------------------------------------------------
--- Loop A: status/comms + ALL indicators except heartbeat blinking
+-- Loop A: comms + status + non-blinking indicators
 -------------------------------------------------
 local function loop_status()
   term.clear()
   term.setCursorPos(1,1)
-  print("[STATUS_DISPLAY] VERSION 1.2.1 (merged, two-loop)")
+  print("[STATUS_DISPLAY] VERSION 1.2.2 (two-loop, full panel)")
+  print("[STATUS_DISPLAY] left off=GREEN, left on=LIME; scram on=RED")
   print("[STATUS_DISPLAY] listening on channel "..STATUS_CHANNEL)
   print(string.format("[STATUS_DISPLAY] timeout=%ss grace=%ss misses=%d hits=%d",
     STATUS_TIMEOUT_S, GRACE_S, MISSES_TO_DEAD, HITS_TO_ALIVE))
@@ -350,8 +368,9 @@ local function loop_status()
   print("---------------------------------------------------")
 
   -- initial LED states
-  set_led(status_led, false)
-  set_led(heartbeat_led, false)
+  set_led(status_led, false)      -- green (off)
+  set_led(heartbeat_led, false)   -- green (off)
+  set_led(trip_led, false)        -- black (off)
   update_other_indicators(false)
 
   local check_timer = os.startTimer(CHECK_STEP_S)
@@ -369,12 +388,10 @@ local function loop_status()
           shared.last_status_ok = msg.status_ok
         end
 
-        -- capture other indicator fields when present
+        -- capture other indicator fields
         if type(msg) == "table" then
           for _, k in ipairs(IND_KEYS) do
-            if msg[k] ~= nil then
-              shared.last[k] = msg[k]
-            end
+            if msg[k] ~= nil then shared.last[k] = msg[k] end
           end
         end
       end
@@ -402,20 +419,20 @@ local function loop_status()
       local alive = shared.hb_enabled
       local status_on = alive and shared.last_status_ok
 
-      -- STATUS LED (solid)
+      -- STATUS LED (LEFT policy: on=lime, off=green)
       set_led(status_led, status_on)
 
-      -- ALL other indicators (solid; gated by alive)
+      -- update everything else (solid indicators)
       update_other_indicators(alive)
 
-      -- debug
       print(string.format(
-        "[CHECK] age=%.2fs within=%s grace=%s hits=%d misses=%d hb_enabled=%s status_ok=%s STATUS=%s",
+        "[CHECK] age=%.2fs within=%s grace=%s hits=%d misses=%d hb_enabled=%s status_ok=%s STATUS=%s trip=%s",
         age, tostring(within), tostring(in_grace),
         shared.hit_count, shared.miss_count,
         tostring(shared.hb_enabled),
         tostring(shared.last_status_ok),
-        tostring(status_on)
+        tostring(status_on),
+        tostring(shared.trip_active)
       ))
 
       check_timer = os.startTimer(CHECK_STEP_S)
@@ -424,20 +441,35 @@ local function loop_status()
 end
 
 -------------------------------------------------
--- Loop B: manual heartbeat blinking (independent timing)
+-- Loop B: manual blinking for HEARTBEAT + TRIP
 -------------------------------------------------
 local function loop_blink()
-  local phase_on = false
+  local hb_phase = false
+  local trip_phase = false
+
   while true do
-    if shared.hb_enabled then
-      phase_on = not phase_on
-      set_led(heartbeat_led, phase_on)
-      os.sleep(phase_on and BLINK_ON_S or BLINK_OFF_S)
+    local alive = shared.hb_enabled
+    local trip  = shared.trip_active
+
+    if alive then
+      hb_phase = not hb_phase
     else
-      phase_on = false
-      set_led(heartbeat_led, false) -- shows HB_OFF_COLOR (lime)
-      os.sleep(0.10)
+      hb_phase = false
     end
+
+    if trip then
+      trip_phase = not trip_phase
+    else
+      trip_phase = false
+    end
+
+    -- HEARTBEAT: blink between lime(on) and green(off)
+    set_led(heartbeat_led, alive and hb_phase)
+
+    -- TRIP: blink red when active, otherwise off(black)
+    set_led(trip_led, trip and trip_phase)
+
+    os.sleep((alive and hb_phase) and BLINK_ON_S or BLINK_OFF_S)
   end
 end
 

@@ -1,10 +1,13 @@
 -- reactor_core.lua
--- VERSION: 1.1.1 (2025-12-16)
+-- VERSION: 1.1.2 (2025-12-16)
 --
 -- Fix:
---   Add explicit `reactor_formed` to the panel frame.
---   This is TRUE when the Mekanism multiblock/logic adapter reports online,
---   independent of poweredOn/burnRate/scram state.
+--   Robust "formed/online" detection for Mekanism getStatus().
+--   Some environments return strings/states, not strict booleans.
+--   Panel fields now use:
+--     reactor_formed = sensors.formed (boolean)
+--     rct_fault      = not sensors.formed
+--     status_ok      = sensors.formed and emergencyOn and not scramLatched
 
 --------------------------
 -- CONFIG
@@ -44,7 +47,10 @@ local emergencyOn  = true
 local targetBurn   = 0
 
 local sensors = {
-  online       = false,
+  -- raw
+  statusRaw    = nil,
+  formed       = false,  -- boolean, robust meaning: multiblock formed/adapter online
+
   tempK        = 0,
   damagePct    = 0,
   coolantFrac  = 0,
@@ -75,8 +81,38 @@ local function setActivationRS(state)
   end
 end
 
+-- Convert whatever getStatus() returns into a boolean "formed/online"
+local function status_to_formed(ok, v)
+  if not ok then return false end
+  if v == true then return true end
+  if v == false or v == nil then return false end
+
+  local t = type(v)
+  if t == "number" then
+    return v ~= 0
+  elseif t == "string" then
+    local s = string.lower(v)
+    -- treat these as "good"
+    if s == "running" or s == "online" or s == "formed" or s == "active" or s == "ready" then
+      return true
+    end
+    -- treat these as "bad"
+    if s == "offline" or s == "invalid" or s == "unformed" or s == "error" then
+      return false
+    end
+    -- unknown string: assume "formed" if it isn't empty
+    return #s > 0
+  end
+
+  -- any other truthy type
+  return true
+end
+
 local function readSensors()
   local okS, status   = pcall(reactor.getStatus)
+  sensors.statusRaw   = status
+  sensors.formed      = status_to_formed(okS, status)
+
   local okT, temp     = pcall(reactor.getTemperature)
   local okD, dmg      = pcall(reactor.getDamagePercent)
   local okC, cool     = pcall(reactor.getCoolantFilledPercentage)
@@ -85,7 +121,6 @@ local function readSensors()
   local okB, burn     = pcall(reactor.getBurnRate)
   local okM, maxBurnR = pcall(reactor.getMaxBurnRate)
 
-  sensors.online      = okS and status or false
   sensors.tempK       = okT and (temp or 0) or 0
   sensors.damagePct   = okD and (dmg or 0) or 0
   sensors.coolantFrac = okC and (cool or 0) or 0
@@ -119,19 +154,14 @@ end
 -- PANEL STATUS ENCODING
 --------------------------
 local function buildPanelStatus()
-  -- NEW: formed is strictly "multiblock/adapter online"
-  local reactor_formed = (sensors.online == true)
+  local reactor_formed = (sensors.formed == true)
+  local status_ok      = reactor_formed and emergencyOn and (not scramLatched)
+  local reactor_on     = reactor_formed and poweredOn and (sensors.burnRate or 0) > 0
+  local trip           = scramLatched
 
-  -- existing meanings
-  local status_ok  = sensors.online and emergencyOn and not scramLatched
-  local reactor_on = sensors.online and poweredOn and (sensors.burnRate or 0) > 0
-  local trip       = scramLatched
-
-  local panel = {
-    -- NEW FIELD
+  return {
     reactor_formed = reactor_formed,
 
-    -- left column
     status_ok  = status_ok,
     reactor_on = reactor_on,
     modem_ok   = true,
@@ -139,17 +169,14 @@ local function buildPanelStatus()
     rps_enable = emergencyOn,
     auto_power = false,
 
-    -- middle column
     emerg_cool = false,
 
-    -- trip banner + causes
     trip         = trip,
     manual_trip  = trip,
     auto_trip    = false,
     timeout_trip = false,
-    rct_fault    = not sensors.online,
+    rct_fault    = not reactor_formed,
 
-    -- alarms
     hi_damage = sensors.damagePct   > MAX_DAMAGE_PCT,
     hi_temp   = false,
     lo_fuel   = false,
@@ -157,13 +184,10 @@ local function buildPanelStatus()
     lo_ccool  = sensors.coolantFrac < MIN_COOLANT_FRAC,
     hi_hcool  = sensors.heatedFrac  > MAX_HEATED_FRAC,
   }
-
-  return panel
 end
 
 local function sendPanelStatus()
-  local pkt = buildPanelStatus()
-  modem.transmit(STATUS_CHANNEL, REACTOR_CHANNEL, pkt)
+  modem.transmit(STATUS_CHANNEL, REACTOR_CHANNEL, buildPanelStatus())
 end
 
 --------------------------
@@ -221,8 +245,7 @@ local function sendStatus(replyChannel)
 end
 
 local function sendHeartbeat()
-  local msg = { type = "heartbeat", timestamp = os.clock() }
-  modem.transmit(CONTROL_CHANNEL, REACTOR_CHANNEL, msg)
+  modem.transmit(CONTROL_CHANNEL, REACTOR_CHANNEL, { type="heartbeat", timestamp=os.clock() })
 end
 
 local function handleCommand(cmd, data, replyChannel)
@@ -266,9 +289,6 @@ local function handleCommand(cmd, data, replyChannel)
   elseif cmd == "set_emergency" then
     emergencyOn = not not data
     log("Emergency protection: "..(emergencyOn and "ON" or "OFF"))
-
-  elseif cmd == "request_status" then
-    -- reply below
   end
 
   sendStatus(replyChannel)

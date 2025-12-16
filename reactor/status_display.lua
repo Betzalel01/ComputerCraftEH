@@ -35,10 +35,10 @@ local MISSES_TO_DEAD   = 3
 local HITS_TO_ALIVE    = 1
 
 -- Blink rates (requested)
-local HB_ON_S   = 1.0
-local HB_OFF_S  = 1.0
-local TRIP_ON_S  = 0.5
-local TRIP_OFF_S = 0.5
+local HB_ON_S   = .5
+local HB_OFF_S  = .5
+local TRIP_ON_S  = 0.3
+local TRIP_OFF_S = 0.1
 
 -- LEFT policy: OFF=GRAY, ON=LIME
 local LEFT_ON  = colors.lime
@@ -99,8 +99,8 @@ local system = Div{
   height = 18
 }
 
-local status_led    = LED{ parent = system, label = "STATUS",    colors = cpair(LEFT_ON, LEFT_OFF) }
-local heartbeat_led = LED{ parent = system, label = "HEARTBEAT", colors = cpair(LEFT_ON, LEFT_OFF) }
+local status_led    = LED{ parent = system, label = "STATUS",    colors = cpair(colors.lime, colors.green) }
+local heartbeat_led = LED{ parent = system, label = "HEARTBEAT", colors = cpair(colors.lime, colors.green) }
 
 system.line_break()
 

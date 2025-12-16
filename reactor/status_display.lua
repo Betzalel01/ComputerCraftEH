@@ -1,13 +1,13 @@
 -- reactor/status_display.lua
--- VERSION: 1.1.2 (2025-12-15)
--- Heartbeat/Status logic EXACTLY matches your 1.0.5:
+-- VERSION: 1.1.3 (2025-12-15)
+-- Heartbeat/Status logic EXACTLY as your 1.0.5:
 --   - HEARTBEAT is based on any traffic on channel 250 (alive_latched)
 --   - STATUS is alive_latched AND last_status_ok
 --   - last_status_ok updates ONLY when msg is a table AND msg.status_ok is a boolean
 -- Flicker fixes (same as 1.0.5): hysteresis + startup grace
 --
--- CHANGE vs 1.1.1: LED updating logic copied from the working minimal version
--- (pre-indicator additions): function-style `el.set_value(x)` only (no `:` calls).
+-- CHANGE: DO NOT use engine flash. Heartbeat LED is non-flashing and we simulate blinking
+-- via a timer when alive_latched == true.
 
 -------------------------------------------------
 -- Require path so graphics/* can be found
@@ -29,7 +29,6 @@ local TextBox    = require("graphics.elements.TextBox")
 local LED        = require("graphics.elements.indicators.LED")
 local LEDPair    = require("graphics.elements.indicators.LEDPair")
 local RGBLED     = require("graphics.elements.indicators.RGBLED")
-local flasher    = require("graphics.flasher")
 
 local ALIGN  = core.ALIGN
 local cpair  = core.cpair
@@ -47,6 +46,9 @@ local GRACE_MS            = 5 * 1000
 local MISSES_TO_DEAD      = 3
 local HITS_TO_ALIVE       = 1
 
+-- Manual blink (replaces engine flash)
+local BLINK_STEP          = 0.25  -- seconds
+
 -------------------------------------------------
 -- Peripherals
 -------------------------------------------------
@@ -62,12 +64,12 @@ modem.open(STATUS_CHANNEL)
 -------------------------------------------------
 term.clear()
 term.setCursorPos(1,1)
-print("[STATUS_DISPLAY] VERSION 1.1.2 (2025-12-15)")
+print("[STATUS_DISPLAY] VERSION 1.1.3 (2025-12-15)")
 print("[STATUS_DISPLAY] heartbeat/status logic = SAME AS 1.0.5")
-print("[STATUS_DISPLAY] LED setter logic = SAME AS minimal working version")
+print("[STATUS_DISPLAY] heartbeat blink = manual timer (no engine flash)")
 print("[STATUS_DISPLAY] listening on STATUS="..STATUS_CHANNEL)
-print(string.format("[STATUS_DISPLAY] grace=%dms timeout=%dms misses=%d hits=%d",
-  GRACE_MS, STATUS_TIMEOUT_MS, MISSES_TO_DEAD, HITS_TO_ALIVE))
+print(string.format("[STATUS_DISPLAY] grace=%dms timeout=%dms misses=%d hits=%d blink=%.2fs",
+  GRACE_MS, STATUS_TIMEOUT_MS, MISSES_TO_DEAD, HITS_TO_ALIVE, BLINK_STEP))
 print("---------------------------------------------------")
 
 -------------------------------------------------
@@ -113,12 +115,12 @@ local status_led = LED{
   colors = cpair(colors.green, colors.red)
 }
 
+-- Non-flashing LED (we blink it ourselves)
 local heartbeat_led = LED{
   parent = system,
   label  = "HEARTBEAT",
   colors = cpair(colors.green, colors.red)
 }
-
 
 system.line_break()
 
@@ -206,9 +208,7 @@ local trip_led = LED{
   parent = trip_div,
   width  = 10,
   label  = "TRIP",
-  colors = cpair(colors.red, colors.black),
-  flash  = true,
-  period = flasher.PERIOD.BLINK_250_MS
+  colors = cpair(colors.red, colors.black)
 }
 
 -------------------------------------------------
@@ -255,15 +255,11 @@ local about = Div{
   height = 2,
   fg_bg  = cpair(colors.lightGray, colors.black)
 }
-TextBox{ parent = about, text = "PANEL: v1.1.2" }
+TextBox{ parent = about, text = "PANEL: v1.1.3" }
 
 -------------------------------------------------
 -- Internal state (same as 1.0.5)
 -------------------------------------------------
-local BLINK_STEP = 0.25        -- seconds (250ms blink)
-local blink_on   = false
-local blink_timer = os.startTimer(BLINK_STEP)
-
 local function now_ms() return os.epoch("utc") end
 
 local start_ms       = now_ms()
@@ -275,11 +271,14 @@ local miss_count     = 0
 local hit_count      = 0
 local alive_latched  = false
 
+-- manual blink state
+local blink_on       = false
+
+-- other indicators
 local last = {}
 
 -------------------------------------------------
--- LED setters (COPIED from minimal working version)
--- IMPORTANT: function-style call ONLY: el.set_value(x)
+-- LED setters (function-style only)
 -------------------------------------------------
 local function led_bool(el, v, name)
   if not el or not el.set_value then return end
@@ -301,17 +300,16 @@ local function rgb_set(el, n)
 end
 
 local function set_ledpair_bool(el, v)
-  -- 0=off/red, 1=yellow, 2=green
-  ledpair_set(el, (v and true) and 2 or 0)
+  ledpair_set(el, (v and true) and 2 or 0) -- 0=off/red, 2=green
 end
 
 local function set_rgb_state(ok)
   if ok == nil then
-    rgb_set(network_led, 5)      -- off
+    rgb_set(network_led, 5)
   elseif ok then
-    rgb_set(network_led, 1)      -- green
+    rgb_set(network_led, 1)
   else
-    rgb_set(network_led, 2)      -- red
+    rgb_set(network_led, 2)
   end
 end
 
@@ -347,12 +345,13 @@ local function apply_panel_msg(msg)
 end
 
 -------------------------------------------------
--- Timer + initial state
+-- Timers + initial state
 -------------------------------------------------
 local check_timer = os.startTimer(CHECK_STEP)
-led_bool(status_led,    false, "STATUS (init)")
-led_bool(heartbeat_led, (alive_latched and blink_on), "HEARTBEAT")
+local blink_timer = os.startTimer(BLINK_STEP)
 
+led_bool(status_led,    false, "STATUS (init)")
+led_bool(heartbeat_led, false, "HEARTBEAT (init)")
 
 -------------------------------------------------
 -- MAIN LOOP
@@ -365,6 +364,14 @@ while true do
     if ch == STATUS_CHANNEL then
       apply_panel_msg(msg)
     end
+
+  elseif ev == "timer" and p1 == blink_timer then
+    if alive_latched then
+      blink_on = not blink_on
+    else
+      blink_on = false
+    end
+    blink_timer = os.startTimer(BLINK_STEP)
 
   elseif ev == "timer" and p1 == check_timer then
     local now = now_ms()
@@ -390,19 +397,20 @@ while true do
     local status_on = alive_latched and last_status_ok
 
     print(string.format(
-      "[CHECK] age=%.2fs within=%s grace=%s hits=%d misses=%d alive=%s status_ok=%s STATUS=%s",
+      "[CHECK] age=%.2fs within=%s grace=%s hits=%d misses=%d alive=%s status_ok=%s STATUS=%s blink=%s",
       age/1000, tostring(within_timeout), tostring(in_grace),
       hit_count, miss_count,
       tostring(alive_latched),
       tostring(last_status_ok),
-      tostring(status_on)
+      tostring(status_on),
+      tostring(blink_on)
     ))
 
-    -- Heartbeat/Status EXACTLY as 1.0.5
-    led_bool(heartbeat_led, alive_latched, "HEARTBEAT")
-    led_bool(status_led,    status_on,     "STATUS")
+    -- Heartbeat/Status EXACTLY as 1.0.5, except heartbeat is blinked manually:
+    led_bool(heartbeat_led, (alive_latched and blink_on), "HEARTBEAT")
+    led_bool(status_led,    status_on,                    "STATUS")
 
-    -- Other indicators restored (driven by last[]; gated by alive_latched)
+    -- Other indicators (restored; gated by alive_latched)
     local alive = alive_latched
 
     set_ledpair_bool(reactor_led, alive and (last.reactor_on == true))
@@ -434,11 +442,4 @@ while true do
 
     check_timer = os.startTimer(CHECK_STEP)
   end
-  elseif ev == "timer" and p1 == blink_timer then
-  if alive_latched then
-    blink_on = not blink_on
-  else
-    blink_on = false
-  end
-  blink_timer = os.startTimer(BLINK_STEP)
 end

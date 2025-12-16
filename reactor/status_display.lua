@@ -99,7 +99,7 @@ local system = Div{
   height = 18
 }
 
-local status_led    = LED{ parent = system, label = "STATUS",    colors = cpair(colors.lime, colors.green) }
+local status_led    = LED{ parent = system, label = "STATUS",    colors = cpair(LEFT_ON, LEFT_OFF) }
 local heartbeat_led = LED{ parent = system, label = "HEARTBEAT", colors = cpair(colors.lime, colors.green) }
 
 system.line_break()

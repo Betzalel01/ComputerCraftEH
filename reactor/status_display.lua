@@ -1,26 +1,10 @@
 -- reactor/status_display.lua
 -- VERSION: 1.2.6 (2025-12-16)
 --
--- Redesign:
---   Replaced ambiguous LEDPair "REACTOR" with two explicit indicators:
---     RCT FORMED  = reactor logic adapter online (alive AND not rct_fault)
---     RCT RUNNING = reactor_on from core (alive AND reactor_on)
---
--- Color policy:
---   LEFT SIDE "normal" indicators:
---     OFF = GRAY
---     ON  = LIME
---   HEARTBEAT special:
---     OFF = GREEN (intentional "idle green")
---     ON  = LIME  (blinks)
---   SCRAM/TRIP indicators:
---     OFF = BLACK
---     ON  = RED
---   TRIP blinks RED when active
---
--- Two-loop architecture:
---   loop_status(): comms + timeout/hysteresis + computes states + updates non-blinking LEDs
---   loop_blink(): manual blinking for HEARTBEAT and TRIP only
+-- Fix:
+--   RCT FORMED now reflects Mekanism "formed" state (core frame field `reactor_formed`),
+--   independent of reactor running/power/scram.
+--   (Requires reactor_core.lua >= v1.1.1)
 
 if package and package.path then
   package.path = "/?.lua;/?/init.lua;" .. package.path
@@ -49,17 +33,17 @@ local GRACE_S          = 5
 local MISSES_TO_DEAD   = 3
 local HITS_TO_ALIVE    = 1
 
--- Blink rates
-local HB_ON_S   = 1.0
-local HB_OFF_S  = 1.0
-local TRIP_ON_S  = 0.5
-local TRIP_OFF_S = 0.5
+-- Blink rates (your current preferences)
+local HB_ON_S    = 0.5
+local HB_OFF_S   = 0.5
+local TRIP_ON_S  = 0.3
+local TRIP_OFF_S = 0.1
 
 -- LEFT policy: OFF=GRAY, ON=LIME
 local LEFT_ON  = colors.lime
 local LEFT_OFF = colors.gray
 
--- HEARTBEAT policy (requested): OFF=GREEN, ON=LIME
+-- HEARTBEAT policy (intentional): OFF=GREEN, ON=LIME
 local HB_ON  = colors.lime
 local HB_OFF = colors.green
 
@@ -120,7 +104,7 @@ local heartbeat_led = LED{ parent = system, label = "HEARTBEAT", colors = cpair(
 
 system.line_break()
 
--- Redesign: explicit reactor indicators
+-- Reactor state: explicit and unambiguous
 local rct_formed_led  = LED{ parent = system, label = "RCT FORMED",  colors = cpair(LEFT_ON, LEFT_OFF) }
 local rct_running_led = LED{ parent = system, label = "RCT RUNNING", colors = cpair(LEFT_ON, LEFT_OFF) }
 
@@ -128,7 +112,6 @@ system.line_break()
 
 local modem_led_el = LED{ parent = system, label = "MODEM", colors = cpair(LEFT_ON, LEFT_OFF) }
 
--- RGBLED: index 1 OK=LIME, 2 fault=RED, 5 idle/unknown=GRAY
 local network_led = RGBLED{
   parent = system,
   label  = "NETWORK",
@@ -166,7 +149,6 @@ local trip_frame = Rectangle{
 }
 
 local trip_div = Div{ parent = trip_frame, height = 1, fg_bg = hi_box }
-
 local trip_led = LED{ parent = trip_div, width = 10, label = "TRIP", colors = cpair(SCRAM_ON, SCRAM_OFF) }
 
 -- RIGHT COLUMN
@@ -201,7 +183,6 @@ rps_cause.line_break()
 local lo_ccool_led   = LED{ parent = rps_cause, label = "LO CCOOLANT", colors = cpair(SCRAM_ON, SCRAM_OFF) }
 local hi_hcool_led   = LED{ parent = rps_cause, label = "HI HCOOLANT", colors = cpair(SCRAM_ON, SCRAM_OFF) }
 
--- Footer
 local about = Div{
   parent = panel,
   y      = mh - 1,
@@ -223,6 +204,8 @@ local shared = {
 }
 
 local IND_KEYS = {
+  -- NEW: reactor_formed supported
+  "reactor_formed",
   "reactor_on","modem_ok","network_ok","rps_enable","auto_power","emerg_cool",
   "trip","manual_trip","auto_trip","timeout_trip","rct_fault",
   "hi_damage","hi_temp","lo_fuel","hi_waste","lo_ccool","hi_hcool"
@@ -231,15 +214,15 @@ local IND_KEYS = {
 local function update_other_indicators(alive)
   local L = shared.last
 
-  local reactor_is_on  = (L.reactor_on == true)
-  local rct_fault      = (L.rct_fault == true)
-  local reactor_formed = alive and (not rct_fault)
+  -- FIX: formed is independent of running/scram
+  local formed  = (L.reactor_formed == true)
+  local running = (L.reactor_on == true)
 
-  set_led(rct_formed_led,  reactor_formed)
-  set_led(rct_running_led, alive and reactor_is_on)
+  set_led(rct_formed_led,  alive and formed)
+  set_led(rct_running_led, alive and running)
 
-  -- Keep this as "running-ish" activity marker
-  set_led(rct_active_led,  alive and reactor_is_on)
+  -- Keep "active" aligned with running
+  set_led(rct_active_led,  alive and running)
 
   set_led(modem_led_el, alive and (L.modem_ok == true))
 
@@ -344,7 +327,6 @@ local function loop_blink()
     local alive = shared.hb_enabled
     local trip  = shared.trip_active
 
-    -- HEARTBEAT schedule
     if not alive then
       hb_phase = false
       hb_next  = now + HB_OFF_S
@@ -353,7 +335,6 @@ local function loop_blink()
       hb_next  = now + (hb_phase and HB_ON_S or HB_OFF_S)
     end
 
-    -- TRIP schedule
     if not trip then
       trip_phase = false
       trip_next  = now + TRIP_OFF_S
@@ -362,7 +343,6 @@ local function loop_blink()
       trip_next  = now + (trip_phase and TRIP_ON_S or TRIP_OFF_S)
     end
 
-    -- Apply (ONLY these two blink)
     set_led(heartbeat_led, alive and hb_phase)
     set_led(trip_led,      trip and trip_phase)
 

@@ -1,12 +1,10 @@
 -- reactor/reactor_core.lua
--- VERSION: 1.3.2 (2025-12-16)
+-- VERSION: 1.3.3 (2025-12-16)
 --
--- FIXES:
---   * "FORMED" (adapter reachable) is NOT getStatus()
---   * reactor_on is derived from (burnRate > 0) while poweredOn + formed
---   * rct_fault ONLY means adapter unreachable (pcall failure)
---   * control_room replies restored (status on replyCh / CONTROL_CHANNEL)
---   * panel frames broadcast continuously on STATUS_CHANNEL (250)
+-- FIX: panel field names aligned with status_display.lua v1.2.6
+--   reactor_formed : true/false  (adapter reachable)
+--   reactor_on     : true/false  (actually burning; burnRate > 0)
+--   rct_fault      : true/false  (only means adapter unreachable)
 
 --------------------------
 -- CONFIG
@@ -41,9 +39,9 @@ local emergencyOn  = true
 local targetBurn   = 0
 
 local sensors = {
-  formed       = false,  -- adapter reachable (pcall OK)
-  burnRate     = 0,
-  maxBurnReac  = 0,
+  reactor_formed = false,  -- adapter reachable
+  burnRate       = 0,
+  maxBurnReac    = 0,
 
   tempK        = 0,
   damagePct    = 0,
@@ -90,19 +88,16 @@ end
 -- SENSOR READ
 --------------------------
 local function readSensors()
-  -- Burn cap + current burn
   local okM, maxB = safe_call("reactor.getMaxBurnRate()", reactor.getMaxBurnRate)
   sensors.maxBurnReac = (okM and maxB) or 0
 
   local okB, burn = safe_call("reactor.getBurnRate()", reactor.getBurnRate)
   sensors.burnRate = (okB and burn) or 0
 
-  -- FORMED = can we talk to the adapter at all?
-  -- Use a lightweight call; getStatus is fine ONLY as an "adapter ping".
+  -- reactor_formed = can we talk to the adapter at all?
   local okS = select(1, safe_call("reactor.getStatus()", reactor.getStatus))
-  sensors.formed = okS and true or false
+  sensors.reactor_formed = okS and true or false
 
-  -- The rest are best-effort; failure should not mark formed=false by itself
   sensors.tempK        = select(2, safe_call("reactor.getTemperature()", reactor.getTemperature)) or 0
   sensors.damagePct    = select(2, safe_call("reactor.getDamagePercent()", reactor.getDamagePercent)) or 0
   sensors.coolantFrac  = select(2, safe_call("reactor.getCoolantFilledPercentage()", reactor.getCoolantFilledPercentage)) or 0
@@ -125,49 +120,47 @@ local function applyControl()
   local burn = math.max(0, math.min(targetBurn or 0, cap))
 
   safe_call("reactor.setBurnRate()", reactor.setBurnRate, burn)
-
-  if burn > 0 then
-    safe_call("reactor.activate()", reactor.activate)
-  end
+  if burn > 0 then safe_call("reactor.activate()", reactor.activate) end
 end
 
 --------------------------
 -- STATUS + PANEL FRAMES
 --------------------------
 local function buildPanelStatus()
-  local formed_ok = sensors.formed == true
+  local formed_ok = (sensors.reactor_formed == true)
 
-  -- "running" = we intended it to be on AND it's actually burning
-  local reactor_on = formed_ok and poweredOn and ((sensors.burnRate or 0) > 0)
+  -- "running" = actually burning
+  local running = formed_ok and poweredOn and ((sensors.burnRate or 0) > 0)
 
   return {
-    -- left column / normal indicators
-    status_ok   = formed_ok and emergencyOn and (not scramLatched),
-    reactor_on  = reactor_on,                 -- use burnRate-based "running"
+    -- overall
+    status_ok      = formed_ok and emergencyOn and (not scramLatched),
+
+    -- IMPORTANT: names expected by status_display.lua v1.2.6
+    reactor_formed = formed_ok,
+    reactor_on     = running,
+
     modem_ok    = true,
     network_ok  = true,
     rps_enable  = emergencyOn,
     auto_power  = false,
-
     emerg_cool  = false,
 
-    -- trips
     trip         = scramLatched,
     manual_trip  = scramLatched,
     auto_trip    = false,
     timeout_trip = false,
 
-    -- IMPORTANT: ONLY a comms/adapter fault
+    -- ONLY comms/adapter fault
     rct_fault    = not formed_ok,
 
-    -- expose formed explicitly in case your panel has a separate lamp for it later
-    rct_formed   = formed_ok,
-
-    -- pass through a few alarms if you want them later
-    hi_damage    = (sensors.damagePct or 0) > 5,
-    hi_waste     = (sensors.wasteFrac or 0) > 0.90,
-    lo_ccool     = (sensors.coolantFrac or 0) < 0.20,
-    hi_hcool     = (sensors.heatedFrac or 0) > 0.95,
+    -- alarms (optional)
+    hi_damage = (sensors.damagePct or 0) > 5,
+    hi_temp   = false,
+    lo_fuel   = false,
+    hi_waste  = (sensors.wasteFrac or 0) > 0.90,
+    lo_ccool  = (sensors.coolantFrac or 0) < 0.20,
+    hi_hcool  = (sensors.heatedFrac or 0) > 0.95,
   }
 end
 
@@ -224,7 +217,7 @@ local function handleCommand(cmd, data, replyCh)
     dbg("EMERGENCY "..tostring(emergencyOn))
 
   elseif cmd == "request_status" then
-    -- handled by sendStatus()
+    -- reply below
   end
 
   sendStatus(replyCh or CONTROL_CHANNEL)

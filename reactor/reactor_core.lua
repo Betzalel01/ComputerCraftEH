@@ -1,26 +1,25 @@
--- reactor/reactor_core.lua
--- VERSION: 1.1.0 (2025-12-15)
--- FIX: Split periodic tick (sensors/control/panel frames) from modem command handling
--- using parallel loops. This prevents modem_message traffic (Ender Modems) from
--- starving timer events and stopping periodic STATUS_CHANNEL updates.
+-- reactor_core.lua
+-- VERSION: 1.1.1 (2025-12-16)
+--
+-- Fix:
+--   Add explicit `reactor_formed` to the panel frame.
+--   This is TRUE when the Mekanism multiblock/logic adapter reports online,
+--   independent of poweredOn/burnRate/scram state.
 
 --------------------------
 -- CONFIG
 --------------------------
-local REACTOR_SIDE             = "back"   -- side with Fission Reactor Logic Adapter
-local MODEM_SIDE               = "right"  -- side with modem
-local REDSTONE_ACTIVATION_SIDE = "left"   -- side which enables reactor via RS
+local REACTOR_SIDE             = "back"
+local MODEM_SIDE               = "right"
+local REDSTONE_ACTIVATION_SIDE = "left"
 
--- Channel setup
-local REACTOR_CHANNEL  = 100   -- listen here for commands
-local CONTROL_CHANNEL  = 101   -- replies (control room)
-local STATUS_CHANNEL   = 250   -- broadcast to front-panel status_display
+local REACTOR_CHANNEL  = 100
+local CONTROL_CHANNEL  = 101
+local STATUS_CHANNEL   = 250
 
--- Periods
-local SENSOR_POLL_PERIOD = 0.2    -- seconds between sensor/control ticks
-local HEARTBEAT_PERIOD   = 10.0   -- seconds between heartbeat packets
+local SENSOR_POLL_PERIOD = 0.2
+local HEARTBEAT_PERIOD   = 10.0
 
--- Safety thresholds (only enforced if emergencyOn = true)
 local MAX_DAMAGE_PCT   = 5
 local MIN_COOLANT_FRAC = 0.20
 local MAX_WASTE_FRAC   = 0.90
@@ -30,10 +29,10 @@ local MAX_HEATED_FRAC  = 0.95
 -- PERIPHERALS
 --------------------------
 local reactor = peripheral.wrap(REACTOR_SIDE)
-if not reactor then error("No reactor logic adapter on side "..REACTOR_SIDE, 0) end
+if not reactor then error("No reactor logic adapter on side "..REACTOR_SIDE) end
 
 local modem = peripheral.wrap(MODEM_SIDE)
-if not modem then error("No modem on side "..MODEM_SIDE, 0) end
+if not modem then error("No modem on side "..MODEM_SIDE) end
 modem.open(REACTOR_CHANNEL)
 
 --------------------------
@@ -59,28 +58,14 @@ local lastRsState  = nil
 local lastErrorMsg = nil
 
 --------------------------
--- TIME HELPERS
---------------------------
-local function now_ms() return os.epoch("utc") end
-
---------------------------
--- LOG HELPERS
+-- HELPERS
 --------------------------
 local function log(msg)
   term.setCursorPos(1, 1)
   term.clearLine()
-  term.write("[CORE] "..tostring(msg))
+  term.write("[CORE] "..msg)
 end
 
-local function dbg(line2)
-  term.setCursorPos(1, 2)
-  term.clearLine()
-  term.write(tostring(line2))
-end
-
---------------------------
--- REACTOR HELPERS
---------------------------
 local function setActivationRS(state)
   state = state and true or false
   redstone.setOutput(REDSTONE_ACTIVATION_SIDE, state)
@@ -134,33 +119,46 @@ end
 -- PANEL STATUS ENCODING
 --------------------------
 local function buildPanelStatus()
+  -- NEW: formed is strictly "multiblock/adapter online"
+  local reactor_formed = (sensors.online == true)
+
+  -- existing meanings
   local status_ok  = sensors.online and emergencyOn and not scramLatched
   local reactor_on = sensors.online and poweredOn and (sensors.burnRate or 0) > 0
   local trip       = scramLatched
 
-  return {
-    status_ok   = status_ok,
-    reactor_on  = reactor_on,
-    modem_ok    = true,
-    network_ok  = true,
-    rps_enable  = emergencyOn,
-    auto_power  = false,
+  local panel = {
+    -- NEW FIELD
+    reactor_formed = reactor_formed,
 
-    emerg_cool  = false,
+    -- left column
+    status_ok  = status_ok,
+    reactor_on = reactor_on,
+    modem_ok   = true,
+    network_ok = true,
+    rps_enable = emergencyOn,
+    auto_power = false,
 
+    -- middle column
+    emerg_cool = false,
+
+    -- trip banner + causes
     trip         = trip,
     manual_trip  = trip,
     auto_trip    = false,
     timeout_trip = false,
     rct_fault    = not sensors.online,
 
-    hi_damage = (sensors.damagePct or 0)   > MAX_DAMAGE_PCT,
+    -- alarms
+    hi_damage = sensors.damagePct   > MAX_DAMAGE_PCT,
     hi_temp   = false,
     lo_fuel   = false,
-    hi_waste  = (sensors.wasteFrac or 0)   > MAX_WASTE_FRAC,
-    lo_ccool  = (sensors.coolantFrac or 0) < MIN_COOLANT_FRAC,
-    hi_hcool  = (sensors.heatedFrac or 0)  > MAX_HEATED_FRAC,
+    hi_waste  = sensors.wasteFrac   > MAX_WASTE_FRAC,
+    lo_ccool  = sensors.coolantFrac < MIN_COOLANT_FRAC,
+    hi_hcool  = sensors.heatedFrac  > MAX_HEATED_FRAC,
   }
+
+  return panel
 end
 
 local function sendPanelStatus()
@@ -178,21 +176,17 @@ local function applyControl()
   end
 
   if emergencyOn then
-    if (sensors.damagePct or 0) > MAX_DAMAGE_PCT then
-      doScram(string.format("Damage %.1f%% > %.1f%%", sensors.damagePct, MAX_DAMAGE_PCT))
-      return
+    if sensors.damagePct > MAX_DAMAGE_PCT then
+      doScram(string.format("Damage %.1f%% > %.1f%%", sensors.damagePct, MAX_DAMAGE_PCT)); return
     end
-    if (sensors.coolantFrac or 0) < MIN_COOLANT_FRAC then
-      doScram(string.format("Coolant %.0f%% < %.0f%%", (sensors.coolantFrac or 0)*100, MIN_COOLANT_FRAC*100))
-      return
+    if sensors.coolantFrac < MIN_COOLANT_FRAC then
+      doScram(string.format("Coolant %.0f%% < %.0f%%", sensors.coolantFrac*100, MIN_COOLANT_FRAC*100)); return
     end
-    if (sensors.wasteFrac or 0) > MAX_WASTE_FRAC then
-      doScram(string.format("Waste %.0f%% > %.0f%%", (sensors.wasteFrac or 0)*100, MAX_WASTE_FRAC*100))
-      return
+    if sensors.wasteFrac > MAX_WASTE_FRAC then
+      doScram(string.format("Waste %.0f%% > %.0f%%", sensors.wasteFrac*100, MAX_WASTE_FRAC*100)); return
     end
-    if (sensors.heatedFrac or 0) > MAX_HEATED_FRAC then
-      doScram(string.format("Heated %.0f%% > %.0f%%", (sensors.heatedFrac or 0)*100, MAX_HEATED_FRAC*100))
-      return
+    if sensors.heatedFrac > MAX_HEATED_FRAC then
+      doScram(string.format("Heated %.0f%% > %.0f%%", sensors.heatedFrac*100, MAX_HEATED_FRAC*100)); return
     end
   end
 
@@ -204,9 +198,7 @@ local function applyControl()
   if burn > cap then burn = cap end
 
   pcall(reactor.setBurnRate, burn)
-  if burn > 0 then
-    pcall(reactor.activate)
-  end
+  if burn > 0 then pcall(reactor.activate) end
 end
 
 --------------------------
@@ -223,14 +215,13 @@ local function sendStatus(replyChannel)
     lastError    = lastErrorMsg,
   }
   lastErrorMsg = nil
-  modem.transmit(replyChannel or CONTROL_CHANNEL, REACTOR_CHANNEL, msg)
 
-  -- Always push a panel frame when a status reply is sent
+  modem.transmit(replyChannel or CONTROL_CHANNEL, REACTOR_CHANNEL, msg)
   sendPanelStatus()
 end
 
 local function sendHeartbeat()
-  local msg = { type = "heartbeat", timestamp = now_ms() }
+  local msg = { type = "heartbeat", timestamp = os.clock() }
   modem.transmit(CONTROL_CHANNEL, REACTOR_CHANNEL, msg)
 end
 
@@ -243,7 +234,6 @@ local function handleCommand(cmd, data, replyChannel)
     poweredOn    = true
     if targetBurn <= 0 then targetBurn = 1.0 end
 
-    -- kick
     local cap  = getBurnCap()
     local burn = targetBurn
     if burn < 0 then burn = 0 end
@@ -263,13 +253,11 @@ local function handleCommand(cmd, data, replyChannel)
       local requested = data
       local cap       = getBurnCap()
       local burn      = requested
-
       if burn < 0 then burn = 0 end
       if burn > cap then
         lastErrorMsg = string.format("Requested burn %.2f > reactor max %.2f; clamped.", requested, cap)
         burn = cap
       end
-
       targetBurn = burn
       log(string.format("Target burn set: requested=%.2f, using=%.2f mB/t", requested, burn))
       pcall(reactor.setBurnRate, burn)
@@ -280,95 +268,48 @@ local function handleCommand(cmd, data, replyChannel)
     log("Emergency protection: "..(emergencyOn and "ON" or "OFF"))
 
   elseif cmd == "request_status" then
-    -- no-op, just reply
+    -- reply below
   end
 
   sendStatus(replyChannel)
 end
 
 --------------------------
--- STARTUP
+-- MAIN LOOP
 --------------------------
-term.clear()
-term.setCursorPos(1,1)
-print("Reactor core ".."VERSION 1.1.0 (2025-12-15)")
-print("Listening on channel "..REACTOR_CHANNEL.." | panel "..STATUS_CHANNEL)
-print("Press Q to quit")
 readSensors()
-sendPanelStatus()
 
---------------------------
--- PARALLEL LOOPS
---------------------------
-local running = true
-local tickCount = 0
-local lastHbMs = now_ms()
+term.clear()
+log("Reactor core online. Listening on channel "..REACTOR_CHANNEL)
 
-local function tickLoop()
-  while running do
-    local ok, err = pcall(function()
-      tickCount = tickCount + 1
+local sensorTimerId    = os.startTimer(SENSOR_POLL_PERIOD)
+local heartbeatTimerId = os.startTimer(HEARTBEAT_PERIOD)
 
+while true do
+  local ev, p1, p2, p3, p4 = os.pullEvent()
+
+  if ev == "timer" then
+    if p1 == sensorTimerId then
       readSensors()
       applyControl()
       sendPanelStatus()
+      sensorTimerId = os.startTimer(SENSOR_POLL_PERIOD)
 
-      -- heartbeat timing (independent of modem events)
-      local now = now_ms()
-      if (now - lastHbMs) >= (HEARTBEAT_PERIOD * 1000) then
-        sendHeartbeat()
-        lastHbMs = now
-      end
-
-      -- lightweight debug on line 2 (doesn't spam)
-      dbg(string.format(
-        "tick=%d online=%s pwr=%s scram=%s burn=%.2f cap=%.0f",
-        tickCount,
-        tostring(sensors.online),
-        tostring(poweredOn),
-        tostring(scramLatched),
-        tonumber(sensors.burnRate or 0),
-        tonumber(sensors.maxBurnReac or 0)
-      ))
-    end)
-
-    if not ok then
-      log("TICK ERR: "..tostring(err))
-      -- keep running; avoid total death
+    elseif p1 == heartbeatTimerId then
+      sendHeartbeat()
+      heartbeatTimerId = os.startTimer(HEARTBEAT_PERIOD)
     end
 
-    sleep(SENSOR_POLL_PERIOD)
-  end
-end
-
-local function commandLoop()
-  while running do
-    local ev, side, ch, reply, msg = os.pullEvent("modem_message")
+  elseif ev == "modem_message" then
+    local ch, reply, msg = p2, p3, p4
     if ch == REACTOR_CHANNEL and type(msg) == "table" then
       if msg.type == "cmd" or msg.type == "command" then
-        local ok, err = pcall(function()
-          handleCommand(msg.cmd, msg.data, reply)
-        end)
-        if not ok then
-          lastErrorMsg = tostring(err)
-          log("CMD ERR: "..tostring(err))
-          -- still attempt to reply/push a panel frame reflecting faulted state
-          pcall(sendStatus, reply)
-        end
+        handleCommand(msg.cmd, msg.data, reply)
       end
     end
+
+  elseif ev == "key" and p1 == keys.q then
+    log("Shutting down core control")
+    break
   end
 end
-
-local function quitLoop()
-  while running do
-    local ev, key = os.pullEvent("key")
-    if key == keys.q then
-      running = false
-      log("Shutting down core control")
-      break
-    end
-  end
-end
-
-parallel.waitForAny(tickLoop, commandLoop, quitLoop)

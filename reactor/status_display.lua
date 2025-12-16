@@ -1,6 +1,26 @@
 -- reactor/status_display.lua
--- VERSION: 1.2.5-debug (2025-12-16)
--- DEBUG BUILD: instrument REACTOR indicator logic
+-- VERSION: 1.2.6 (2025-12-16)
+--
+-- Redesign:
+--   Replaced ambiguous LEDPair "REACTOR" with two explicit indicators:
+--     RCT FORMED  = reactor logic adapter online (alive AND not rct_fault)
+--     RCT RUNNING = reactor_on from core (alive AND reactor_on)
+--
+-- Color policy:
+--   LEFT SIDE "normal" indicators:
+--     OFF = GRAY
+--     ON  = LIME
+--   HEARTBEAT special:
+--     OFF = GREEN (intentional "idle green")
+--     ON  = LIME  (blinks)
+--   SCRAM/TRIP indicators:
+--     OFF = BLACK
+--     ON  = RED
+--   TRIP blinks RED when active
+--
+-- Two-loop architecture:
+--   loop_status(): comms + timeout/hysteresis + computes states + updates non-blinking LEDs
+--   loop_blink(): manual blinking for HEARTBEAT and TRIP only
 
 if package and package.path then
   package.path = "/?.lua;/?/init.lua;" .. package.path
@@ -14,38 +34,44 @@ local Div        = require("graphics.elements.Div")
 local Rectangle  = require("graphics.elements.Rectangle")
 local TextBox    = require("graphics.elements.TextBox")
 local LED        = require("graphics.elements.indicators.LED")
-local LEDPair    = require("graphics.elements.indicators.LEDPair")
 local RGBLED     = require("graphics.elements.indicators.RGBLED")
 
 local ALIGN  = core.ALIGN
 local cpair  = core.cpair
 local border = core.border
 
-local STATUS_CHANNEL = 250
+local STATUS_CHANNEL   = 250
 
 local STATUS_TIMEOUT_S = 11
 local CHECK_STEP_S     = 1.0
+
 local GRACE_S          = 5
 local MISSES_TO_DEAD   = 3
 local HITS_TO_ALIVE    = 1
 
 -- Blink rates
-local HB_ON_S    = 0.5
-local HB_OFF_S   = 0.5
-local TRIP_ON_S  = 0.3
-local TRIP_OFF_S = 0.1
+local HB_ON_S   = 1.0
+local HB_OFF_S  = 1.0
+local TRIP_ON_S  = 0.5
+local TRIP_OFF_S = 0.5
 
+-- LEFT policy: OFF=GRAY, ON=LIME
 local LEFT_ON  = colors.lime
 local LEFT_OFF = colors.gray
 
+-- HEARTBEAT policy (requested): OFF=GREEN, ON=LIME
+local HB_ON  = colors.lime
+local HB_OFF = colors.green
+
+-- SCRAM/TRIP policy: OFF=BLACK, ON=RED
 local SCRAM_ON  = colors.red
 local SCRAM_OFF = colors.black
 
 local mon = peripheral.wrap("top")
-if not mon then error("No monitor on TOP", 0) end
+if not mon then error("No monitor on TOP for status_display", 0) end
 
 local modem = peripheral.wrap("back")
-if not modem then error("No modem on BACK", 0) end
+if not modem then error("No modem on BACK for status_display", 0) end
 modem.open(STATUS_CHANNEL)
 
 local function now_s() return os.epoch("utc") / 1000 end
@@ -53,31 +79,17 @@ local function now_s() return os.epoch("utc") / 1000 end
 local function set_led(el, v)
   if el and el.set_value then el.set_value(v and true or false) end
 end
-local function set_ledpair(el, n)
-  if el and el.set_value then el.set_value(n) end
-end
 local function set_rgb(el, n)
   if el and el.set_value then el.set_value(n) end
 end
 
--------------------------------------------------
--- TERMINAL DEBUG HEADER
--------------------------------------------------
-term.clear()
-term.setCursorPos(1,1)
-print("[STATUS_DISPLAY] v1.2.5-debug")
-print("[DEBUG] REACTOR indicator instrumentation enabled")
-print("--------------------------------------------------")
-
--------------------------------------------------
--- UI SETUP (UNCHANGED)
--------------------------------------------------
 mon.setTextScale(0.5)
 local mw, mh = mon.getSize()
 
 mon.setBackgroundColor(colors.black)
 mon.setTextColor(colors.white)
 mon.clear()
+mon.setCursorPos(1, 1)
 
 local panel = DisplayBox{
   window = mon,
@@ -95,23 +107,28 @@ TextBox{
 }
 
 -- LEFT COLUMN
-local system = Div{ parent = panel, x = 1, y = 3, width = 16, height = 18 }
+local system = Div{
+  parent = panel,
+  x      = 1,
+  y      = 3,
+  width  = 16,
+  height = 18
+}
 
 local status_led    = LED{ parent = system, label = "STATUS",    colors = cpair(LEFT_ON, LEFT_OFF) }
-local heartbeat_led = LED{ parent = system, label = "HEARTBEAT", colors = cpair(colors.lime, colors.green) }
+local heartbeat_led = LED{ parent = system, label = "HEARTBEAT", colors = cpair(HB_ON, HB_OFF) }
 
 system.line_break()
 
-local reactor_led = LEDPair{
-  parent = system,
-  label  = "REACTOR",
-  off    = LEFT_OFF,
-  c1     = LEFT_OFF,
-  c2     = LEFT_ON
-}
+-- Redesign: explicit reactor indicators
+local rct_formed_led  = LED{ parent = system, label = "RCT FORMED",  colors = cpair(LEFT_ON, LEFT_OFF) }
+local rct_running_led = LED{ parent = system, label = "RCT RUNNING", colors = cpair(LEFT_ON, LEFT_OFF) }
+
+system.line_break()
 
 local modem_led_el = LED{ parent = system, label = "MODEM", colors = cpair(LEFT_ON, LEFT_OFF) }
 
+-- RGBLED: index 1 OK=LIME, 2 fault=RED, 5 idle/unknown=GRAY
 local network_led = RGBLED{
   parent = system,
   label  = "NETWORK",
@@ -120,12 +137,80 @@ local network_led = RGBLED{
 
 system.line_break()
 
-local rps_enable_led = LED{ parent = system, label = "RPS ENABLE", colors = cpair(LEFT_ON, LEFT_OFF) }
+local rps_enable_led = LED{ parent = system, label = "RPS ENABLE",      colors = cpair(LEFT_ON, LEFT_OFF) }
 local auto_power_led = LED{ parent = system, label = "AUTO POWER CTRL", colors = cpair(LEFT_ON, LEFT_OFF) }
 
--------------------------------------------------
--- STATE
--------------------------------------------------
+-- MIDDLE COLUMN
+local mid = Div{
+  parent = panel,
+  x      = 18,
+  y      = 3,
+  width  = mw - 34,
+  height = 18
+}
+
+local rct_active_led = LED{ parent = mid, x = 2, width = 12, label = "RCT ACTIVE", colors = cpair(LEFT_ON, LEFT_OFF) }
+local emerg_cool_led = LED{ parent = mid, x = 2, width = 14, label = "EMERG COOL", colors = cpair(LEFT_ON, LEFT_OFF) }
+
+mid.line_break()
+
+local hi_box = cpair(colors.white, colors.gray)
+
+local trip_frame = Rectangle{
+  parent     = mid,
+  x          = 1,
+  width      = mid.get_width() - 2,
+  height     = 3,
+  border     = border(1, hi_box.bkg, true),
+  even_inner = true
+}
+
+local trip_div = Div{ parent = trip_frame, height = 1, fg_bg = hi_box }
+
+local trip_led = LED{ parent = trip_div, width = 10, label = "TRIP", colors = cpair(SCRAM_ON, SCRAM_OFF) }
+
+-- RIGHT COLUMN
+local rps_cause = Rectangle{
+  parent = panel,
+  x      = mw - 16,
+  y      = 3,
+  width  = 16,
+  height = 16,
+  thin   = true,
+  border = border(1, hi_box.bkg),
+  fg_bg  = hi_box
+}
+
+local manual_led     = LED{ parent = rps_cause, label = "MANUAL",    colors = cpair(SCRAM_ON, SCRAM_OFF) }
+local auto_trip_led  = LED{ parent = rps_cause, label = "AUTOMATIC", colors = cpair(SCRAM_ON, SCRAM_OFF) }
+local timeout_led    = LED{ parent = rps_cause, label = "TIMEOUT",   colors = cpair(SCRAM_ON, SCRAM_OFF) }
+local rct_fault_led  = LED{ parent = rps_cause, label = "RCT FAULT", colors = cpair(SCRAM_ON, SCRAM_OFF) }
+
+rps_cause.line_break()
+
+local hi_damage_led  = LED{ parent = rps_cause, label = "HI DAMAGE", colors = cpair(SCRAM_ON, SCRAM_OFF) }
+local hi_temp_led    = LED{ parent = rps_cause, label = "HI TEMP",   colors = cpair(SCRAM_ON, SCRAM_OFF) }
+
+rps_cause.line_break()
+
+local lo_fuel_led    = LED{ parent = rps_cause, label = "LO FUEL",  colors = cpair(SCRAM_ON, SCRAM_OFF) }
+local hi_waste_led   = LED{ parent = rps_cause, label = "HI WASTE", colors = cpair(SCRAM_ON, SCRAM_OFF) }
+
+rps_cause.line_break()
+
+local lo_ccool_led   = LED{ parent = rps_cause, label = "LO CCOOLANT", colors = cpair(SCRAM_ON, SCRAM_OFF) }
+local hi_hcool_led   = LED{ parent = rps_cause, label = "HI HCOOLANT", colors = cpair(SCRAM_ON, SCRAM_OFF) }
+
+-- Footer
+local about = Div{
+  parent = panel,
+  y      = mh - 1,
+  width  = 40,
+  height = 2,
+  fg_bg  = cpair(colors.lightGray, colors.black)
+}
+TextBox{ parent = about, text = "PANEL: v1.2.6" }
+
 local shared = {
   start_s        = now_s(),
   last_frame_s   = 0,
@@ -133,7 +218,7 @@ local shared = {
   hit_count      = 0,
   miss_count     = 0,
   hb_enabled     = false,
-  last           = {},
+  last          = {},
   trip_active    = false
 }
 
@@ -143,43 +228,59 @@ local IND_KEYS = {
   "hi_damage","hi_temp","lo_fuel","hi_waste","lo_ccool","hi_hcool"
 }
 
--------------------------------------------------
--- DEBUGGED INDICATOR UPDATE
--------------------------------------------------
 local function update_other_indicators(alive)
   local L = shared.last
-  local reactor_is_on = (L.reactor_on == true)
 
-  local led_state = (alive and reactor_is_on) and 2 or 0
-  set_ledpair(reactor_led, led_state)
+  local reactor_is_on  = (L.reactor_on == true)
+  local rct_fault      = (L.rct_fault == true)
+  local reactor_formed = alive and (not rct_fault)
 
-  -- DEBUG PRINT (THIS IS THE KEY)
-  print(string.format(
-    "[DBG] alive=%s reactor_on=%s → LEDPair=%s",
-    tostring(alive),
-    tostring(L.reactor_on),
-    led_state == 2 and "ON (LIME)" or "OFF (GRAY)"
-  ))
+  set_led(rct_formed_led,  reactor_formed)
+  set_led(rct_running_led, alive and reactor_is_on)
+
+  -- Keep this as "running-ish" activity marker
+  set_led(rct_active_led,  alive and reactor_is_on)
 
   set_led(modem_led_el, alive and (L.modem_ok == true))
 
   if not alive then
     set_rgb(network_led, 2)
   else
-    set_rgb(network_led, (L.network_ok == true) and 1 or 2)
+    if L.network_ok == nil then
+      set_rgb(network_led, 5)
+    elseif L.network_ok == true then
+      set_rgb(network_led, 1)
+    else
+      set_rgb(network_led, 2)
+    end
   end
 
   set_led(rps_enable_led, alive and (L.rps_enable == true))
   set_led(auto_power_led, alive and (L.auto_power == true))
+  set_led(emerg_cool_led, alive and (L.emerg_cool == true))
+
+  set_led(manual_led,    alive and (L.manual_trip == true))
+  set_led(auto_trip_led, alive and (L.auto_trip == true))
+  set_led(timeout_led,   alive and (L.timeout_trip == true))
+  set_led(rct_fault_led, alive and (L.rct_fault == true))
+
+  set_led(hi_damage_led, alive and (L.hi_damage == true))
+  set_led(hi_temp_led,   alive and (L.hi_temp == true))
+  set_led(lo_fuel_led,   alive and (L.lo_fuel == true))
+  set_led(hi_waste_led,  alive and (L.hi_waste == true))
+  set_led(lo_ccool_led,  alive and (L.lo_ccool == true))
+  set_led(hi_hcool_led,  alive and (L.hi_hcool == true))
 
   shared.trip_active = alive and (L.trip == true)
 end
 
--------------------------------------------------
--- STATUS LOOP (UNCHANGED LOGIC)
--------------------------------------------------
 local function loop_status()
   local check_timer = os.startTimer(CHECK_STEP_S)
+
+  set_led(status_led, false)
+  set_led(heartbeat_led, false)
+  set_led(trip_led, false)
+  update_other_indicators(false)
 
   while true do
     local ev, p1, p2, p3, p4 = os.pullEvent()
@@ -203,25 +304,27 @@ local function loop_status()
     elseif ev == "timer" and p1 == check_timer then
       local now = now_s()
       local age = (shared.last_frame_s > 0) and (now - shared.last_frame_s) or 1e9
-      local within = age <= STATUS_TIMEOUT_S
+      local within = (shared.last_frame_s > 0) and (age <= STATUS_TIMEOUT_S)
       local in_grace = (now - shared.start_s) <= GRACE_S
 
       if within then
-        shared.hit_count = shared.hit_count + 1
+        shared.hit_count  = shared.hit_count + 1
         shared.miss_count = 0
       else
         shared.miss_count = shared.miss_count + 1
-        shared.hit_count = 0
+        shared.hit_count  = 0
       end
 
       if within and shared.hit_count >= HITS_TO_ALIVE then
         shared.hb_enabled = true
-      elseif (not in_grace) and shared.miss_count >= MISSES_TO_DEAD then
+      elseif (not in_grace) and (not within) and shared.miss_count >= MISSES_TO_DEAD then
         shared.hb_enabled = false
       end
 
       local alive = shared.hb_enabled
-      set_led(status_led, alive and shared.last_status_ok)
+      local status_on = alive and shared.last_status_ok
+
+      set_led(status_led, status_on)
       update_other_indicators(alive)
 
       check_timer = os.startTimer(CHECK_STEP_S)
@@ -229,32 +332,45 @@ local function loop_status()
   end
 end
 
--------------------------------------------------
--- BLINK LOOP (UNCHANGED)
--------------------------------------------------
 local function loop_blink()
-  local hb_phase, trip_phase = false, false
-  local hb_next, trip_next = now_s(), now_s()
+  local hb_phase   = false
+  local trip_phase = false
+
+  local hb_next   = now_s()
+  local trip_next = now_s()
 
   while true do
     local now = now_s()
+    local alive = shared.hb_enabled
+    local trip  = shared.trip_active
 
-    if shared.hb_enabled and now >= hb_next then
-      hb_phase = not hb_phase
-      hb_next = now + (hb_phase and HB_ON_S or HB_OFF_S)
-    elseif not shared.hb_enabled then
+    -- HEARTBEAT schedule
+    if not alive then
       hb_phase = false
+      hb_next  = now + HB_OFF_S
+    elseif now >= hb_next then
+      hb_phase = not hb_phase
+      hb_next  = now + (hb_phase and HB_ON_S or HB_OFF_S)
     end
 
-    if shared.trip_active and now >= trip_next then
-      trip_phase = not trip_phase
-      trip_next = now + (trip_phase and TRIP_ON_S or TRIP_OFF_S)
-    elseif not shared.trip_active then
+    -- TRIP schedule
+    if not trip then
       trip_phase = false
+      trip_next  = now + TRIP_OFF_S
+    elseif now >= trip_next then
+      trip_phase = not trip_phase
+      trip_next  = now + (trip_phase and TRIP_ON_S or TRIP_OFF_S)
     end
 
-    set_led(heartbeat_led, shared.hb_enabled and hb_phase)
-    os.sleep(0.05)
+    -- Apply (ONLY these two blink)
+    set_led(heartbeat_led, alive and hb_phase)
+    set_led(trip_led,      trip and trip_phase)
+
+    local next_wake = hb_next
+    if trip_next < next_wake then next_wake = trip_next end
+    local dt = next_wake - now
+    if dt < 0.02 then dt = 0.02 end
+    os.sleep(dt)
   end
 end
 

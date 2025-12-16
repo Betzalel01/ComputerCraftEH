@@ -1,207 +1,241 @@
 -- reactor/input_panel.lua
 -- VERSION: 1.0.0 (2025-12-16)
 --
--- INPUT COMPUTER (hidden behind wall) - reads Create Redstone Links via Redstone Relays
--- Layout (as specified):
---   LEFT  relay  (protection buttons) : SCRAM   = relay.TOP
---   RIGHT relay  (ops buttons)        : START   = relay.TOP
---   TOP   relay  (power levers)       : BURN    = relay.TOP   (analog 0-15)
---                                      AUTO_PWR = relay.BOTTOM (optional, digital threshold)
---                                      LOAD_FOL = relay.RIGHT  (optional, digital threshold)
---   BACK  relay  (thermal/fluids)     : COOLANT = relay.TOP    (analog 0-15)
---                                      STEAM   = relay.RIGHT  (analog 0-15)
---                                      BYPASS  = relay.BOTTOM (analog 0-15, optional)
---   BOTTOM relay (safety/modes)       : EMERG   = relay.TOP    (analog 0-15, threshold)
---                                      RPS_BYP = relay.RIGHT  (optional)
---                                      MAINT   = relay.BOTTOM (optional)
+-- PURPOSE
+--   Hidden “Input Panel” computer that reads physical controls (buttons/levers)
+--   via Redstone Relays, and sends commands to reactor_core over modem.
 --
--- This program sends commands to reactor_core.lua over modem channels:
---   REACTOR_CHANNEL = 100 (core listens)
---   CONTROL_CHANNEL = 101 (reply channel; core replies here)
+-- IMPORTANT: BLOCKED FACES
+--   The relay face touching the computer is NOT usable.
+--   So: TOP relay cannot use "bottom"; RIGHT relay cannot use "left"; etc.
 --
--- Commands sent (core supports these):
---   {type="cmd", cmd="scram"}
---   {type="cmd", cmd="power_on"}
---   {type="cmd", cmd="set_target_burn", data=<number>}
---   {type="cmd", cmd="set_emergency", data=<boolean>}
---   {type="cmd", cmd="request_status"}
+-- PHYSICAL LAYOUT ASSUMED
+--   Computer has redstone relays on: TOP, BOTTOM, LEFT, RIGHT, BACK
+--   Front face is free (you can place monitor/labeling/etc).
+--   Modem is assumed on FRONT by default (change below if needed).
 --
--- NOTE: Coolant/steam/fuel "valve" levers are read here for future use, but not transmitted
--- unless you choose to wire them into core logic later. For now we print them when they change.
+-- CONTROL MAPPING (COMPARTMENTALIZED)
+--   BUTTON RELAY (RIGHT relay): momentary buttons
+--     SCRAM         = RIGHT relay : TOP
+--     START/POWERON = RIGHT relay : BOTTOM
+--
+--   LEVER RELAY (TOP relay): analog levers 0..15
+--     BURN LEVEL    = TOP relay : TOP        (0..15 => 0..maxBurn in core)
+--     COOLANT IN    = TOP relay : LEFT       (0..15 => valve request, placeholder)
+--     STEAM OUT     = TOP relay : RIGHT      (0..15 => valve request, placeholder)
+--     FUEL IN       = TOP relay : BACK       (0..15 => feeder request, placeholder)
+--     (TOP relay : FRONT reserved)
+--
+--   SAFETY/OPS RELAY (BACK relay): digital toggles
+--     EMERGENCY SYS TOGGLE = BACK relay : TOP  (0=OFF, >0=ON)  [latching switch/lever]
+--
+-- Notes:
+--   - You can move any signal to different relay sides; just update the mapping tables below.
+--   - This script does edge-detection for buttons (only sends on rising edge).
+--   - This script rate-limits command spam and only sends when values change.
 
 --------------------------
 -- CONFIG
 --------------------------
-local MODEM_SIDE      = "front"   -- change if your modem is elsewhere
-local REACTOR_CHANNEL = 100
-local CONTROL_CHANNEL = 101
+local MODEM_SIDE       = "front"  -- side where modem is attached on input computer
+local REACTOR_CHANNEL  = 100      -- reactor_core listens here
+local REPLY_CHANNEL    = 101      -- core replies here (optional)
+local POLL_S           = 0.10     -- poll rate
 
--- Burn-rate scaling: lever 0..15 -> 0..BURN_MAX
--- Keep BURN_MAX <= your reactor max burn cap; core will clamp anyway.
-local BURN_MAX = 20.0
-
--- Button edge debounce
-local POLL_DT = 0.05
-local EDGE_COOLDOWN_S = 0.25
-
--- Analog change threshold (to avoid spam)
-local ANALOG_EPS = 0.02  -- in "lever fraction" units (0..1)
-
--- Digital threshold for treating analog lever as a boolean toggle
-local BOOL_THRESH = 8  -- 0..15, >=8 => true
+-- Burn mapping: lever 0..15 => burn 0..BURN_MAX_REQUEST
+-- Keep conservative; core will clamp to reactor max anyway.
+local BURN_MAX_REQUEST = 20.0
 
 --------------------------
 -- PERIPHERALS
 --------------------------
 local modem = peripheral.wrap(MODEM_SIDE)
-if not modem then error("No modem on side "..MODEM_SIDE, 0) end
-modem.open(CONTROL_CHANNEL)
+if not modem then error("No modem on "..MODEM_SIDE, 0) end
+modem.open(REPLY_CHANNEL)
 
--- Expect a redstone_relay attached to each side except the front
-local relays = {
-  LEFT   = peripheral.wrap("left"),
-  RIGHT  = peripheral.wrap("right"),
-  TOP    = peripheral.wrap("top"),
-  BACK   = peripheral.wrap("back"),
-  BOTTOM = peripheral.wrap("bottom"),
-}
-
-for name, r in pairs(relays) do
-  if not r then error("Missing redstone_relay on "..name.." side", 0) end
+-- Wrap relays by side (must physically exist on these faces)
+local relays = {}
+local function wrap_relay(side)
+  local p = peripheral.wrap(side)
+  if p and peripheral.getType(side) == "redstone_relay" then
+    return p
+  end
+  return nil
 end
+
+relays.top    = wrap_relay("top")
+relays.bottom = wrap_relay("bottom")
+relays.left   = wrap_relay("left")
+relays.right  = wrap_relay("right")
+relays.back   = wrap_relay("back")
+
+local function require_relay(side_name)
+  if not relays[side_name] then
+    error("Missing redstone_relay on computer "..side_name:upper().." face", 0)
+  end
+end
+
+require_relay("top")
+require_relay("right")
+require_relay("back")
 
 --------------------------
 -- HELPERS
 --------------------------
-local function now_s() return os.epoch("utc") / 1000 end
-
-local function safe_get_input(relay, side)
-  local ok, v = pcall(relay.getInput, side)
-  if ok then return v and true or false end
-  return false
-end
-
-local function safe_get_analog(relay, side)
-  local ok, v = pcall(relay.getAnalogInput, side)
-  if ok and type(v) == "number" then return v end
-  return 0
+local function dbg(line)
+  term.setCursorPos(1, 1)
+  term.clearLine()
+  term.write("[INPUT_PANEL] "..line)
 end
 
 local function send_cmd(cmd, data)
-  local msg = { type = "cmd", cmd = cmd, data = data }
-  modem.transmit(REACTOR_CHANNEL, CONTROL_CHANNEL, msg)
+  modem.transmit(REACTOR_CHANNEL, REPLY_CHANNEL, { type="cmd", cmd=cmd, data=data })
 end
 
-local function clamp(x, lo, hi)
-  if x < lo then return lo end
-  if x > hi then return hi end
-  return x
+-- Read DIGITAL: treat any >0 analog as ON as well (works for Create links/levers)
+local function read_digital(relay, side)
+  local okA, a = pcall(relay.getAnalogInput, side)
+  if okA and type(a) == "number" then return a > 0 end
+  local okD, d = pcall(relay.getInput, side)
+  if okD then return d and true or false end
+  return false
 end
 
-local function analog_to_frac(a) return clamp(a / 15, 0, 1) end
+-- Read ANALOG 0..15
+local function read_analog(relay, side)
+  local okA, a = pcall(relay.getAnalogInput, side)
+  if okA and type(a) == "number" then
+    if a < 0 then a = 0 end
+    if a > 15 then a = 15 end
+    return a
+  end
+  -- fallback: digital -> 0/15
+  local okD, d = pcall(relay.getInput, side)
+  if okD then return d and 15 or 0 end
+  return 0
+end
+
+-- Scale lever 0..15 to numeric range
+local function scale(v, vmin, vmax)
+  return vmin + (v / 15) * (vmax - vmin)
+end
 
 --------------------------
--- STATE (edge detect + rate limit)
+-- MAPPINGS
 --------------------------
-local last = {
-  scram_in    = false,
-  start_in    = false,
-
-  burn_frac   = -1,
-  emerg_bool  = nil,
-
-  coolant_frac = -1,
-  steam_frac   = -1,
+-- BUTTONS (momentary, send on rising edge)
+local BTN = {
+  scram  = { relay="right", side="top"    },
+  start  = { relay="right", side="bottom" },
 }
 
-local cooldown = {
-  scram = 0,
-  start = 0,
+-- ANALOG LEVERS (send when value changes)
+local LEV = {
+  burn_level = { relay="top", side="top"  },   -- 0..15 => target burn
+  coolant_in = { relay="top", side="left" },   -- placeholder
+  steam_out  = { relay="top", side="right"},   -- placeholder
+  fuel_in    = { relay="top", side="back" },   -- placeholder
+}
+
+-- TOGGLES (latching, send when changes)
+local TOG = {
+  emergency = { relay="back", side="top" }, -- ON/OFF
 }
 
 --------------------------
--- BOOT
+-- STATE (for edge-detect / change-detect)
+--------------------------
+local last_btn = { scram=false, start=false }
+local last_lev = { burn_level=-1, coolant_in=-1, steam_out=-1, fuel_in=-1 }
+local last_tog = { emergency=nil }
+
+--------------------------
+-- STARTUP BANNER
 --------------------------
 term.clear()
 term.setCursorPos(1,1)
-print("[INPUT_PANEL] v1.0.0")
-print("[INPUT_PANEL] modem="..MODEM_SIDE.." -> reactor ch="..REACTOR_CHANNEL.." reply="..CONTROL_CHANNEL)
-print("[INPUT_PANEL] relay map: LEFT/RIGHT/TOP/BACK/BOTTOM")
-print("--------------------------------------------------")
-
--- initial status request
-send_cmd("request_status")
+print("INPUT_PANEL v1.0.0")
+print("Modem: "..MODEM_SIDE.."  -> core ch "..REACTOR_CHANNEL)
+print("Relays present: top="..tostring(relays.top~=nil)..
+      " right="..tostring(relays.right~=nil)..
+      " back="..tostring(relays.back~=nil))
+print("Mapping:")
+print("  SCRAM  : RIGHT relay TOP")
+print("  START  : RIGHT relay BOTTOM")
+print("  BURN   : TOP relay TOP (0..15)")
+print("  COOLIN : TOP relay LEFT (0..15)")
+print("  STEAM  : TOP relay RIGHT (0..15)")
+print("  FUELIN : TOP relay BACK (0..15)")
+print("  EMERG  : BACK relay TOP (ON/OFF)")
+print("--------------------------------------")
 
 --------------------------
 -- MAIN LOOP
 --------------------------
 while true do
-  local t = now_s()
-
-  -- DIGITAL INPUTS (buttons)
-  local scram_in = safe_get_input(relays.LEFT, "top")      -- LEFT relay -> TOP side
-  local start_in = safe_get_input(relays.RIGHT, "top")     -- RIGHT relay -> TOP side
-
-  -- Edge detect with cooldown (press = rising edge)
-  if scram_in and not last.scram_in and t >= cooldown.scram then
-    print(string.format("[%.3f] SCRAM pressed", t))
-    send_cmd("scram")
-    cooldown.scram = t + EDGE_COOLDOWN_S
+  -- BUTTONS (edge detect)
+  do
+    local cur = read_digital(relays[BTN.scram.relay], BTN.scram.side)
+    if cur and not last_btn.scram then
+      send_cmd("scram", true)
+      dbg("SCRAM pressed -> cmd:scram")
+    end
+    last_btn.scram = cur
   end
 
-  if start_in and not last.start_in and t >= cooldown.start then
-    print(string.format("[%.3f] START pressed", t))
-    send_cmd("power_on")
-    cooldown.start = t + EDGE_COOLDOWN_S
+  do
+    local cur = read_digital(relays[BTN.start.relay], BTN.start.side)
+    if cur and not last_btn.start then
+      send_cmd("power_on", true)
+      dbg("START pressed -> cmd:power_on")
+    end
+    last_btn.start = cur
   end
 
-  last.scram_in = scram_in
-  last.start_in = start_in
-
-  -- ANALOG INPUTS (levers)
-  -- TOP relay -> TOP side: burn setpoint
-  local burn_a   = safe_get_analog(relays.TOP, "top")
-  local burn_f   = analog_to_frac(burn_a)
-
-  -- BOTTOM relay -> TOP side: emergency enable (treated as boolean)
-  local emerg_a  = safe_get_analog(relays.BOTTOM, "top")
-  local emerg_b  = (emerg_a >= BOOL_THRESH)
-
-  -- BACK relay: coolant/steam (currently just monitored)
-  local coolant_a = safe_get_analog(relays.BACK, "top")
-  local steam_a   = safe_get_analog(relays.BACK, "right")
-  local coolant_f = analog_to_frac(coolant_a)
-  local steam_f   = analog_to_frac(steam_a)
-
-  -- Send burn only when it meaningfully changes
-  if last.burn_frac < 0 or math.abs(burn_f - last.burn_frac) >= ANALOG_EPS then
-    last.burn_frac = burn_f
-    local burn_cmd = burn_f * BURN_MAX
-    burn_cmd = math.floor(burn_cmd * 100 + 0.5) / 100  -- 2 decimals
-    print(string.format("[%.3f] BURN lever=%d/15 -> %.2f mB/t", t, burn_a, burn_cmd))
-    send_cmd("set_target_burn", burn_cmd)
+  -- TOGGLES (change detect)
+  do
+    local cur = read_digital(relays[TOG.emergency.relay], TOG.emergency.side)
+    if last_tog.emergency == nil or cur ~= last_tog.emergency then
+      send_cmd("set_emergency", cur)
+      dbg("Emergency toggle -> "..tostring(cur).." (cmd:set_emergency)")
+      last_tog.emergency = cur
+    end
   end
 
-  -- Send emergency toggle only on change
-  if last.emerg_bool == nil or emerg_b ~= last.emerg_bool then
-    last.emerg_bool = emerg_b
-    print(string.format("[%.3f] EMERGENCY lever=%d/15 -> %s", t, emerg_a, tostring(emerg_b)))
-    send_cmd("set_emergency", emerg_b)
+  -- LEVERS (change detect)
+  do
+    local v = read_analog(relays[LEV.burn_level.relay], LEV.burn_level.side)
+    if v ~= last_lev.burn_level then
+      local target = scale(v, 0.0, BURN_MAX_REQUEST)
+      send_cmd("set_target_burn", target)
+      dbg(string.format("Burn lever=%d -> target=%.2f (cmd:set_target_burn)", v, target))
+      last_lev.burn_level = v
+    end
   end
 
-  -- Monitor coolant/steam levers (no core command yet)
-  if last.coolant_frac < 0 or math.abs(coolant_f - last.coolant_frac) >= ANALOG_EPS then
-    last.coolant_frac = coolant_f
-    print(string.format("[%.3f] COOLANT lever=%d/15 (%.0f%%)", t, coolant_a, coolant_f*100))
+  -- The other analog levers are placeholders until you decide the receiving plumbing logic.
+  -- For now we just detect changes and print them (no commands sent).
+  do
+    local v = read_analog(relays[LEV.coolant_in.relay], LEV.coolant_in.side)
+    if v ~= last_lev.coolant_in then
+      dbg("Coolant-in lever changed -> "..v.." (no-op placeholder)")
+      last_lev.coolant_in = v
+    end
+  end
+  do
+    local v = read_analog(relays[LEV.steam_out.relay], LEV.steam_out.side)
+    if v ~= last_lev.steam_out then
+      dbg("Steam-out lever changed -> "..v.." (no-op placeholder)")
+      last_lev.steam_out = v
+    end
+  end
+  do
+    local v = read_analog(relays[LEV.fuel_in.relay], LEV.fuel_in.side)
+    if v ~= last_lev.fuel_in then
+      dbg("Fuel-in lever changed -> "..v.." (no-op placeholder)")
+      last_lev.fuel_in = v
+    end
   end
 
-  if last.steam_frac < 0 or math.abs(steam_f - last.steam_frac) >= ANALOG_EPS then
-    last.steam_frac = steam_f
-    print(string.format("[%.3f] STEAM lever=%d/15 (%.0f%%)", t, steam_a, steam_f*100))
-  end
-
-  -- Periodic status request (optional, low rate)
-  -- send_cmd("request_status")
-
-  os.sleep(POLL_DT)
+  os.sleep(POLL_S)
 end

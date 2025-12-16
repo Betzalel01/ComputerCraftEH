@@ -66,6 +66,18 @@ local lastErrorMsg = nil
 --------------------------
 -- HELPERS
 --------------------------
+-- DEBUG: print raw getStatus() results
+local function debugStatus(ok, v)
+  local t = type(v)
+  local s
+  if t == "string" then
+    s = string.format("%q", v)
+  else
+    s = tostring(v)
+  end
+  log(string.format("getStatus(): ok=%s type=%s value=%s", tostring(ok), t, s))
+end
+
 local function log(msg)
   term.setCursorPos(1, 1)
   term.clearLine()
@@ -110,6 +122,8 @@ end
 
 local function readSensors()
   local okS, status   = pcall(reactor.getStatus)
+  debugStatus(okS, status)
+  
   sensors.statusRaw   = status
   sensors.formed      = status_to_formed(okS, status)
 

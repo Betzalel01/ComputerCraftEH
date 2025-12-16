@@ -1,5 +1,5 @@
 -- reactor/status_display.lua
--- VERSION: 1.2.3 (2025-12-15)
+-- VERSION: 1.2.4 (2025-12-15)
 --
 -- Color policy:
 --   LEFT SIDE "normal" indicators:
@@ -12,7 +12,7 @@
 --
 -- Two-loop architecture:
 --   loop_status(): comms + timeout/hysteresis + computes states + updates non-blinking LEDs
---   loop_blink(): manual blinking for HEARTBEAT and TRIP
+--   loop_blink(): manual blinking for HEARTBEAT and TRIP only
 
 if package and package.path then
   package.path = "/?.lua;/?/init.lua;" .. package.path
@@ -45,10 +45,11 @@ local HITS_TO_ALIVE    = 1
 local BLINK_ON_S       = 0.12
 local BLINK_OFF_S      = 0.12
 
--- UPDATED per request: OFF = gray, ON = lime
+-- LEFT policy: OFF=GRAY, ON=LIME (NO GREEN USED FOR OFF ANYWHERE)
 local LEFT_ON  = colors.lime
 local LEFT_OFF = colors.gray
 
+-- SCRAM/TRIP policy: OFF=BLACK, ON=RED
 local SCRAM_ON  = colors.red
 local SCRAM_OFF = colors.black
 
@@ -94,6 +95,7 @@ TextBox{
   fg_bg     = cpair(colors.white, colors.gray)
 }
 
+-- LEFT COLUMN
 local system = Div{
   parent = panel,
   x      = 1,
@@ -102,25 +104,13 @@ local system = Div{
   height = 18
 }
 
-local status_led = LED{
-  parent = system,
-  label  = "STATUS",
-  colors = cpair(LEFT_ON, LEFT_OFF)
-}
-
-local heartbeat_led = LED{
-  parent = system,
-  label  = "HEARTBEAT",
-  colors = cpair(LEFT_ON, LEFT_OFF)
-}
+local status_led = LED{ parent = system, label = "STATUS",    colors = cpair(LEFT_ON, LEFT_OFF) }
+local heartbeat_led = LED{ parent = system, label = "HEARTBEAT", colors = cpair(LEFT_ON, LEFT_OFF) }
 
 system.line_break()
 
 -- LEDPair states: 0=off, 1=c1, 2=c2
--- We want OFF=gray and ON=lime, so:
---   off = gray
---   c1  = gray (unused)
---   c2  = lime
+-- Force OFF=GRAY and ON=LIME
 local reactor_led = LEDPair{
   parent = system,
   label  = "REACTOR",
@@ -129,12 +119,9 @@ local reactor_led = LEDPair{
   c2     = LEFT_ON
 }
 
-local modem_led_el = LED{
-  parent = system,
-  label  = "MODEM",
-  colors = cpair(LEFT_ON, LEFT_OFF)
-}
+local modem_led_el = LED{ parent = system, label = "MODEM",   colors = cpair(LEFT_ON, LEFT_OFF) }
 
+-- RGBLED: index 1 OK=LIME, 2 fault=RED, 5 idle/unknown=GRAY
 local network_led = RGBLED{
   parent = system,
   label  = "NETWORK",
@@ -143,18 +130,10 @@ local network_led = RGBLED{
 
 system.line_break()
 
-local rps_enable_led = LED{
-  parent = system,
-  label  = "RPS ENABLE",
-  colors = cpair(LEFT_ON, LEFT_OFF)
-}
+local rps_enable_led = LED{ parent = system, label = "RPS ENABLE",     colors = cpair(LEFT_ON, LEFT_OFF) }
+local auto_power_led = LED{ parent = system, label = "AUTO POWER CTRL", colors = cpair(LEFT_ON, LEFT_OFF) }
 
-local auto_power_led = LED{
-  parent = system,
-  label  = "AUTO POWER CTRL",
-  colors = cpair(LEFT_ON, LEFT_OFF)
-}
-
+-- MIDDLE COLUMN
 local mid = Div{
   parent = panel,
   x      = 18,
@@ -163,21 +142,8 @@ local mid = Div{
   height = 18
 }
 
-local rct_active_led = LED{
-  parent = mid,
-  x      = 2,
-  width  = 12,
-  label  = "RCT ACTIVE",
-  colors = cpair(LEFT_ON, LEFT_OFF)
-}
-
-local emerg_cool_led = LED{
-  parent = mid,
-  x      = 2,
-  width  = 14,
-  label  = "EMERG COOL",
-  colors = cpair(LEFT_ON, LEFT_OFF)
-}
+local rct_active_led = LED{ parent = mid, x = 2, width = 12, label = "RCT ACTIVE", colors = cpair(LEFT_ON, LEFT_OFF) }
+local emerg_cool_led = LED{ parent = mid, x = 2, width = 14, label = "EMERG COOL", colors = cpair(LEFT_ON, LEFT_OFF) }
 
 mid.line_break()
 
@@ -192,19 +158,12 @@ local trip_frame = Rectangle{
   even_inner = true
 }
 
-local trip_div = Div{
-  parent = trip_frame,
-  height = 1,
-  fg_bg  = hi_box
-}
+local trip_div = Div{ parent = trip_frame, height = 1, fg_bg = hi_box }
 
-local trip_led = LED{
-  parent = trip_div,
-  width  = 10,
-  label  = "TRIP",
-  colors = cpair(SCRAM_ON, SCRAM_OFF)
-}
+-- TRIP is SCRAM-style: OFF black, ON red; blinking is manual
+local trip_led = LED{ parent = trip_div, width = 10, label = "TRIP", colors = cpair(SCRAM_ON, SCRAM_OFF) }
 
+-- RIGHT COLUMN (SCRAM/TRIP indicators)
 local rps_cause = Rectangle{
   parent = panel,
   x      = mw - 16,
@@ -236,6 +195,7 @@ rps_cause.line_break()
 local lo_ccool_led   = LED{ parent = rps_cause, label = "LO CCOOLANT", colors = cpair(SCRAM_ON, SCRAM_OFF) }
 local hi_hcool_led   = LED{ parent = rps_cause, label = "HI HCOOLANT", colors = cpair(SCRAM_ON, SCRAM_OFF) }
 
+-- Footer (version visible in-game)
 local about = Div{
   parent = panel,
   y      = mh - 1,
@@ -243,19 +203,17 @@ local about = Div{
   height = 2,
   fg_bg  = cpair(colors.lightGray, colors.black)
 }
-TextBox{ parent = about, text = "PANEL: v1.2.3" }
+TextBox{ parent = about, text = "PANEL: v1.2.4" }
 
 local shared = {
   start_s        = now_s(),
   last_frame_s   = 0,
   last_status_ok = false,
-
   hit_count      = 0,
   miss_count     = 0,
   hb_enabled     = false,
-
-  last = {},
-  trip_active = false
+  last          = {},
+  trip_active    = false
 }
 
 local IND_KEYS = {
@@ -266,9 +224,8 @@ local IND_KEYS = {
 
 local function update_other_indicators(alive)
   local L = shared.last
-
-  -- reactor uses LEDPair state 2 for lime
   local reactor_is_on = (L.reactor_on == true)
+
   set_ledpair(reactor_led, (alive and reactor_is_on) and 2 or 0)
   set_led(rct_active_led,  alive and reactor_is_on)
 
@@ -306,19 +263,12 @@ local function update_other_indicators(alive)
 end
 
 local function loop_status()
-  term.clear()
-  term.setCursorPos(1,1)
-  print("[STATUS_DISPLAY] VERSION 1.2.3")
-  print("[STATUS_DISPLAY] left OFF=GRAY, ON=LIME; scram ON=RED")
-  print("[STATUS_DISPLAY] channel "..STATUS_CHANNEL)
-  print("---------------------------------------------------")
+  local check_timer = os.startTimer(CHECK_STEP_S)
 
   set_led(status_led, false)
   set_led(heartbeat_led, false)
   set_led(trip_led, false)
   update_other_indicators(false)
-
-  local check_timer = os.startTimer(CHECK_STEP_S)
 
   while true do
     local ev, p1, p2, p3, p4 = os.pullEvent()
@@ -378,11 +328,12 @@ local function loop_blink()
     local alive = shared.hb_enabled
     local trip  = shared.trip_active
 
-    hb_phase = alive and (not hb_phase) or false
-    trip_phase = trip and (not trip_phase) or false
+    if alive then hb_phase = not hb_phase else hb_phase = false end
+    if trip  then trip_phase = not trip_phase else trip_phase = false end
 
+    -- ONLY these two blink
     set_led(heartbeat_led, alive and hb_phase)
-    set_led(trip_led, trip and trip_phase)
+    set_led(trip_led,      trip and trip_phase)
 
     os.sleep((alive and hb_phase) and BLINK_ON_S or BLINK_OFF_S)
   end

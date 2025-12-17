@@ -1,34 +1,41 @@
 -- reactor/input_panel.lua
--- VERSION: 1.0.0
--- Purpose: Physical control input computer (relays + levers + buttons)
+-- VERSION: 1.0.1
+-- Physical input computer (relays + levers + buttons)
 
 -------------------------------------------------
 -- CONFIG
 -------------------------------------------------
-local MODEM_SIDE        = "right"
-local CORE_CHANNEL      = 100
-local INPUT_REPLY_CH    = 101
+local CORE_CHANNEL   = 100
+local INPUT_REPLY_CH = 101
 
 -------------------------------------------------
--- RELAY MAP
+-- RELAY MAP (faces on computer)
 -------------------------------------------------
 local RELAY = {
-  TOP    = "top",
-  LEFT   = "left",
-  RIGHT  = "right",
-  BACK   = "back",
+  TOP    = "top",     -- SCRAM / START
+  LEFT   = "left",    -- ANALOG SETPOINTS
+  RIGHT  = "right",   -- FLOW CONTROL
+  BACK   = "back",    -- MODE TOGGLES
 }
 
 -------------------------------------------------
--- SETUP
+-- MODEM (robust)
 -------------------------------------------------
-local modem = peripheral.wrap(MODEM_SIDE)
+local modem = peripheral.find("modem")
+if not modem then
+  error("No modem found (wired or wireless)", 0)
+end
 modem.open(INPUT_REPLY_CH)
 
+-------------------------------------------------
+-- RELAYS
+-------------------------------------------------
 local relays = {}
 for name, side in pairs(RELAY) do
   local r = peripheral.wrap(side)
-  if not r then error("Missing relay on "..side) end
+  if not r then
+    error("Missing redstone relay on "..side, 0)
+  end
   relays[name] = r
 end
 
@@ -44,7 +51,7 @@ local function send(cmd, data)
 end
 
 -------------------------------------------------
--- EDGE DETECTION STATE
+-- EDGE DETECTION
 -------------------------------------------------
 local last = {}
 
@@ -58,40 +65,27 @@ end
 -- MAIN LOOP
 -------------------------------------------------
 while true do
-  -- ===== TOP RELAY (CRITICAL) =====
-  if rising("scram",
-      relays.TOP.getInput("top")) then
+  -- ===== TOP RELAY (CRITICAL ACTIONS) =====
+  if rising("scram", relays.TOP.getInput("top")) then
     send("scram")
   end
 
-  if rising("start",
-      relays.TOP.getInput("left")) then
+  if rising("start", relays.TOP.getInput("left")) then
     send("power_on")
   end
 
   -- ===== LEFT RELAY (ANALOG SETPOINTS) =====
-  local burn = relays.LEFT.getAnalogInput("top")
-  send("set_target_burn", burn)
-
-  local fuel = relays.LEFT.getAnalogInput("left")
-  send("set_fuel_valve", fuel)
-
-  local coolant = relays.LEFT.getAnalogInput("right")
-  send("set_coolant_valve", coolant)
+  send("set_target_burn",   relays.LEFT.getAnalogInput("top"))
+  send("set_fuel_valve",    relays.LEFT.getAnalogInput("left"))
+  send("set_coolant_valve", relays.LEFT.getAnalogInput("right"))
 
   -- ===== RIGHT RELAY (FLOW CONTROL) =====
-  local steam = relays.RIGHT.getAnalogInput("top")
-  send("set_steam_valve", steam)
-
-  local waste = relays.RIGHT.getAnalogInput("right")
-  send("set_waste_valve", waste)
+  send("set_steam_valve", relays.RIGHT.getAnalogInput("top"))
+  send("set_waste_valve", relays.RIGHT.getAnalogInput("right"))
 
   -- ===== BACK RELAY (MODES) =====
-  send("set_emergency",
-    relays.BACK.getInput("top"))
-
-  send("set_auto_power",
-    relays.BACK.getInput("left"))
+  send("set_emergency",  relays.BACK.getInput("top"))
+  send("set_auto_power", relays.BACK.getInput("left"))
 
   sleep(0.1)
 end

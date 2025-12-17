@@ -1,27 +1,19 @@
 -- reactor/input_panel.lua
--- VERSION: 0.3.1 (2025-12-16)
--- Minimal INPUT PANEL: SCRAM / POWER ON / CLEAR SCRAM
+-- VERSION: 0.4.0 (2025-12-16)
+-- INPUT PANEL -> CONTROL ROOM -> REACTOR CORE
+-- Minimal: SCRAM / POWER ON / CLEAR SCRAM (button-pulse friendly)
 --
--- Fixes vs v0.3.0:
---   1) Debounce + re-arm: one press => one command, even if signal stays high.
---   2) Cooldown per button to block command storms.
---   3) Priority: SCRAM wins; POWER_ON ignored if SCRAM is currently asserted.
---   4) Hybrid trigger: reacts to redstone events *and* polls on a short timer
---      (helps when Create pulses are too fast/weird for events).
+-- Wiring (redstone-change / 1-tick buttons OK):
+--   TOP redstone_relay on the INPUT computer:
+--     SCRAM       -> relay "top", side "left"
+--     POWER ON    -> relay "top", side "back"
+--     CLEAR SCRAM -> relay "top", side "right"
 
 --------------------------
 -- CHANNELS
 --------------------------
-local REACTOR_CHANNEL = 100
-local REPLY_CHANNEL   = 101
-
---------------------------
--- TIMING / FILTERING
---------------------------
-local POLL_S            = 0.05   -- 20 Hz polling to catch 1-tick-ish pulses
-local DEBOUNCE_S        = 0.10   -- minimum time between accepted edges (per button)
-local COOLDOWN_S        = 0.40   -- hard cooldown after a valid press (per button)
-local REQUIRE_RELEASE   = true   -- must go low before it can fire again
+local CONTROL_ROOM_INPUT_CH = 102  -- input_panel -> control_room
+local CONTROL_ROOM_REPLY_CH = 103  -- (optional) replies back to input_panel
 
 --------------------------
 -- MODEM (robust detect)
@@ -33,16 +25,15 @@ end)
 if not modem then
   term.clear()
   term.setCursorPos(1,1)
-  print("[INPUT_PANEL] ERROR: No usable modem peripheral found.")
+  print("[INPUT_PANEL] ERROR: No usable modem found.")
   print("Peripherals seen:")
   for _, n in ipairs(peripheral.getNames()) do
-    local t = peripheral.getType(n)
-    print("  - "..n.." ("..t..")")
+    print("  - "..n.." ("..tostring(peripheral.getType(n))..")")
   end
   error("Attach a modem to this computer and try again.", 0)
 end
 
-pcall(function() modem.open(REPLY_CHANNEL) end)
+pcall(function() modem.open(CONTROL_ROOM_REPLY_CH) end)
 
 --------------------------
 -- RELAYS
@@ -53,7 +44,7 @@ if not relay_top or peripheral.getType("top") ~= "redstone_relay" then
 end
 
 --------------------------
--- INPUT MAPPING (TOP relay only)
+-- INPUT MAPPING
 --------------------------
 local BTN = {
   SCRAM       = { relay = relay_top, relay_name = "top", side = "left",  cmd = "scram" },
@@ -73,67 +64,12 @@ local function get_in(b)
   return (v and 1 or 0)
 end
 
+local function rising(prev, cur) return (prev == 0) and (cur == 1) end
+
 local function send_cmd(cmd)
-  modem.transmit(REACTOR_CHANNEL, REPLY_CHANNEL, { type = "cmd", cmd = cmd })
-end
-
---------------------------
--- STATE (per button)
---------------------------
-local st = {}
-for k, _ in pairs(BTN) do
-  st[k] = {
-    prev = 0,
-    armed = true,
-    last_edge_t = -1e9,
-    cooldown_until = -1e9
-  }
-end
-
-local function accept_press(k, cur)
-  local b  = BTN[k]
-  local s  = st[k]
-  local t  = now_s()
-
-  -- optional re-arm on release
-  if REQUIRE_RELEASE and cur == 0 then
-    s.armed = true
-  end
-
-  -- must be rising edge
-  local rising = (s.prev == 0) and (cur == 1)
-
-  -- basic gates
-  if not rising then return false end
-  if REQUIRE_RELEASE and not s.armed then return false end
-  if t < s.cooldown_until then return false end
-  if (t - s.last_edge_t) < DEBOUNCE_S then return false end
-
-  -- SCRAM priority: if SCRAM is asserted, ignore POWER_ON and CLEAR_SCRAM presses
-  if k ~= "SCRAM" then
-    local scram_cur = get_in(BTN.SCRAM)
-    if scram_cur == 1 then
-      log(k.." ignored (SCRAM asserted)")
-      return false
-    end
-  end
-
-  -- accept
-  s.last_edge_t = t
-  s.cooldown_until = t + COOLDOWN_S
-  if REQUIRE_RELEASE then s.armed = false end
-
-  log(k.." pressed ("..b.relay_name.."."..b.side..") -> "..b.cmd)
-  send_cmd(b.cmd)
-  return true
-end
-
-local function scan_inputs()
-  for k, b in pairs(BTN) do
-    local cur = get_in(b)
-    accept_press(k, cur)
-    st[k].prev = cur
-  end
+  local pkt = { type = "cmd", cmd = cmd }
+  -- route to control room (NOT reactor core)
+  modem.transmit(CONTROL_ROOM_INPUT_CH, CONTROL_ROOM_REPLY_CH, pkt)
 end
 
 --------------------------
@@ -141,34 +77,33 @@ end
 --------------------------
 term.clear()
 term.setCursorPos(1,1)
-print("[INPUT_PANEL] v0.3.1  (SCRAM / POWER ON / CLEAR SCRAM)")
+print("[INPUT_PANEL] v0.4.0  (ROUTED via CONTROL ROOM)")
+print("TX -> CONTROL_ROOM_INPUT_CH="..CONTROL_ROOM_INPUT_CH)
 print("Wiring (TOP relay):")
 print("  SCRAM       = left")
 print("  POWER ON    = back")
 print("  CLEAR SCRAM = right")
-print(string.format("Poll=%.2fs debounce=%.2fs cooldown=%.2fs release=%s",
-  POLL_S, DEBOUNCE_S, COOLDOWN_S, tostring(REQUIRE_RELEASE)))
-print("Waiting for pulses...")
-
--- init prev states
-for k, b in pairs(BTN) do
-  st[k].prev = get_in(b)
-end
+print("Listening for redstone pulses...")
 
 --------------------------
--- MAIN LOOP (events + polling)
+-- EDGE STATE INIT
 --------------------------
-local poll_timer = os.startTimer(POLL_S)
+local prev = {}
+for k, b in pairs(BTN) do prev[k] = get_in(b) end
 
+--------------------------
+-- MAIN LOOP (event-driven)
+--------------------------
 while true do
-  local ev, p1 = os.pullEvent()
-
+  local ev = os.pullEvent()
   if ev == "redstone" then
-    -- immediate scan on any redstone change
-    scan_inputs()
-
-  elseif ev == "timer" and p1 == poll_timer then
-    scan_inputs()
-    poll_timer = os.startTimer(POLL_S)
+    for k, b in pairs(BTN) do
+      local cur = get_in(b)
+      if rising(prev[k], cur) then
+        log(k.." pressed ("..b.relay_name.."."..b.side..") -> "..b.cmd.." (to control room)")
+        send_cmd(b.cmd)
+      end
+      prev[k] = cur
+    end
   end
 end

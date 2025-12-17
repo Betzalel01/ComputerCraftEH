@@ -1,6 +1,9 @@
 -- reactor/control_room.lua
--- VERSION: 0.2.3-router+ui-confirm (2025-12-17)
--- Fix: UI printing no longer depends on getCursorPos() (avoids nil y crash)
+-- VERSION: 0.2.4-router+ui-confirm (2025-12-17)
+-- Fix:
+--   * "Already satisfied" + confirmations now use sensors.reactor_active (Mekanism getStatus()).
+--   * Adds stale-status guard so we don't ignore presses on old data.
+--   * Keeps pending gate: ignores extra presses until confirmed/timeout.
 
 --------------------------
 -- CHANNELS
@@ -14,6 +17,7 @@ local CORE_REPLY_CH         = 101
 --------------------------
 local PENDING_TIMEOUT_S = 6.0
 local POLL_PERIOD_S     = 0.25
+local STALE_STATUS_S    = 2.0   -- if status older than this, don't "already satisfied" ignore
 
 --------------------------
 -- PERIPHERALS
@@ -59,25 +63,30 @@ local function request_status()
 end
 
 --------------------------
--- STATUS INTERPRETATION
+-- STATUS INTERPRETATION (authoritative)
 --------------------------
-local function status_actual_running(st)
-  if type(st) ~= "table" then return false end
-  local sens = (type(st.sensors) == "table") and st.sensors or {}
-  local formed = (sens.reactor_formed == true)
-  local burn   = tonumber(sens.burnRate) or 0
-  return formed and (burn > 0)
+local function get_sensors(st)
+  if type(st) ~= "table" then return {} end
+  return (type(st.sensors) == "table") and st.sensors or {}
+end
+
+local function actual_active(st)
+  local sens = get_sensors(st)
+  return (sens.reactor_active == true)
 end
 
 local function status_matches(cmd, st)
   if type(st) ~= "table" then return false end
-  local actual_running = status_actual_running(st)
-  local scramLatched   = (st.scramLatched == true)
+  local active      = actual_active(st)
+  local scramLatched = (st.scramLatched == true)
+  local poweredOn    = (st.poweredOn == true)
 
   if cmd == "power_on" then
-    return actual_running
+    -- satisfied only when we are commanded on AND the reactor is actually active
+    return poweredOn and active
   elseif cmd == "scram" then
-    return scramLatched
+    -- satisfied when reactor is not active OR latch indicates scram
+    return (not active) or scramLatched
   elseif cmd == "clear_scram" then
     return not scramLatched
   end
@@ -99,7 +108,7 @@ local pending = nil
 
 local function draw()
   clr()
-  wln("CONTROL ROOM (confirm router)  v0.2.3")
+  wln("CONTROL ROOM (confirm router)  v0.2.4")
   wln("INPUT "..CONTROL_ROOM_INPUT_CH.."  CORE "..REACTOR_CHANNEL.."  REPLY "..CORE_REPLY_CH)
   wln("----------------------------------------")
 
@@ -124,7 +133,7 @@ local function draw()
   end
 
   local st = ui.status
-  local sens = (type(st.sensors) == "table") and st.sensors or {}
+  local sens = get_sensors(st)
 
   wln("CORE (command latch)")
   wln("  poweredOn    = "..tostring(st.poweredOn))
@@ -133,15 +142,20 @@ local function draw()
 
   wln("ACTUAL (verified)")
   wln("  formed       = "..tostring(sens.reactor_formed))
-  wln("  burnRate     = "..tostring(sens.burnRate))
-  wln("  running      = "..tostring(status_actual_running(st)))
+  wln("  active       = "..tostring(sens.reactor_active))
 end
 
 --------------------------
 -- COMMAND GATE
 --------------------------
+local function status_is_stale()
+  if ui.last_status_t == 0 then return true end
+  return (now_s() - ui.last_status_t) > STALE_STATUS_S
+end
+
 local function try_issue(cmd)
-  if ui.status and status_matches(cmd, ui.status) then
+  -- If status is fresh, allow "already satisfied" ignore. If stale, never ignore.
+  if (not status_is_stale()) and ui.status and status_matches(cmd, ui.status) then
     log("IGNORED "..cmd.." (already satisfied)")
     return
   end

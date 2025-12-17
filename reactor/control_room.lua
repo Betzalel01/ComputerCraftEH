@@ -1,27 +1,14 @@
 -- reactor/control_room.lua
--- VERSION: 0.2.4-router+ui-confirm (2025-12-17)
--- Fix:
---   * "Already satisfied" + confirmations now use sensors.reactor_active (Mekanism getStatus()).
---   * Adds stale-status guard so we don't ignore presses on old data.
---   * Keeps pending gate: ignores extra presses until confirmed/timeout.
+-- VERSION: 0.2.4-router+ui-confirm+ack (2025-12-17)
+-- Adds: immediate ACK back to input_panel so 1-tick buttons don't need multiple presses.
 
---------------------------
--- CHANNELS
---------------------------
 local CONTROL_ROOM_INPUT_CH = 102
 local REACTOR_CHANNEL       = 100
 local CORE_REPLY_CH         = 101
 
---------------------------
--- TIMING
---------------------------
 local PENDING_TIMEOUT_S = 6.0
 local POLL_PERIOD_S     = 0.25
-local STALE_STATUS_S    = 2.0   -- if status older than this, don't "already satisfied" ignore
 
---------------------------
--- PERIPHERALS
---------------------------
 local modem = peripheral.find("modem", function(_, p)
   return type(p) == "table" and type(p.transmit) == "function" and type(p.open) == "function"
 end)
@@ -33,9 +20,6 @@ local out = mon or term
 modem.open(CONTROL_ROOM_INPUT_CH)
 modem.open(CORE_REPLY_CH)
 
---------------------------
--- HELPERS
---------------------------
 local function now_s() return os.epoch("utc") / 1000 end
 local function log(s) print(string.format("[%.3f][CONTROL_ROOM] %s", now_s(), s)) end
 
@@ -47,7 +31,6 @@ local function clr()
   if out.setCursorPos then out.setCursorPos(1,1) else term.setCursorPos(1,1) end
   ui_y = 1
 end
-
 local function wln(s)
   if out.setCursorPos then out.setCursorPos(1, ui_y) else term.setCursorPos(1, ui_y) end
   if out.write then out.write(tostring(s)) else term.write(tostring(s)) end
@@ -57,58 +40,39 @@ end
 local function send_to_core(pkt)
   modem.transmit(REACTOR_CHANNEL, CORE_REPLY_CH, pkt)
 end
-
 local function request_status()
   send_to_core({ type="cmd", cmd="request_status" })
 end
 
---------------------------
--- STATUS INTERPRETATION (authoritative)
---------------------------
-local function get_sensors(st)
-  if type(st) ~= "table" then return {} end
-  return (type(st.sensors) == "table") and st.sensors or {}
-end
-
-local function actual_active(st)
-  local sens = get_sensors(st)
-  return (sens.reactor_active == true)
+local function status_actual_running(st)
+  if type(st) ~= "table" then return false end
+  local sens = (type(st.sensors) == "table") and st.sensors or {}
+  local formed = (sens.reactor_formed == true)
+  local burn   = tonumber(sens.burnRate) or 0
+  return formed and (burn > 0)
 end
 
 local function status_matches(cmd, st)
   if type(st) ~= "table" then return false end
-  local active      = actual_active(st)
-  local scramLatched = (st.scramLatched == true)
-  local poweredOn    = (st.poweredOn == true)
+  local actual_running = status_actual_running(st)
+  local scramLatched   = (st.scramLatched == true)
 
   if cmd == "power_on" then
-    -- satisfied only when we are commanded on AND the reactor is actually active
-    return poweredOn and active
+    return actual_running
   elseif cmd == "scram" then
-    -- satisfied when reactor is not active OR latch indicates scram
-    return (not active) or scramLatched
+    return scramLatched
   elseif cmd == "clear_scram" then
     return not scramLatched
   end
   return false
 end
 
---------------------------
--- UI STATE
---------------------------
-local ui = {
-  last_cmd      = "(none)",
-  last_cmd_t    = 0,
-  last_status_t = 0,
-  status        = nil,
-}
-
+local ui = { last_cmd="(none)", last_cmd_t=0, last_status_t=0, status=nil }
 local pending = nil
--- pending = { cmd=..., issued_at=... }
 
 local function draw()
   clr()
-  wln("CONTROL ROOM (confirm router)  v0.2.4")
+  wln("CONTROL ROOM (confirm+ack router)  v0.2.4")
   wln("INPUT "..CONTROL_ROOM_INPUT_CH.."  CORE "..REACTOR_CHANNEL.."  REPLY "..CORE_REPLY_CH)
   wln("----------------------------------------")
 
@@ -126,40 +90,29 @@ local function draw()
   end
 
   wln("")
-
   if type(ui.status) ~= "table" then
     wln("Waiting for status...")
     return
   end
 
   local st = ui.status
-  local sens = get_sensors(st)
+  local sens = (type(st.sensors) == "table") and st.sensors or {}
 
   wln("CORE (command latch)")
   wln("  poweredOn    = "..tostring(st.poweredOn))
   wln("  scramLatched = "..tostring(st.scramLatched))
   wln("")
-
   wln("ACTUAL (verified)")
   wln("  formed       = "..tostring(sens.reactor_formed))
-  wln("  active       = "..tostring(sens.reactor_active))
-end
-
---------------------------
--- COMMAND GATE
---------------------------
-local function status_is_stale()
-  if ui.last_status_t == 0 then return true end
-  return (now_s() - ui.last_status_t) > STALE_STATUS_S
+  wln("  burnRate     = "..tostring(sens.burnRate))
+  wln("  running      = "..tostring(status_actual_running(st)))
 end
 
 local function try_issue(cmd)
-  -- If status is fresh, allow "already satisfied" ignore. If stale, never ignore.
-  if (not status_is_stale()) and ui.status and status_matches(cmd, ui.status) then
+  if ui.status and status_matches(cmd, ui.status) then
     log("IGNORED "..cmd.." (already satisfied)")
     return
   end
-
   if pending then
     local age = now_s() - pending.issued_at
     if age < PENDING_TIMEOUT_S then
@@ -175,17 +128,11 @@ local function try_issue(cmd)
   draw()
 end
 
---------------------------
--- STARTUP
---------------------------
 if mon and mon.setTextScale then pcall(function() mon.setTextScale(0.5) end) end
 draw()
 log("Online. Listening on "..CONTROL_ROOM_INPUT_CH)
 request_status()
 
---------------------------
--- MAIN LOOP
---------------------------
 local poll_timer = os.startTimer(POLL_PERIOD_S)
 
 while true do
@@ -197,18 +144,22 @@ while true do
     if ch == CONTROL_ROOM_INPUT_CH and type(msg) == "table" and msg.cmd then
       ui.last_cmd   = tostring(msg.cmd)
       ui.last_cmd_t = now_s()
+
+      -- NEW: immediate ACK back to input_panel
+      if type(msg.ack_ch) == "number" and type(msg.id) == "number" then
+        modem.transmit(msg.ack_ch, CONTROL_ROOM_INPUT_CH, { type="ack", id=msg.id, note="rx" })
+      end
+
       try_issue(msg.cmd)
 
     elseif ch == CORE_REPLY_CH then
       if type(msg) == "table" and msg.type == "status" then
         ui.status        = msg
         ui.last_status_t = now_s()
-
         if pending and status_matches(pending.cmd, ui.status) then
           log("CONFIRMED "..pending.cmd)
           pending = nil
         end
-
         draw()
       end
     end

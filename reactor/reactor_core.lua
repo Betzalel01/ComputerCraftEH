@@ -80,17 +80,34 @@ local function setActivationRS(state)
   redstone.setOutput(REDSTONE_ACTIVATION_SIDE, state and true or false)
 end
 
+-- Add this helper near HARD ACTIONS
+local function scram_until_inactive(max_tries, delay_s)
+  max_tries = max_tries or 6
+  delay_s   = delay_s or 0.15
+
+  for i = 1, max_tries do
+    local okS, active = pcall(reactor.getStatus)
+    if okS and active then
+      pcall(reactor.scram) -- ignore error text; we re-check status
+      os.sleep(delay_s)
+    else
+      -- if getStatus fails OR reports inactive, stop trying
+      return
+    end
+  end
+end
+
+-- REPLACE zeroOutput() with this
 local function zeroOutput()
   setActivationRS(false)
 
+  -- Only run the retry loop once per "off/scram period"
   if not scramIssued then
-    local okS, active = pcall(reactor.getStatus)
-    if okS and active then
-      safe_call("reactor.scram()", reactor.scram)
-    end
+    scram_until_inactive(6, 0.15)
     scramIssued = true
   end
 end
+
 
 local function doScram(reason)
   dbg("SCRAM: "..tostring(reason or "unknown"))

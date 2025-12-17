@@ -1,109 +1,120 @@
 -- reactor/input_panel.lua
 -- VERSION: 0.3.0 (2025-12-16)
--- Purpose: Dedicated INPUT computer for momentary (1-tick) buttons via Redstone Relay.
--- Method: event-driven + rising-edge detection (won't miss 1-tick pulses)
+-- Minimal INPUT PANEL: SCRAM / POWER ON / CLEAR SCRAM (button-pulse friendly)
 --
--- HARDWARE ASSUMPTION (your layout):
--- - A Redstone Relay is attached to the COMPUTER's TOP face (so we wrap "top").
--- - You only wire into faces on THAT relay (do not also use the adjacent relay that would occupy the same block space).
+-- Fix for your error:
+--   Ensures we actually grabbed a *modem peripheral* (has transmit/open).
+--   If not found, prints peripherals so you can see what you wrapped.
 --
--- WIRING (TOP RELAY):
---   SCRAM       -> top relay LEFT
---   POWER ON    -> top relay RIGHT
---   CLEAR SCRAM -> top relay BACK
+-- Wiring (buttons are 1-tick OK; uses redstone-change events):
+--   TOP relay (the redstone_relay sitting on TOP of the computer):
+--     SCRAM       -> relay "top", side "left"
+--     POWER ON    -> relay "top", side "back"
+--     CLEAR SCRAM -> relay "top", side "right"
 --
--- Notes:
--- - The relay face names below ("left/right/back") are relative to the RELAY block.
--- - 1-tick buttons work because we use os.pullEvent("redstone") + rising edge.
+-- Each button should drive that relay side HIGH briefly (Create link / button pulse is fine).
 
 --------------------------
--- CONFIG
+-- CHANNELS
 --------------------------
-local RELAY_SIDE        = "top"    -- which side of THIS computer the relay is on
-local MODEM_SIDE        = "back"   -- modem on this input computer
-local REACTOR_CHANNEL   = 100      -- reactor_core listens here
-local REPLY_CHANNEL     = 101      -- where reactor_core replies (optional; we don't require it)
-
--- Debounce (seconds): prevents double-send if a signal chatters
-local DEBOUNCE_S        = 0.10
+local REACTOR_CHANNEL = 100
+local REPLY_CHANNEL   = 101   -- reply channel the core can answer to (optional)
 
 --------------------------
--- PERIPHERALS
+-- MODEM (robust detect)
 --------------------------
-local relay = peripheral.wrap(RELAY_SIDE)
-if not relay then error("No redstone_relay on "..RELAY_SIDE, 0) end
+local modem = peripheral.find("modem", function(_, p)
+  return type(p) == "table" and type(p.transmit) == "function" and type(p.open) == "function"
+end)
 
-local modem = peripheral.wrap(MODEM_SIDE)
-if not modem then error("No modem on "..MODEM_SIDE, 0) end
+if not modem then
+  term.clear()
+  term.setCursorPos(1,1)
+  print("[INPUT_PANEL] ERROR: No usable modem peripheral found.")
+  print("Peripherals seen:")
+  for _, n in ipairs(peripheral.getNames()) do
+    local t = peripheral.getType(n)
+    print("  - "..n.." ("..t..")")
+  end
+  error("Attach a modem to this computer and try again.", 0)
+end
 
--- Opening is only required to RECEIVE. We don't require replies, but opening is harmless.
 pcall(function() modem.open(REPLY_CHANNEL) end)
 
 --------------------------
--- INPUT MAP
+-- RELAYS
 --------------------------
-local INPUTS = {
-  { name = "SCRAM",       face = "left",  cmd = "scram" },
-  { name = "POWER ON",    face = "right", cmd = "power_on" },
-  { name = "CLEAR SCRAM", face = "back",  cmd = "clear_scram" },
+local relay_top = peripheral.wrap("top")
+if not relay_top or peripheral.getType("top") ~= "redstone_relay" then
+  error("Expected a redstone_relay on TOP of the input computer.", 0)
+end
+
+--------------------------
+-- INPUT MAPPING
+--------------------------
+local BTN = {
+  SCRAM       = { relay = relay_top, relay_name = "top", side = "left",  cmd = "scram" },
+  POWER_ON    = { relay = relay_top, relay_name = "top", side = "back",  cmd = "power_on" },
+  CLEAR_SCRAM = { relay = relay_top, relay_name = "top", side = "right", cmd = "clear_scram" },
 }
 
 --------------------------
 -- HELPERS
 --------------------------
 local function now_s() return os.epoch("utc") / 1000 end
+local function log(msg)
+  print(string.format("[%.3f][INPUT_PANEL] %s", now_s(), msg))
+end
+
+local function get_in(b)
+  -- digital read; Create pulses are still fine
+  local ok, v = pcall(b.relay.getInput, b.side)
+  if not ok then return 0 end
+  return (v and 1 or 0)
+end
+
+local function rising(prev, cur)
+  return (prev == 0) and (cur == 1)
+end
 
 local function send_cmd(cmd)
-  -- reactor_core expects a table with type=cmd/command, cmd=<string>, data=<optional>
-  modem.transmit(REACTOR_CHANNEL, REPLY_CHANNEL, {
-    type = "cmd",
-    cmd  = cmd,
-    data = nil
-  })
+  local pkt = { type = "cmd", cmd = cmd }
+  modem.transmit(REACTOR_CHANNEL, REPLY_CHANNEL, pkt)
 end
 
 --------------------------
--- INIT (edge state)
+-- STARTUP PRINT
 --------------------------
 term.clear()
 term.setCursorPos(1,1)
-print("[INPUT_PANEL] v0.3.0")
-print("[INPUT_PANEL] relay="..RELAY_SIDE.."  modem="..MODEM_SIDE)
-print("[INPUT_PANEL] WIRING (TOP RELAY): left=SCRAM right=POWER_ON back=CLEAR_SCRAM")
-print("----------------------------------------------------")
+print("[INPUT_PANEL] v0.3.0  (SCRAM / POWER ON / CLEAR SCRAM)")
+print("Wiring:")
+print("  SCRAM       = top relay, left")
+print("  POWER ON    = top relay, back")
+print("  CLEAR SCRAM = top relay, right")
+print("Listening for redstone pulses...")
 
-local last = {}
-for _, it in ipairs(INPUTS) do
-  local ok, v = pcall(relay.getInput, it.face)
-  last[it.face] = ok and (v == true) or false
+--------------------------
+-- EDGE STATE INIT
+--------------------------
+local prev = {}
+for k, b in pairs(BTN) do
+  prev[k] = get_in(b)
 end
-
-local last_fire = {}  -- per-face debounce timer
 
 --------------------------
 -- MAIN LOOP (event-driven)
 --------------------------
 while true do
   local ev = os.pullEvent()
-
   if ev == "redstone" then
-    for _, it in ipairs(INPUTS) do
-      local ok, cur = pcall(relay.getInput, it.face)
-      cur = ok and (cur == true) or false
-
-      local prev = last[it.face] or false
-      last[it.face] = cur
-
-      -- Rising edge: prev=false -> cur=true
-      if (not prev) and cur then
-        local t = now_s()
-        local lf = last_fire[it.face] or -1e9
-        if (t - lf) >= DEBOUNCE_S then
-          last_fire[it.face] = t
-          print(string.format("[INPUT_PANEL] %s (relay.%s) -> cmd=%s", it.name, it.face, it.cmd))
-          send_cmd(it.cmd)
-        end
+    for k, b in pairs(BTN) do
+      local cur = get_in(b)
+      if rising(prev[k], cur) then
+        log(k.." pressed ("..b.relay_name.."."..b.side..") -> "..b.cmd)
+        send_cmd(b.cmd)
       end
+      prev[k] = cur
     end
   end
 end

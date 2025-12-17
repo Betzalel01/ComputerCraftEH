@@ -19,23 +19,25 @@ end
 -----------------------
 -- MODEM DISCOVERY (FIX)
 -----------------------
-local modem_name, modem = peripheral.find("modem", function(name, p)
-  return type(p) == "table" and type(p.open) == "function" and type(p.transmit) == "function"
-end)
+-- MODEM (FIX)
+-- Your relays occupy every side except "front", so modem must be on "front".
+local MODEM_SIDE = "front"
 
-if not modem then
-  print("[INPUT_PANEL][ERR] No modem peripheral with open()+transmit() found.")
-  print("[INPUT_PANEL][ERR] Detected peripherals on each side:")
-  for _, side in ipairs({"top","bottom","left","right","front","back"}) do
-    local t = peripheral.getType(side)
-    if t then print(("  %s: %s"):format(side, t)) end
+local modem = peripheral.wrap(MODEM_SIDE)
+if not modem or type(modem.open) ~= "function" or type(modem.transmit) ~= "function" then
+  -- fallback: find any modem on the network
+  local name
+  name, modem = peripheral.find("modem", function(n, p)
+    return type(p) == "table" and type(p.open) == "function" and type(p.transmit) == "function"
+  end)
+
+  if not modem then
+    error("No modem found. Put a modem on FRONT (recommended) or attach one via wired modem network.", 0)
   end
-  error("Attach a modem (wired/wireless) to this computer, or connect one via a modem cable.", 0)
 end
 
-dbg("Using modem: "..tostring(modem_name))
+-- now safe
 modem.open(INPUT_REPLY_CH)
-dbg("Opened reply channel: "..tostring(INPUT_REPLY_CH))
 
 -----------------------
 -- COMMAND SEND HELPERS

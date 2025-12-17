@@ -49,6 +49,31 @@ local sensors = {
   heatedFrac   = 0,
   wasteFrac    = 0,
 }
+-- ADD near the other STATE vars (top of file)
+local scramIssued = false   -- prevents spamming reactor.scram() when already inactive
+
+
+-- REPLACE your existing zeroOutput() with this version
+local function zeroOutput()
+  setActivationRS(false)
+
+  -- Only try scram if reactor is actually active, and only once per "active period"
+  if not scramIssued then
+    local okS, active = pcall(reactor.getStatus) -- Mekanism: true when active
+    if okS and active then
+      pcall(reactor.scram)  -- if it fails, we still latch scramIssued to avoid log spam
+      scramIssued = true
+    else
+      -- Reactor isn't active; scram would error. Mark as issued to prevent repeated attempts.
+      scramIssued = true
+    end
+  end
+end
+
+
+-- In applyControl(), when you are about to run (poweredOn & not scrammed), clear the scramIssued latch.
+-- ADD this line right before setActivationRS(true) in the "safe to run" path:
+--   scramIssued = false
 
 --------------------------
 -- DEBUG (minimal)

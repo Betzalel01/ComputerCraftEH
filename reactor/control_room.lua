@@ -1,148 +1,120 @@
--- reactor/control_room.lua
--- VERSION: 0.2.0-router+ui (2025-12-16)
--- Control room that:
---   1) Receives commands from input_panel on CONTROL_ROOM_INPUT_CH
---   2) Forwards them to reactor_core on REACTOR_CHANNEL
---   3) Keeps a simple monitor UI updated from reactor_core status replies (channel CORE_REPLY_CH)
+-- reactor/input_panel.lua
+-- VERSION: 0.3.1 (2025-12-17)
+-- Reliable INPUT PANEL (1-tick pulse friendly)
+-- Changes vs 0.3.0:
+--   - Polling loop (no reliance on redstone events)
+--   - Debounce + "armed" latch (one send per press)
+--   - Burst send (3x) to avoid any comm hiccups
+--
+-- Wiring (TOP relay on top of this computer):
+--   SCRAM       -> top relay, left
+--   POWER ON    -> top relay, back
+--   CLEAR SCRAM -> top relay, right
 
 --------------------------
 -- CHANNELS
 --------------------------
 local CONTROL_ROOM_INPUT_CH = 102  -- input_panel -> control_room
-local REACTOR_CHANNEL       = 100  -- control_room -> reactor_core
-local CORE_REPLY_CH         = 101  -- reactor_core -> control_room (status/heartbeat/etc.)
+local CONTROL_ROOM_REPLY_CH = 101  -- not required, but fine if open
 
 --------------------------
--- PERIPHERALS (robust)
+-- TUNING
+--------------------------
+local POLL_S          = 0.05  -- 20 Hz polling (fast enough for 1-tick-ish pulses)
+local DEBOUNCE_S      = 0.10  -- ignore re-triggers within this time
+local BURST_COUNT     = 3
+local BURST_GAP_S     = 0.06  -- spacing between repeats
+
+--------------------------
+-- MODEM (robust detect)
 --------------------------
 local modem = peripheral.find("modem", function(_, p)
   return type(p) == "table" and type(p.transmit) == "function" and type(p.open) == "function"
 end)
-if not modem then error("No modem found on control room computer", 0) end
+if not modem then error("No modem found on input panel computer", 0) end
+pcall(function() modem.open(CONTROL_ROOM_REPLY_CH) end)
 
-local mon = peripheral.find("monitor")
-local function term_or_mon()
-  if mon then return mon else return term end
+--------------------------
+-- RELAY
+--------------------------
+local relay_top = peripheral.wrap("top")
+if not relay_top or peripheral.getType("top") ~= "redstone_relay" then
+  error("Expected a redstone_relay on TOP of the input computer.", 0)
 end
-local out = term_or_mon()
 
-modem.open(CONTROL_ROOM_INPUT_CH)
-modem.open(CORE_REPLY_CH)
+--------------------------
+-- INPUT MAP
+--------------------------
+local BTN = {
+  SCRAM       = { relay = relay_top, side = "left",  cmd = "scram" },
+  POWER_ON    = { relay = relay_top, side = "back",  cmd = "power_on" },
+  CLEAR_SCRAM = { relay = relay_top, side = "right", cmd = "clear_scram" },
+}
 
 --------------------------
 -- HELPERS
 --------------------------
 local function now_s() return os.epoch("utc") / 1000 end
+local function log(msg) print(string.format("[%.3f][INPUT_PANEL] %s", now_s(), msg)) end
 
-local function clr()
-  if out.clear then out.clear() else term.clear() end
-  if out.setCursorPos then out.setCursorPos(1,1) else term.setCursorPos(1,1) end
+local function get_in(b)
+  local ok, v = pcall(b.relay.getInput, b.side)
+  return (ok and v) and 1 or 0
 end
 
-local function wln(s)
-  if out.write then out.write(tostring(s)) else term.write(tostring(s)) end
-  if out.getCursorPos and out.setCursorPos then
-    local x,y = out.getCursorPos()
-    out.setCursorPos(1, y+1)
-  else
-    local x,y = term.getCursorPos()
-    term.setCursorPos(1, y+1)
+local function burst_send(cmd)
+  local pkt = { type = "cmd", cmd = cmd }
+  for i = 1, BURST_COUNT do
+    modem.transmit(CONTROL_ROOM_INPUT_CH, CONTROL_ROOM_REPLY_CH, pkt)
+    if i < BURST_COUNT then os.sleep(BURST_GAP_S) end
   end
-end
-
-local function log(s)
-  print(string.format("[%.3f][CONTROL_ROOM] %s", now_s(), s))
-end
-
---------------------------
--- UI STATE
---------------------------
-local ui = {
-  last_cmd      = "(none)",
-  last_cmd_t    = 0,
-  last_status_t = 0,
-  status        = nil,  -- full status table from core
-}
-
-local function draw()
-  clr()
-  wln("CONTROL ROOM (router mode)  v0.2.0")
-  wln("INPUT CH: "..CONTROL_ROOM_INPUT_CH.."   CORE CH: "..REACTOR_CHANNEL.."   REPLY CH: "..CORE_REPLY_CH)
-  wln("----------------------------------------")
-
-  local age_cmd = (ui.last_cmd_t > 0) and (now_s() - ui.last_cmd_t) or 0
-  wln(string.format("Last CMD: %s  (%.1fs ago)", ui.last_cmd, age_cmd))
-
-  local age_st = (ui.last_status_t > 0) and (now_s() - ui.last_status_t) or -1
-  wln(string.format("Last STATUS RX: %s", (ui.last_status_t > 0) and (string.format("%.1fs ago", age_st)) or "none"))
-  wln("")
-
-  if type(ui.status) ~= "table" then
-    wln("Waiting for status from reactor_core...")
-    wln("Tip: press a button or the core must answer request_status.")
-    return
-  end
-
-  local s = ui.status
-  local sens = (type(s.sensors) == "table") and s.sensors or {}
-
-  wln("CORE STATE")
-  wln("  poweredOn    = "..tostring(s.poweredOn))
-  wln("  scramLatched = "..tostring(s.scramLatched))
-  wln("  emergencyOn  = "..tostring(s.emergencyOn))
-  wln("  targetBurn   = "..tostring(s.targetBurn))
-  wln("")
-  wln("SENSORS (subset)")
-  wln("  reactor_formed = "..tostring(sens.reactor_formed))
-  wln("  burnRate       = "..tostring(sens.burnRate))
-  wln("  maxBurnReac    = "..tostring(sens.maxBurnReac))
-end
-
---------------------------
--- CORE COMMS
---------------------------
-local function send_to_core(pkt)
-  modem.transmit(REACTOR_CHANNEL, CORE_REPLY_CH, pkt)
-end
-
-local function request_status()
-  send_to_core({ type="cmd", cmd="request_status" })
 end
 
 --------------------------
 -- STARTUP
 --------------------------
-if mon and mon.setTextScale then pcall(function() mon.setTextScale(0.5) end) end
-draw()
-log("Router online. Listening for input_panel on "..CONTROL_ROOM_INPUT_CH)
+term.clear()
+term.setCursorPos(1,1)
+print("[INPUT_PANEL] v0.3.1 (poll+debounce+burst)")
+print("Wiring (TOP relay): left=SCRAM, back=POWER ON, right=CLEAR SCRAM")
+print("TX -> control_room channel "..CONTROL_ROOM_INPUT_CH)
+print("------------------------------------------------------------")
 
--- ask once at startup so monitor populates even before any button press
-request_status()
+-- per-button latch state
+local state = {}
+for k, b in pairs(BTN) do
+  state[k] = {
+    last = get_in(b),
+    armed = true,          -- becomes false after firing; re-arms when released
+    last_fire_t = -1e9
+  }
+end
 
 --------------------------
--- MAIN LOOP
+-- MAIN LOOP (polling)
 --------------------------
 while true do
-  local ev, side, ch, replyCh, msg = os.pullEvent("modem_message")
+  local t = now_s()
 
-  -- INPUT_PANEL -> CONTROL_ROOM
-  if ch == CONTROL_ROOM_INPUT_CH and type(msg) == "table" and msg.cmd then
-    ui.last_cmd   = tostring(msg.cmd)
-    ui.last_cmd_t = now_s()
+  for k, b in pairs(BTN) do
+    local cur = get_in(b)
+    local st = state[k]
 
-    log("RX input cmd="..ui.last_cmd.." -> forwarding to core")
-    send_to_core(msg)
-
-    -- force UI refresh immediately
-    request_status()
-    draw()
-
-  -- CORE -> CONTROL_ROOM
-  elseif ch == CORE_REPLY_CH then
-    if type(msg) == "table" and msg.type == "status" then
-      ui.status        = msg
-      ui.last_status_t = now_s()
-      draw()
+    -- re-arm when released
+    if cur == 0 then
+      st.armed = true
     end
+
+    -- fire on rising edge OR any high level while armed (catches ultra-short pulses)
+    if cur == 1 and st.armed and (t - st.last_fire_t) >= DEBOUNCE_S then
+      st.armed = false
+      st.last_fire_t = t
+      log(k.." pressed -> "..b.cmd.." (burst x"..BURST_COUNT..")")
+      burst_send(b.cmd)
+    end
+
+    st.last = cur
   end
+
+  os.sleep(POLL_S)
 end

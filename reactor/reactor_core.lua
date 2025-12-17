@@ -1,6 +1,9 @@
 -- reactor/reactor_core.lua
--- VERSION: 1.3.6-debug (2025-12-17)
+-- VERSION: 1.3.5-debug+ack (2025-12-17)
 
+--------------------------
+-- CONFIG
+--------------------------
 local REACTOR_SIDE             = "back"
 local MODEM_SIDE               = "right"
 local REDSTONE_ACTIVATION_SIDE = "left"
@@ -12,15 +15,40 @@ local STATUS_CHANNEL  = 250
 local SENSOR_POLL_PERIOD = 0.2
 local HEARTBEAT_PERIOD   = 10.0
 
-local DEBUG = true
+-- Optional safety thresholds (only if emergencyOn=true)
+local MAX_DAMAGE_PCT   = 5
+local MIN_COOLANT_FRAC = 0.20
+local MAX_WASTE_FRAC   = 0.90
+local MAX_HEATED_FRAC  = 0.95
 
+--------------------------
+-- PERIPHERALS
+--------------------------
 local reactor = peripheral.wrap(REACTOR_SIDE)
-if not reactor then error("No reactor logic adapter on "..REACTOR_SIDE, 0) end
+if not reactor then error("No reactor logic adapter on "..REACTOR_SIDE) end
 
 local modem = peripheral.wrap(MODEM_SIDE)
-if not modem then error("No modem on "..MODEM_SIDE, 0) end
+if not modem then error("No modem on "..MODEM_SIDE) end
 modem.open(REACTOR_CHANNEL)
 
+--------------------------
+-- DEBUG
+--------------------------
+local function now_s() return os.epoch("utc") / 1000 end
+local function ts() return string.format("%.3f", now_s()) end
+local function dbg(msg) print("["..ts().."][CORE] "..msg) end
+
+local function safe_call(name, fn, ...)
+  local ok, v = pcall(fn, ...)
+  if not ok then
+    return false, tostring(v)
+  end
+  return true, v
+end
+
+--------------------------
+-- STATE
+--------------------------
 local poweredOn    = false
 local scramLatched = false
 local emergencyOn  = true
@@ -28,82 +56,81 @@ local targetBurn   = 0
 
 local sensors = {
   reactor_formed = false,
-  reactor_active = false,
+  reactor_active = false, -- reactor.getStatus() value
   burnRate       = 0,
   maxBurnReac    = 0,
+  tempK          = 0,
+  damagePct      = 0,
+  coolantFrac    = 0,
+  heatedFrac     = 0,
+  wasteFrac      = 0,
 }
 
-local shutdownLatched = false
+local scramIssued = false
 
-local function now_s() return os.epoch("utc") / 1000 end
-local function ts() return string.format("%.3f", now_s()) end
-local function dbg(msg) if DEBUG then print("["..ts().."][CORE] "..msg) end end
-
-local function safe_call(name, fn, ...)
-  local ok, v = pcall(fn, ...)
-  if not ok then
-    dbg("FAIL "..name.." :: "..tostring(v))
-    return false, nil
-  end
-  return true, v
-end
-
-local function has_method(obj, name)
-  return type(obj) == "table" and type(obj[name]) == "function"
-end
-
+--------------------------
+-- HARD ACTIONS
+--------------------------
 local function setActivationRS(state)
   redstone.setOutput(REDSTONE_ACTIVATION_SIDE, state and true or false)
-  dbg("RS "..REDSTONE_ACTIVATION_SIDE.." = "..tostring(state))
 end
 
-local function read_active_now()
-  local okS, active = safe_call("reactor.getStatus()", reactor.getStatus)
-  local okB, burn   = safe_call("reactor.getBurnRate()", reactor.getBurnRate)
-  active = (okS and active) and true or false
-  burn   = (okB and burn) or 0
-  return active, burn
+local function rs_state()
+  return redstone.getOutput(REDSTONE_ACTIVATION_SIDE) and true or false
 end
 
-local function hard_shutdown(reason)
-  if shutdownLatched then
-    dbg("hard_shutdown skipped (latched) reason="..tostring(reason))
-    return
-  end
-  shutdownLatched = true
+local function phys_snapshot()
+  -- best-effort physical truth
+  local okS, act = safe_call("reactor.getStatus()", reactor.getStatus)
+  local okB, br  = safe_call("reactor.getBurnRate()", reactor.getBurnRate)
+  return {
+    formed = okS and true or false,
+    active = (okS and act) and true or false,
+    burn   = (okB and tonumber(br)) or 0,
+    rs     = rs_state(),
+  }
+end
 
-  dbg("HARD SHUTDOWN start reason="..tostring(reason))
-
+local function zeroOutput()
   setActivationRS(false)
-  safe_call("reactor.setBurnRate(0)", reactor.setBurnRate, 0)
 
-  if has_method(reactor, "deactivate") then safe_call("reactor.deactivate()", reactor.deactivate) end
-  if has_method(reactor, "scram") then safe_call("reactor.scram()", reactor.scram) end
-
-  local active, burn = read_active_now()
-  dbg("VERIFY after shutdown: active="..tostring(active).." burn="..tostring(burn))
-
-  if active or burn > 0 then
-    dbg("WARNING: Reactor still active after shutdown. Check REDSTONE_ACTIVATION_SIDE and external RS sources.")
+  -- only attempt scram once while off/scrammed, and only if active
+  if not scramIssued then
+    local snap = phys_snapshot()
+    if snap.formed and snap.active then
+      local ok, err = safe_call("reactor.scram()", reactor.scram)
+      if ok then
+        dbg("SCRAM call OK (physical active->off expected)")
+      else
+        -- If it errors, we still stop spamming.
+        dbg("SCRAM call FAIL: "..tostring(err))
+      end
+    end
+    scramIssued = true
   end
-end
 
-local function allow_run_outputs()
-  if shutdownLatched then dbg("run-permitted: clearing shutdown latch") end
-  shutdownLatched = false
+  -- also try to force burn to 0 (best-effort)
+  safe_call("reactor.setBurnRate(0)", reactor.setBurnRate, 0)
 end
 
 local function doScram(reason)
-  dbg("SCRAM: "..tostring(reason))
+  dbg("SCRAM: "..tostring(reason or "unknown"))
   scramLatched = true
   poweredOn    = false
-  hard_shutdown("SCRAM")
+  zeroOutput()
 end
 
+--------------------------
+-- SENSOR READ
+--------------------------
 local function readSensors()
   do
     local ok, v = safe_call("reactor.getMaxBurnRate()", reactor.getMaxBurnRate)
-    sensors.maxBurnReac = (ok and v) or 0
+    sensors.maxBurnReac = (ok and tonumber(v)) or 0
+  end
+  do
+    local ok, v = safe_call("reactor.getBurnRate()", reactor.getBurnRate)
+    sensors.burnRate = (ok and tonumber(v)) or 0
   end
   do
     local ok, v = safe_call("reactor.getStatus()", reactor.getStatus)
@@ -111,16 +138,30 @@ local function readSensors()
     sensors.reactor_active = (ok and v) and true or false
   end
   do
-    local ok, v = safe_call("reactor.getBurnRate()", reactor.getBurnRate)
-    sensors.burnRate = (ok and v) or 0
+    local ok, v = safe_call("reactor.getTemperature()", reactor.getTemperature)
+    sensors.tempK = (ok and tonumber(v)) or 0
   end
-
-  dbg("SENS formed="..tostring(sensors.reactor_formed)..
-      " active="..tostring(sensors.reactor_active)..
-      " burn="..tostring(sensors.burnRate)..
-      " cap="..tostring(sensors.maxBurnReac))
+  do
+    local ok, v = safe_call("reactor.getDamagePercent()", reactor.getDamagePercent)
+    sensors.damagePct = (ok and tonumber(v)) or 0
+  end
+  do
+    local ok, v = safe_call("reactor.getCoolantFilledPercentage()", reactor.getCoolantFilledPercentage)
+    sensors.coolantFrac = (ok and tonumber(v)) or 0
+  end
+  do
+    local ok, v = safe_call("reactor.getHeatedCoolantFilledPercentage()", reactor.getHeatedCoolantFilledPercentage)
+    sensors.heatedFrac = (ok and tonumber(v)) or 0
+  end
+  do
+    local ok, v = safe_call("reactor.getWasteFilledPercentage()", reactor.getWasteFilledPercentage)
+    sensors.wasteFrac = (ok and tonumber(v)) or 0
+  end
 end
 
+--------------------------
+-- CONTROL LAW
+--------------------------
 local function getBurnCap()
   if sensors.maxBurnReac and sensors.maxBurnReac > 0 then return sensors.maxBurnReac end
   return 20
@@ -128,31 +169,49 @@ end
 
 local function applyControl()
   if scramLatched or not poweredOn then
-    hard_shutdown(scramLatched and "scramLatched" or "poweredOff")
+    zeroOutput()
     return
   end
 
-  allow_run_outputs()
+  -- entering run-permitted state
+  scramIssued = false
+
+  if emergencyOn then
+    if (sensors.damagePct or 0) > MAX_DAMAGE_PCT then doScram("HI DAMAGE") return end
+    if (sensors.coolantFrac or 0) < MIN_COOLANT_FRAC then doScram("LO COOLANT") return end
+    if (sensors.wasteFrac or 0) > MAX_WASTE_FRAC then doScram("HI WASTE") return end
+    if (sensors.heatedFrac or 0) > MAX_HEATED_FRAC then doScram("HI HEATED") return end
+  end
+
   setActivationRS(true)
 
   local cap  = getBurnCap()
-  local burn = targetBurn or 0
+  local burn = tonumber(targetBurn) or 0
   if burn < 0 then burn = 0 end
   if burn > cap then burn = cap end
 
-  dbg("CONTROL applying burn="..tostring(burn).." cap="..tostring(cap))
   safe_call("reactor.setBurnRate()", reactor.setBurnRate, burn)
-  if burn > 0 and has_method(reactor, "activate") then
-    safe_call("reactor.activate()", reactor.activate)
-  end
 
-  local active, br = read_active_now()
-  dbg("VERIFY after control: active="..tostring(active).." burn="..tostring(br))
+  -- only call activate if not already active
+  if burn > 0 and not sensors.reactor_active then
+    local ok, err = safe_call("reactor.activate()", reactor.activate)
+    if not ok then
+      -- Treat "already active" as OK
+      if tostring(err):find("already active") then
+        -- ignore
+      else
+        dbg("activate FAIL: "..tostring(err))
+      end
+    end
+  end
 end
 
+--------------------------
+-- STATUS + PANEL
+--------------------------
 local function buildPanelStatus()
   local formed_ok = (sensors.reactor_formed == true)
-  local running   = formed_ok and poweredOn and ((sensors.burnRate or 0) > 0)
+  local running = formed_ok and poweredOn and ((sensors.burnRate or 0) > 0)
 
   return {
     status_ok      = formed_ok and emergencyOn and (not scramLatched),
@@ -171,7 +230,13 @@ local function buildPanelStatus()
     timeout_trip = false,
 
     rct_fault    = not formed_ok,
-    hi_damage=false, hi_temp=false, lo_fuel=false, hi_waste=false, lo_ccool=false, hi_hcool=false,
+
+    hi_damage = (sensors.damagePct or 0) > MAX_DAMAGE_PCT,
+    hi_temp   = false,
+    lo_fuel   = false,
+    hi_waste  = (sensors.wasteFrac or 0) > MAX_WASTE_FRAC,
+    lo_ccool  = (sensors.coolantFrac or 0) < MIN_COOLANT_FRAC,
+    hi_hcool  = (sensors.heatedFrac or 0) > MAX_HEATED_FRAC,
   }
 end
 
@@ -180,68 +245,103 @@ local function sendPanelStatus()
 end
 
 local function sendStatus(replyCh)
-  modem.transmit(replyCh or CONTROL_CHANNEL, REACTOR_CHANNEL, {
-    type="status",
-    poweredOn=poweredOn,
-    scramLatched=scramLatched,
-    emergencyOn=emergencyOn,
-    targetBurn=targetBurn,
-    sensors=sensors,
-  })
+  local msg = {
+    type         = "status",
+    poweredOn    = poweredOn,
+    scramLatched = scramLatched,
+    emergencyOn  = emergencyOn,
+    targetBurn   = targetBurn,
+    sensors      = sensors,
+  }
+  modem.transmit(replyCh or CONTROL_CHANNEL, REACTOR_CHANNEL, msg)
   sendPanelStatus()
+end
+
+local function sendAck(replyCh, id, cmd, ok, note)
+  local snap = phys_snapshot()
+  local pkt = {
+    type = "ack",
+    id   = id,
+    cmd  = cmd,
+    ok   = ok and true or false,
+    note = note,
+    phys = { active = snap.active, burn = snap.burn, rs = snap.rs, formed = snap.formed },
+  }
+  modem.transmit(replyCh or CONTROL_CHANNEL, REACTOR_CHANNEL, pkt)
 end
 
 local function sendHeartbeat()
   modem.transmit(CONTROL_CHANNEL, REACTOR_CHANNEL, { type="heartbeat", t=os.epoch("utc") })
 end
 
-local function handleCommand(cmd, data, replyCh)
-  dbg("RX CMD "..tostring(cmd).." from replyCh="..tostring(replyCh))
+--------------------------
+-- COMMANDS
+--------------------------
+local function handleCommand(cmd, data, replyCh, id, src)
+  dbg(("RX CMD cmd=%s id=%s src=%s replyCh=%s"):format(tostring(cmd), tostring(id), tostring(src), tostring(replyCh)))
 
   if cmd == "scram" then
-    doScram("Remote SCRAM")
+    -- If not physically active, scram is already satisfied.
+    local snap = phys_snapshot()
+    if not snap.active then
+      scramLatched = true
+      poweredOn = false
+      setActivationRS(false)
+      sendAck(replyCh, id, cmd, true, "already inactive")
+    else
+      doScram("Remote SCRAM")
+      sendAck(replyCh, id, cmd, true, "scram issued")
+    end
 
   elseif cmd == "power_on" then
     scramLatched = false
     poweredOn    = true
     if (targetBurn or 0) <= 0 then targetBurn = 1.0 end
-    dbg("POWER ON latch set (targetBurn="..tostring(targetBurn)..")")
+    scramIssued = false
+    sendAck(replyCh, id, cmd, true, "latched power_on")
 
   elseif cmd == "power_off" then
     poweredOn = false
-    dbg("POWER OFF latch set")
+    zeroOutput()
+    sendAck(replyCh, id, cmd, true, "powered_off")
 
   elseif cmd == "clear_scram" then
     scramLatched = false
-    dbg("SCRAM CLEARED latch set")
+    scramIssued = false
+    sendAck(replyCh, id, cmd, true, "scram cleared")
 
   elseif cmd == "set_target_burn" then
     if type(data) == "number" then
       targetBurn = data
-      dbg("TARGET BURN set to "..tostring(targetBurn))
+      sendAck(replyCh, id, cmd, true, "targetBurn="..tostring(targetBurn))
+    else
+      sendAck(replyCh, id, cmd, false, "bad data")
     end
 
   elseif cmd == "request_status" then
-    dbg("request_status")
+    sendAck(replyCh, id, cmd, true, "status sent")
+
+  else
+    sendAck(replyCh, id, cmd, false, "unknown cmd")
   end
 
-  local active, br = read_active_now()
-  dbg("PHYS snapshot: active="..tostring(active).." burn="..tostring(br))
   sendStatus(replyCh or CONTROL_CHANNEL)
 end
 
+--------------------------
+-- MAIN
+--------------------------
 term.clear()
 term.setCursorPos(1,1)
 
 readSensors()
-dbg("Online. RX="..REACTOR_CHANNEL.." CTRL="..CONTROL_CHANNEL.." PANEL="..STATUS_CHANNEL..
-    " RS_SIDE="..REDSTONE_ACTIVATION_SIDE.." REACTOR_SIDE="..REACTOR_SIDE)
+dbg("Online. RX="..REACTOR_CHANNEL.." CTRL="..CONTROL_CHANNEL.." PANEL="..STATUS_CHANNEL)
 
 local sensorTimer    = os.startTimer(SENSOR_POLL_PERIOD)
 local heartbeatTimer = os.startTimer(HEARTBEAT_PERIOD)
 
 while true do
-  local ev, p1, p2, p3, p4 = os.pullEvent()
+  local ev, p1, p2, p3, p4, p5 = os.pullEvent()
 
   if ev == "timer" then
     if p1 == sensorTimer then
@@ -255,9 +355,9 @@ while true do
     end
 
   elseif ev == "modem_message" then
-    local ch, replyCh, msg = p2, p3, p4
-    if ch == REACTOR_CHANNEL and type(msg) == "table" and msg.cmd ~= nil then
-      handleCommand(msg.cmd, msg.data, replyCh)
+    local side, ch, replyCh, msg, dist = p1, p2, p3, p4, p5
+    if ch == REACTOR_CHANNEL and type(msg) == "table" and msg.cmd then
+      handleCommand(msg.cmd, msg.data, replyCh, msg.id, msg.src)
     end
   end
 end

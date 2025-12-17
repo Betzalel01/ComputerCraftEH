@@ -1,79 +1,83 @@
 -- reactor/input_panel.lua
--- VERSION: 1.0.1 (2025-12-16)
--- Fix: relay face assignments avoid shared block-space collisions.
+-- VERSION: 0.3.0-debug (2025-12-16)
+-- Fix: robust modem discovery (prevents 'modem.open is nil' when wrong side wrapped)
 
-local MODEM_SIDE     = "right"
-local CORE_CHANNEL   = 100
-local INPUT_REPLY_CH = 101
+-----------------------
+-- CONFIG (match your reactor_core.lua)
+-----------------------
+local REACTOR_CHANNEL    = 100   -- reactor_core listens here
+local INPUT_REPLY_CH     = 101   -- where replies may come back (ok to share with control room)
+local STATUS_CHANNEL     = 250   -- optional: if you want to send/trigger anything related to panel
 
-local modem = peripheral.wrap(MODEM_SIDE)
-if not modem then error("No modem on "..MODEM_SIDE) end
+-----------------------
+-- DEBUG PRINT
+-----------------------
+local function dbg(s)
+  print(("[INPUT_PANEL][DBG] %s"):format(s))
+end
+
+-----------------------
+-- MODEM DISCOVERY (FIX)
+-----------------------
+local modem_name, modem = peripheral.find("modem", function(name, p)
+  return type(p) == "table" and type(p.open) == "function" and type(p.transmit) == "function"
+end)
+
+if not modem then
+  print("[INPUT_PANEL][ERR] No modem peripheral with open()+transmit() found.")
+  print("[INPUT_PANEL][ERR] Detected peripherals on each side:")
+  for _, side in ipairs({"top","bottom","left","right","front","back"}) do
+    local t = peripheral.getType(side)
+    if t then print(("  %s: %s"):format(side, t)) end
+  end
+  error("Attach a modem (wired/wireless) to this computer, or connect one via a modem cable.", 0)
+end
+
+dbg("Using modem: "..tostring(modem_name))
 modem.open(INPUT_REPLY_CH)
+dbg("Opened reply channel: "..tostring(INPUT_REPLY_CH))
 
--- Relays attached to the computer (all sides except front)
-local relay_top    = peripheral.wrap("top")
-local relay_left   = peripheral.wrap("left")
-local relay_right  = peripheral.wrap("right")
-local relay_bottom = peripheral.wrap("bottom")
-
-if not relay_top    then error("Missing redstone_relay on TOP") end
-if not relay_left   then error("Missing redstone_relay on LEFT") end
-if not relay_right  then error("Missing redstone_relay on RIGHT") end
-if not relay_bottom then error("Missing redstone_relay on BOTTOM") end
-
-local function send(cmd, data)
-  modem.transmit(CORE_CHANNEL, INPUT_REPLY_CH, { type="cmd", cmd=cmd, data=data })
+-----------------------
+-- COMMAND SEND HELPERS
+-----------------------
+local function send_cmd(cmd, data)
+  local msg = { type = "cmd", cmd = cmd, data = data }
+  modem.transmit(REACTOR_CHANNEL, INPUT_REPLY_CH, msg)
+  dbg(("TX cmd=%s data=%s -> ch=%d reply=%d"):format(
+    tostring(cmd),
+    (data == nil) and "nil" or tostring(data),
+    REACTOR_CHANNEL,
+    INPUT_REPLY_CH
+  ))
 end
 
--- edge detection for buttons
-local last = {}
-local function rising(id, v)
-  local p = last[id] or false
-  last[id] = v
-  return v and not p
-end
+-----------------------
+-- MINIMAL INPUT LOOP (stub)
+-- Replace this with your relay wiring reads once modem is confirmed working.
+-----------------------
+dbg("Ready. Press:")
+dbg("  S = SCRAM")
+dbg("  P = POWER ON")
+dbg("  C = CLEAR SCRAM")
+dbg("  Q = quit")
 
 while true do
-  -- =========================
-  -- TOP RELAY (NO OVERLAPS)
-  -- =========================
-  -- TOP relay: top + front only
-  if rising("scram", relay_top.getInput("top")) then
-    send("scram")
+  local ev, p1 = os.pullEvent()
+
+  if ev == "char" then
+    local ch = string.lower(p1)
+    if ch == "s" then
+      send_cmd("scram")
+    elseif ch == "p" then
+      send_cmd("power_on")
+    elseif ch == "c" then
+      send_cmd("clear_scram")
+    elseif ch == "q" then
+      dbg("Quit.")
+      break
+    end
+
+  elseif ev == "modem_message" then
+    local side, channel, replyCh, msg = p1, select(2, os.pullEventRaw()) -- not used in this minimal stub
   end
-
-  if rising("start", relay_top.getInput("front")) then
-    send("power_on")
-  end
-
-  -- =========================
-  -- LEFT RELAY (NO OVERLAPS)
-  -- =========================
-  -- LEFT relay: left + front + back only
-  local burn    = relay_left.getAnalogInput("left")   -- 0..15
-  local fuel    = relay_left.getAnalogInput("front")  -- 0..15
-  local coolant = relay_left.getAnalogInput("back")   -- 0..15
-
-  send("set_target_burn", burn)
-  send("set_fuel_valve",  fuel)
-  send("set_coolant_valve", coolant)
-
-  -- =========================
-  -- RIGHT RELAY (NO OVERLAPS)
-  -- =========================
-  -- RIGHT relay: right + front only
-  local steam = relay_right.getAnalogInput("right")   -- 0..15
-  local waste = relay_right.getAnalogInput("front")   -- 0..15
-
-  send("set_steam_valve", steam)
-  send("set_waste_valve", waste)
-
-  -- =========================
-  -- BOTTOM RELAY (NO OVERLAPS)
-  -- =========================
-  -- BOTTOM relay: bottom + front only
-  send("set_emergency", relay_bottom.getInput("bottom"))
-  send("set_auto_power", relay_bottom.getInput("front"))
-
-  sleep(0.1)
 end

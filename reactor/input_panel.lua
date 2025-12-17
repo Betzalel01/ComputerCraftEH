@@ -1,85 +1,106 @@
 -- reactor/input_panel.lua
--- VERSION: 0.3.0-debug (2025-12-16)
--- Fix: robust modem discovery (prevents 'modem.open is nil' when wrong side wrapped)
+-- VERSION: 1.0.0 (2025-12-16)
+-- Minimal INPUT PANEL: 3 buttons only
+--   SCRAM       = Top relay, TOP face
+--   POWER ON    = Top relay, RIGHT face
+--   CLEAR SCRAM = Top relay, LEFT face
+--
+-- Wiring assumption:
+--   - This computer has a modem attached (front is recommended).
+--   - There is a redstone_relay on the TOP of this computer.
+--   - Your physical buttons in the control room drive the specified relay faces (via Create links).
 
------------------------
--- CONFIG (match your reactor_core.lua)
------------------------
-local REACTOR_CHANNEL    = 100   -- reactor_core listens here
-local INPUT_REPLY_CH     = 101   -- where replies may come back (ok to share with control room)
-local STATUS_CHANNEL     = 250   -- optional: if you want to send/trigger anything related to panel
+--------------------------
+-- CONFIG
+--------------------------
+local REACTOR_CHANNEL = 100          -- reactor_core listens here
+local REPLY_CHANNEL   = 103          -- unique reply channel for this input panel
+local POLL_S          = 0.05         -- button scan rate
 
------------------------
--- DEBUG PRINT
------------------------
-local function dbg(s)
-  print(("[INPUT_PANEL][DBG] %s"):format(s))
+-- Relay and face mapping (COMPARTMENTALIZED: all 3 on TOP relay)
+local RELAY_SIDE      = "top"        -- the relay block attached to the top of this computer
+
+local BTN_SCRAM_FACE  = "top"        -- top relay, top face
+local BTN_PWR_FACE    = "right"      -- top relay, right face
+local BTN_CLR_FACE    = "left"       -- top relay, left face
+
+--------------------------
+-- PERIPHERALS
+--------------------------
+local modem = peripheral.find("modem")
+if not modem then error("No modem attached to input computer.", 0) end
+modem.open(REPLY_CHANNEL)
+
+local relay = peripheral.wrap(RELAY_SIDE)
+if not relay then error("No redstone_relay on "..RELAY_SIDE, 0) end
+
+--------------------------
+-- HELPERS
+--------------------------
+local function log(msg)
+  print(("[INPUT_PANEL] %s"):format(msg))
 end
 
------------------------
--- MODEM DISCOVERY (FIX)
------------------------
--- MODEM (FIX)
--- Your relays occupy every side except "front", so modem must be on "front".
-local MODEM_SIDE = "front"
-
-local modem = peripheral.wrap(MODEM_SIDE)
-if not modem or type(modem.open) ~= "function" or type(modem.transmit) ~= "function" then
-  -- fallback: find any modem on the network
-  local name
-  name, modem = peripheral.find("modem", function(n, p)
-    return type(p) == "table" and type(p.open) == "function" and type(p.transmit) == "function"
-  end)
-
-  if not modem then
-    error("No modem found. Put a modem on FRONT (recommended) or attach one via wired modem network.", 0)
-  end
-end
-
--- now safe
-modem.open(INPUT_REPLY_CH)
-
------------------------
--- COMMAND SEND HELPERS
------------------------
 local function send_cmd(cmd, data)
-  local msg = { type = "cmd", cmd = cmd, data = data }
-  modem.transmit(REACTOR_CHANNEL, INPUT_REPLY_CH, msg)
-  dbg(("TX cmd=%s data=%s -> ch=%d reply=%d"):format(
-    tostring(cmd),
-    (data == nil) and "nil" or tostring(data),
-    REACTOR_CHANNEL,
-    INPUT_REPLY_CH
-  ))
+  modem.transmit(REACTOR_CHANNEL, REPLY_CHANNEL, {
+    type = "cmd",
+    cmd  = cmd,
+    data = data
+  })
+  log("SENT cmd="..tostring(cmd))
 end
 
------------------------
--- MINIMAL INPUT LOOP (stub)
--- Replace this with your relay wiring reads once modem is confirmed working.
------------------------
-dbg("Ready. Press:")
-dbg("  S = SCRAM")
-dbg("  P = POWER ON")
-dbg("  C = CLEAR SCRAM")
-dbg("  Q = quit")
+-- rising edge detector: true only when input transitions 0->1 (or false->true)
+local function rising(state, key, current)
+  local prev = state[key] or false
+  state[key] = current and true or false
+  return (not prev) and state[key]
+end
+
+--------------------------
+-- MAIN
+--------------------------
+term.clear()
+term.setCursorPos(1, 1)
+log("Ready. Buttons:")
+log(("  SCRAM       = %s relay, %s face"):format(RELAY_SIDE, BTN_SCRAM_FACE))
+log(("  POWER ON    = %s relay, %s face"):format(RELAY_SIDE, BTN_PWR_FACE))
+log(("  CLEAR SCRAM = %s relay, %s face"):format(RELAY_SIDE, BTN_CLR_FACE))
+log(("  TX -> ch %d (reply ch %d)"):format(REACTOR_CHANNEL, REPLY_CHANNEL))
+
+local edge = {}
 
 while true do
-  local ev, p1 = os.pullEvent()
+  -- read button inputs from the TOP relay
+  local scram_in = relay.getInput(BTN_SCRAM_FACE)
+  local pwr_in   = relay.getInput(BTN_PWR_FACE)
+  local clr_in   = relay.getInput(BTN_CLR_FACE)
 
-  if ev == "char" then
-    local ch = string.lower(p1)
-    if ch == "s" then
-      send_cmd("scram")
-    elseif ch == "p" then
-      send_cmd("power_on")
-    elseif ch == "c" then
-      send_cmd("clear_scram")
-    elseif ch == "q" then
-      dbg("Quit.")
-      break
-    end
-
-  elseif ev == "modem_message" then
-    local side, channel, replyCh, msg = p1, select(2, os.pullEventRaw()) -- not used in this minimal stub
+  -- fire commands on rising edge only (button press)
+  if rising(edge, "scram", scram_in) then
+    send_cmd("scram")
   end
+  if rising(edge, "pwr", pwr_in) then
+    send_cmd("power_on")
+  end
+  if rising(edge, "clr", clr_in) then
+    send_cmd("clear_scram")
+  end
+
+  -- optional: show any replies (status frames, etc.)
+  local ev, p1, p2, p3, p4 = os.pullEventRaw()
+  if ev == "modem_message" then
+    local ch, msg = p2, p4
+    if ch == REPLY_CHANNEL and type(msg) == "table" then
+      if msg.type == "status" then
+        log(("REPLY status: poweredOn=%s scramLatched=%s emergencyOn=%s targetBurn=%s"):format(
+          tostring(msg.poweredOn), tostring(msg.scramLatched), tostring(msg.emergencyOn), tostring(msg.targetBurn)
+        ))
+      end
+    end
+  elseif ev == "terminate" then
+    break
+  end
+
+  os.sleep(POLL_S)
 end

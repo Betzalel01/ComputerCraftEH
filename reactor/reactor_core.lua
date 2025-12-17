@@ -1,14 +1,9 @@
 -- reactor/reactor_core.lua
--- VERSION: 1.3.4 (2025-12-16)
+-- VERSION: 1.3.5 (2025-12-17)
 --
--- Fixes:
---   * Removes duplicate zeroOutput() override bug (was causing infinite scram spam).
---   * scram() is attempted ONLY when reactor is actually active, and only once per "off/scram period".
---   * Resets scramIssued latch when entering a run-permitted state.
---   * Panel fields aligned with status_display.lua v1.2.6+:
---       reactor_formed : adapter reachable (pcall(getStatus) succeeded)
---       reactor_on     : actually burning (burnRate > 0 while poweredOn and formed)
---       rct_fault      : only means adapter unreachable
+-- Fix:
+--   Panel field reactor_on now reflects sensors.reactor_active (Mekanism getStatus()),
+--   not burnRate (which can be a setpoint).
 
 --------------------------
 -- CONFIG
@@ -24,7 +19,6 @@ local STATUS_CHANNEL  = 250
 local SENSOR_POLL_PERIOD = 0.2
 local HEARTBEAT_PERIOD   = 10.0
 
--- Optional safety thresholds (used only if emergencyOn = true)
 local MAX_DAMAGE_PCT   = 5
 local MIN_COOLANT_FRAC = 0.20
 local MAX_WASTE_FRAC   = 0.90
@@ -50,7 +44,7 @@ local targetBurn   = 0
 
 local sensors = {
   reactor_formed = false,
-  reactor_active = false, -- getStatus() value (true when active)
+  reactor_active = false,
   burnRate       = 0,
   maxBurnReac    = 0,
 
@@ -61,11 +55,10 @@ local sensors = {
   wasteFrac    = 0,
 }
 
--- prevents spamming scram when reactor is inactive
 local scramIssued = false
 
 --------------------------
--- DEBUG (minimal)
+-- DEBUG
 --------------------------
 local function now_s() return os.epoch("utc") / 1000 end
 local function ts() return string.format("%.3f", now_s()) end
@@ -90,7 +83,6 @@ end
 local function zeroOutput()
   setActivationRS(false)
 
-  -- Only attempt scram if reactor is actually active; only once per "off/scram period"
   if not scramIssued then
     local okS, active = pcall(reactor.getStatus)
     if okS and active then
@@ -158,16 +150,13 @@ local function getBurnCap()
 end
 
 local function applyControl()
-  -- Off or scrammed => ensure output is cut (and do not spam scram)
   if scramLatched or not poweredOn then
     zeroOutput()
     return
   end
 
-  -- entering run-permitted state; allow future scram attempts again
   scramIssued = false
 
-  -- emergency safety checks (only if enabled)
   if emergencyOn then
     if (sensors.damagePct or 0) > MAX_DAMAGE_PCT then
       doScram(string.format("Damage %.2f%% > %.2f%%", sensors.damagePct, MAX_DAMAGE_PCT))
@@ -206,8 +195,8 @@ end
 local function buildPanelStatus()
   local formed_ok = (sensors.reactor_formed == true)
 
-  -- running = actually burning (burn rate > 0), while operator has poweredOn
-  local running = formed_ok and poweredOn and ((sensors.burnRate or 0) > 0)
+  -- IMPORTANT: use actual Mekanism status for "on"
+  local running = formed_ok and poweredOn and (sensors.reactor_active == true)
 
   return {
     status_ok      = formed_ok and emergencyOn and (not scramLatched),

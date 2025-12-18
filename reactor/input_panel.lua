@@ -1,25 +1,19 @@
 -- reactor/input_panel.lua
 -- VERSION: 0.5.0 (2025-12-17)
--- INPUT PANEL -> CONTROL ROOM
--- - Edge-detects 1-tick button pulses via redstone events
--- - Sends cmd to CONTROL_ROOM_INPUT_CH with unique id
--- - Retries a few times UNTIL control room ACKs (proves CR received it)
+-- Sends button pulses to CONTROL ROOM (not directly to core).
+-- Shows ACK from control_room so 1-tick buttons feel reliable.
+
+local CONTROL_ROOM_CH = 102
+local ACK_CH          = 103  -- input_panel listens here for ACKs
 
 --------------------------
--- CHANNELS
---------------------------
-local CONTROL_ROOM_INPUT_CH = 102
-local INPUT_REPLY_CH        = 103  -- this panel listens here for ACKs from control_room
-
---------------------------
--- MODEM (robust detect)
+-- MODEM
 --------------------------
 local modem = peripheral.find("modem", function(_, p)
   return type(p) == "table" and type(p.transmit) == "function" and type(p.open) == "function"
 end)
 if not modem then error("No modem found on input panel computer", 0) end
-
-pcall(function() modem.open(INPUT_REPLY_CH) end)
+modem.open(ACK_CH)
 
 --------------------------
 -- RELAY (TOP)
@@ -30,100 +24,69 @@ if not relay_top or peripheral.getType("top") ~= "redstone_relay" then
 end
 
 --------------------------
--- BUTTON MAP (your wiring)
+-- MAPPING (your current)
 --------------------------
 local BTN = {
-  POWER_ON    = { relay = relay_top, relay_name = "top", side = "right", cmd = "power_on" },
-  SCRAM       = { relay = relay_top, relay_name = "top", side = "top",   cmd = "scram" },
-  CLEAR_SCRAM = { relay = relay_top, relay_name = "top", side = "back",  cmd = "clear_scram" },
+  POWER_ON    = { relay=relay_top, side="right", cmd="power_on"    },
+  SCRAM       = { relay=relay_top, side="top",   cmd="scram"       },
+  CLEAR_SCRAM = { relay=relay_top, side="back",  cmd="clear_scram" },
 }
 
 --------------------------
--- DEBUG
+-- HELPERS
 --------------------------
-local function now_ms() return os.epoch("utc") end
-local function now_s()  return now_ms() / 1000 end
+local function now_s() return os.epoch("utc") / 1000 end
 local function log(msg) print(string.format("[%.3f][INPUT_PANEL] %s", now_s(), msg)) end
 
 local function get_in(b)
   local ok, v = pcall(b.relay.getInput, b.side)
   if not ok then return 0 end
-  return v and 1 or 0
+  return (v and 1 or 0)
 end
 
-local function rising(prev, cur) return (prev == 0) and (cur == 1) end
+local function rising(prev, cur) return (prev==0 and cur==1) end
 
---------------------------
--- SEND WITH ACK (from CONTROL ROOM)
---------------------------
-local function make_id(prefix)
-  -- enough uniqueness for CC
-  return string.format("%s-%d-%d", prefix, now_ms(), math.random(1000,9999))
-end
-
-local function wait_for_ack(id, timeout_s)
-  local deadline = now_s() + timeout_s
-  while now_s() < deadline do
-    local ev, side, ch, replyCh, msg = os.pullEvent()
-    if ev == "modem_message" and ch == INPUT_REPLY_CH and type(msg) == "table" then
-      if msg.type == "ack" and msg.id == id then
-        return true, msg
-      end
-    end
-  end
-  return false, nil
-end
-
-local function send_cmd_to_control_room(cmd)
-  local id = make_id("IP")
-  local pkt = { type="cmd", cmd=cmd, id=id, from="input_panel" }
-
-  -- short, non-spam retry: prove CR received it
-  local tries = 4
-  for i = 1, tries do
-    log(string.format("TX -> CONTROL_ROOM ch=%d cmd=%s id=%s try=%d/%d", CONTROL_ROOM_INPUT_CH, cmd, id, i, tries))
-    modem.transmit(CONTROL_ROOM_INPUT_CH, INPUT_REPLY_CH, pkt)
-
-    local ok, ack = wait_for_ack(id, 0.25)
-    if ok then
-      log(string.format("ACK from CONTROL_ROOM id=%s (accepted=%s note=%s)", id, tostring(ack.accepted), tostring(ack.note)))
-      return
-    end
-  end
-
-  log("NO ACK from CONTROL_ROOM (check CR modem/channel/range). id="..id)
+local function send_cmd(cmd)
+  local id = "IP-"..tostring(os.epoch("utc")).."-"..tostring(math.random(1000,9999))
+  local pkt = { cmd=cmd, id=id }
+  modem.transmit(CONTROL_ROOM_CH, ACK_CH, pkt)
+  log("TX -> CONTROL_ROOM ch="..CONTROL_ROOM_CH.." cmd="..cmd.." id="..id)
 end
 
 --------------------------
--- STARTUP PRINT
+-- UI
 --------------------------
 term.clear()
 term.setCursorPos(1,1)
-print(string.format("[INPUT_PANEL] v0.5.0 -> CONTROL_ROOM CH %d (ACK on %d)", CONTROL_ROOM_INPUT_CH, INPUT_REPLY_CH))
-print("POWER_ON    = top relay, side right")
-print("SCRAM       = top relay, side top")
-print("CLEAR_SCRAM = top relay, side back")
+print("[INPUT_PANEL] v0.5.0 -> CONTROL_ROOM CH "..CONTROL_ROOM_CH.." (ACK on "..ACK_CH..")")
+print("POWER_ON     = top relay, side right")
+print("SCRAM        = top relay, side top")
+print("CLEAR_SCRAM  = top relay, side back")
 print("Waiting for redstone pulses...")
 
---------------------------
--- EDGE STATE INIT
---------------------------
 local prev = {}
-for k, b in pairs(BTN) do prev[k] = get_in(b) end
+for k,b in pairs(BTN) do prev[k] = get_in(b) end
 
 --------------------------
--- MAIN LOOP
+-- MAIN
 --------------------------
 while true do
-  local ev = os.pullEvent()
+  local ev, p1, p2, p3, p4 = os.pullEvent()
+
   if ev == "redstone" then
-    for k, b in pairs(BTN) do
+    for k,b in pairs(BTN) do
       local cur = get_in(b)
       if rising(prev[k], cur) then
-        log(k.." pressed ("..b.relay_name.."."..b.side..") -> "..b.cmd)
-        send_cmd_to_control_room(b.cmd)
+        log(k.." pressed (top."..b.side..") -> "..b.cmd)
+        send_cmd(b.cmd)
       end
       prev[k] = cur
+    end
+
+  elseif ev == "modem_message" then
+    local ch, replyCh, msg = p2, p3, p4
+    if ch == ACK_CH and type(msg) == "table" and msg.type == "ack" then
+      log("ACK from CONTROL_ROOM id="..tostring(msg.id).." (accepted="..tostring(msg.ok)..") note="..tostring(msg.note))
     end
   end
 end

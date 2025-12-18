@@ -1,5 +1,9 @@
 -- reactor/control_room.lua
--- VERSION: 0.3.0-router+ui-confirm+ack (2025-12-17)
+-- VERSION: 0.3.1 (2025-12-17) fix satisfied-logic + less spam
+--
+-- * power_on "already satisfied" is based on CORE LATCH poweredOn, not physical burnRate.
+-- * still shows physical sensors for debugging.
+-- * polls status only when pending.
 
 --------------------------
 -- CHANNELS
@@ -42,39 +46,44 @@ local function clr()
   if out.setCursorPos then out.setCursorPos(1,1) else term.setCursorPos(1,1) end
   ui_y = 1
 end
-
 local function wln(s)
   if out.setCursorPos then out.setCursorPos(1, ui_y) else term.setCursorPos(1, ui_y) end
   if out.write then out.write(tostring(s)) else term.write(tostring(s)) end
   ui_y = ui_y + 1
 end
 
-local function tx_core(pkt)
+local function send_to_core(pkt)
   modem.transmit(REACTOR_CHANNEL, CORE_REPLY_CH, pkt)
-  log("TX -> CORE ch="..REACTOR_CHANNEL.." cmd="..tostring(pkt.cmd).." id="..tostring(pkt.id))
 end
 
-local function request_status()
-  tx_core({ cmd="request_status", id="CR-REQ-"..tostring(os.epoch("utc")) })
+local function request_status(id)
+  send_to_core({ cmd="request_status", type="cmd", id=id, src="control_room" })
 end
 
 --------------------------
 -- STATUS INTERPRETATION
 --------------------------
-local function status_actual_running(st)
+local function phys_running(st)
   if type(st) ~= "table" then return false end
   local sens = (type(st.sensors) == "table") and st.sensors or {}
-  return (sens.reactor_formed == true) and ((tonumber(sens.burnRate) or 0) > 0)
+  local formed = (sens.reactor_formed == true)
+  local burn   = tonumber(sens.burnRate) or 0
+  return formed and (burn > 0)
 end
 
-local function status_matches(cmd, st)
+-- IMPORTANT FIX:
+-- "already satisfied" should be based on the CORE latch for operator commands.
+local function cmd_satisfied(cmd, st)
   if type(st) ~= "table" then return false end
+  local poweredOn    = (st.poweredOn == true)
+  local scramLatched  = (st.scramLatched == true)
+
   if cmd == "power_on" then
-    return status_actual_running(st)
+    return poweredOn
   elseif cmd == "scram" then
-    return (st.scramLatched == true)
+    return scramLatched
   elseif cmd == "clear_scram" then
-    return (st.scramLatched ~= true)
+    return not scramLatched
   end
   return false
 end
@@ -83,42 +92,37 @@ end
 -- UI STATE
 --------------------------
 local ui = {
-  last_btn      = "(none)",
-  last_btn_t    = 0,
+  last_cmd      = "(none)",
+  last_cmd_t    = 0,
   last_status_t = 0,
   status        = nil,
-  last_ack_t    = 0,
-  last_ack      = "(none)",
 }
 
 local pending = nil
--- pending = { cmd=..., id=..., issued_at=..., source=... }
+-- pending = { cmd=..., id=..., issued_at=..., src=... }
 
 local function draw()
   clr()
-  wln("CONTROL ROOM (confirm+ack router)  v0.3.0")
-  wln("INPUT "..CONTROL_ROOM_INPUT_CH.."  CORE "..REACTOR_CHANNEL.."  REPLY "..CORE_REPLY_CH)
+  wln("CONTROL ROOM (confirm router+ACK)  v0.3.1")
+  wln("IN "..CONTROL_ROOM_INPUT_CH.."  CORE "..REACTOR_CHANNEL.."  REPLY "..CORE_REPLY_CH)
   wln("Keys: P=power_on  S=scram  C=clear_scram  Q=quit")
   wln("----------------------------------------")
 
-  local age_btn = (ui.last_btn_t > 0) and (now_s() - ui.last_btn_t) or 0
-  wln(string.format("Last IN: %s (%.1fs)", ui.last_btn, age_btn))
+  local age_cmd = (ui.last_cmd_t > 0) and (now_s() - ui.last_cmd_t) or 0
+  wln(string.format("Last CMD: %s (%.1fs)", ui.last_cmd, age_cmd))
 
   local age_st = (ui.last_status_t > 0) and (now_s() - ui.last_status_t) or -1
   wln("Last STATUS: "..((ui.last_status_t > 0) and (string.format("%.1fs", age_st)) or "none"))
 
-  local age_ack = (ui.last_ack_t > 0) and (now_s() - ui.last_ack_t) or -1
-  wln("Last ACK: "..ui.last_ack.." "..((ui.last_ack_t > 0) and (string.format("(%.1fs)", age_ack)) or ""))
-
   if pending then
     local age_p = now_s() - pending.issued_at
-    wln(string.format("PENDING: %s id=%s (%.1fs/%.1fs) src=%s",
-      pending.cmd, pending.id, age_p, PENDING_TIMEOUT_S, pending.source))
+    wln(string.format("PENDING: %s id=%s (%.1fs/%.1fs)", pending.cmd, pending.id, age_p, PENDING_TIMEOUT_S))
   else
     wln("PENDING: none")
   end
 
   wln("")
+
   if type(ui.status) ~= "table" then
     wln("Waiting for status...")
     return
@@ -127,24 +131,29 @@ local function draw()
   local st = ui.status
   local sens = (type(st.sensors) == "table") and st.sensors or {}
 
-  wln("CORE (latched)")
+  wln("CORE LATCH")
   wln("  poweredOn    = "..tostring(st.poweredOn))
   wln("  scramLatched = "..tostring(st.scramLatched))
-  wln("  last_cmd_id  = "..tostring(st.last_cmd_id))
   wln("")
-  wln("PHYSICAL (verified)")
+
+  wln("PHYSICAL (from sensors)")
   wln("  formed   = "..tostring(sens.reactor_formed))
-  wln("  active   = "..tostring(sens.reactor_active))
   wln("  burnRate = "..tostring(sens.burnRate))
-  wln("  running  = "..tostring(status_actual_running(st)))
+  wln("  running  = "..tostring(phys_running(st)))
 end
 
 --------------------------
--- COMMAND GATE
+-- COMMAND ISSUE
 --------------------------
-local function issue(cmd, source)
-  if ui.status and status_matches(cmd, ui.status) then
-    log("IGNORED "..cmd.." (already satisfied by status)")
+local function new_id(prefix)
+  return string.format("CR-%s-%d-%d", prefix, os.epoch("utc"), math.random(1000,9999))
+end
+
+local function issue(cmd, src)
+  src = src or "control_room"
+
+  if ui.status and cmd_satisfied(cmd, ui.status) then
+    log("IGNORED "..cmd.." (already satisfied by latch)")
     return
   end
 
@@ -154,11 +163,15 @@ local function issue(cmd, source)
       log("IGNORED "..cmd.." (pending "..pending.cmd..")")
       return
     end
+    pending = nil
   end
 
-  local id = "CR-"..tostring(os.epoch("utc")).."-"..tostring(math.random(1000,9999))
-  pending = { cmd=cmd, id=id, issued_at=now_s(), source=source or "unknown" }
-  tx_core({ cmd=cmd, id=id })
+  local id = new_id(cmd)
+  log("TX "..cmd.." -> core id="..id.." src="..src)
+  send_to_core({ type="cmd", cmd=cmd, id=id, src=src })
+  pending = { cmd=cmd, id=id, issued_at=now_s(), src=src }
+
+  request_status(new_id("REQ"))
   draw()
 end
 
@@ -169,7 +182,7 @@ math.randomseed(os.epoch("utc"))
 if mon and mon.setTextScale then pcall(function() mon.setTextScale(0.5) end) end
 draw()
 log("Online.")
-request_status()
+request_status(new_id("BOOT"))
 
 --------------------------
 -- MAIN LOOP
@@ -182,44 +195,42 @@ while true do
   if ev == "modem_message" then
     local ch, replyCh, msg = p2, p3, p4
 
-    -- INPUT PANEL -> CONTROL ROOM
+    -- from input_panel
     if ch == CONTROL_ROOM_INPUT_CH and type(msg) == "table" and msg.cmd then
-      ui.last_btn   = "IP:"..tostring(msg.cmd)
-      ui.last_btn_t = now_s()
-      log("RX from input_panel cmd="..tostring(msg.cmd).." id="..tostring(msg.id).." rep="..tostring(replyCh))
-
-      -- immediate ACK back to input_panel so 1-tick buttons feel reliable
-      modem.transmit(replyCh, CORE_REPLY_CH, {
-        type="ack", id=msg.id, cmd=msg.cmd, ok=true, note="received_by_control_room"
-      })
-
+      ui.last_cmd   = tostring(msg.cmd).." from input_panel"
+      ui.last_cmd_t = now_s()
       issue(msg.cmd, "input_panel")
+      -- reply to input_panel if it asked for it
+      if type(msg.replyCh) == "number" and msg.id then
+        modem.transmit(msg.replyCh, CONTROL_ROOM_INPUT_CH, {
+          type="ack", id=msg.id, accepted=true, note="received_by_control_room"
+        })
+      end
 
-    -- CORE -> CONTROL ROOM
+    -- from core
     elseif ch == CORE_REPLY_CH and type(msg) == "table" then
-      if msg.type == "ack" then
-        ui.last_ack_t = now_s()
-        ui.last_ack   = "cmd="..tostring(msg.cmd).." id="..tostring(msg.id).." ok="..tostring(msg.ok).." "..tostring(msg.note or "")
-        log("ACK from core "..ui.last_ack)
-
-      elseif msg.type == "status" then
+      if msg.type == "status" then
         ui.status        = msg
         ui.last_status_t = now_s()
-        if pending and status_matches(pending.cmd, ui.status) then
-          log("CONFIRMED by status cmd="..pending.cmd.." id="..pending.id)
+
+        if pending and cmd_satisfied(pending.cmd, ui.status) then
+          log("CONFIRMED "..pending.cmd.." (latch now matches) id="..pending.id)
           pending = nil
         end
+        draw()
+
+      elseif msg.type == "ack" then
+        log("ACK from core id="..tostring(msg.id).." ok="..tostring(msg.ok).." note="..tostring(msg.note))
       end
-      draw()
     end
 
   elseif ev == "char" then
-    local c = tostring(p1):lower()
-    if c == "q" then return end
-    if c == "p" then ui.last_btn="KB:power_on"; ui.last_btn_t=now_s(); issue("power_on", "keyboard") end
-    if c == "s" then ui.last_btn="KB:scram"; ui.last_btn_t=now_s(); issue("scram", "keyboard") end
-    if c == "c" then ui.last_btn="KB:clear_scram"; ui.last_btn_t=now_s(); issue("clear_scram", "keyboard") end
-    draw()
+    local c = p1
+    if c == "p" or c == "P" then issue("power_on", "keyboard")
+    elseif c == "s" or c == "S" then issue("scram", "keyboard")
+    elseif c == "c" or c == "C" then issue("clear_scram", "keyboard")
+    elseif c == "q" or c == "Q" then return
+    end
 
   elseif ev == "timer" and p1 == poll_timer then
     if pending then
@@ -227,11 +238,10 @@ while true do
       if age >= PENDING_TIMEOUT_S then
         log("TIMEOUT "..pending.cmd.." id="..pending.id.." (clearing pending)")
         pending = nil
+        draw()
       else
-        -- only poll while pending (prevents spam)
-        request_status()
+        request_status(new_id("REQ"))
       end
-      draw()
     end
     poll_timer = os.startTimer(POLL_PERIOD_S)
   end

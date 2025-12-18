@@ -1,11 +1,8 @@
 -- reactor/reactor_core.lua
--- VERSION: 1.3.6 (2025-12-18)
+-- VERSION: 1.3.5 (2025-12-18)
 --
--- Lever mapping:
---   burnRate_target [mB/t] = 128 * RL   where RL in [0..15]
---   RL 0   -> 0
---   RL 15  -> 1920
--- Clamped to Mekanism max burn rate.
+-- Adds: set_burn_lever (0..15) mapped to targetBurn (0..cap)
+-- Also reports sensors.burnLever for control_room confirmation.
 
 --------------------------
 -- CONFIG
@@ -56,7 +53,7 @@ local sensors = {
   heatedFrac   = 0,
   wasteFrac    = 0,
 
-  burnLever    = 0,   -- 0..15 latch for confirm/UI
+  burnLever    = 0,   -- NEW: 0..15 latch for confirm
 }
 
 local scramIssued = false
@@ -159,7 +156,7 @@ local function applyControl()
 
   safe_call("reactor.setBurnRate()", reactor.setBurnRate, burn)
 
-  -- allow activate even at burn=0 (your requested behavior)
+  -- IMPORTANT: allow activate() even at burn=0 if you want that behavior
   safe_call("reactor.activate()", reactor.activate)
 end
 
@@ -224,20 +221,14 @@ end
 --------------------------
 local function set_burn_from_lever(lv)
   lv = tonumber(lv) or 0
-  lv = math.floor(lv + 0.5)
   if lv < 0 then lv = 0 end
   if lv > 15 then lv = 15 end
   sensors.burnLever = lv
 
-  -- NEW mapping: 128 mB/t per redstone level
-  local requested = 128 * lv
-
-  -- clamp to Mek cap
   local cap = getBurnCap()
-  if requested > cap then requested = cap end
+  targetBurn = (lv / 15) * cap
 
-  targetBurn = requested
-  dbg(string.format("BURN LEVER=%d => targetBurn=%.3f mB/t (cap=%.3f)", lv, targetBurn, cap))
+  dbg(string.format("BURN LEVER=%d => targetBurn=%.3f (cap=%.3f)", lv, targetBurn, cap))
 end
 
 local function handleCommand(cmd, data, replyCh)

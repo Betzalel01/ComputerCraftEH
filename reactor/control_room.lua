@@ -1,16 +1,6 @@
 -- reactor/control_room.lua
--- VERSION: 0.3.2 (2025-12-17)
--- Confirm router + ACK + local keyboard commands.
---
--- Channels:
---   INPUT_PANEL -> CONTROL_ROOM on CONTROL_ROOM_INPUT_CH
---   CONTROL_ROOM -> CORE on REACTOR_CHANNEL
---   CORE -> CONTROL_ROOM on CORE_REPLY_CH
---
--- Features:
---   * Sends ACK back to input_panel immediately upon receiving a button command.
---   * Uses "active" (not burn>0) to satisfy power_on.
---   * Polling is rate-limited (no more spam).
+-- VERSION: 0.3.3 (2025-12-17)
+-- Adds: post-confirm "settle" cooldown + 1-deep queue for next command.
 
 --------------------------
 -- CHANNELS
@@ -22,9 +12,10 @@ local CORE_REPLY_CH         = 101
 --------------------------
 -- TIMING
 --------------------------
-local PENDING_TIMEOUT_S = 6.0
-local POLL_PERIOD_S     = 0.5     -- rate-limited
-local POLL_WHEN_IDLE_S  = 2.0     -- occasional refresh even when idle
+local PENDING_TIMEOUT_S        = 6.0
+local POLL_PERIOD_S            = 0.5
+local POLL_WHEN_IDLE_S         = 2.0
+local SETTLE_AFTER_CONFIRM_S   = 1.2   -- << key: wait after a command confirms
 
 --------------------------
 -- PERIPHERALS
@@ -96,12 +87,12 @@ end
 local function status_matches(cmd, st)
   if cmd == "power_on" then
     return status_is_active(st)
+  elseif cmd == "power_off" then
+    return not status_is_active(st)
   elseif cmd == "scram" then
     return status_scrammed(st)
   elseif cmd == "clear_scram" then
     return not status_scrammed(st)
-  elseif cmd == "power_off" then
-    return not status_is_active(st)
   end
   return false
 end
@@ -121,12 +112,18 @@ local ui = {
 -- pending = { cmd=..., id=..., issued_at=..., src=... }
 local pending = nil
 
+-- settle window after confirm
+local last_confirm_t = 0
+
+-- one-deep queue for next command (during settle/pending)
+local queued = nil -- { cmd=..., src=..., input_replyCh=..., input_id=... }
+
 local last_poll_t = 0
 local last_idle_poll_t = 0
 
 local function draw()
   clr()
-  wln("CONTROL ROOM (confirm router+ACK)  v0.3.2")
+  wln("CONTROL ROOM (confirm+ACK+settle)  v0.3.3")
   wln(("IN %d   CORE %d   REPLY %d"):format(CONTROL_ROOM_INPUT_CH, REACTOR_CHANNEL, CORE_REPLY_CH))
   wln("Keys: P=power_on  O=power_off  S=scram  C=clear_scram  R=request_status  Q=quit")
   wln("----------------------------------------")
@@ -142,6 +139,15 @@ local function draw()
     wln(("PENDING: %s id=%s (%.1fs / %.1fs)"):format(pending.cmd, pending.id, age_p, PENDING_TIMEOUT_S))
   else
     wln("PENDING: none")
+  end
+
+  local settle_left = math.max(0, (last_confirm_t > 0) and (SETTLE_AFTER_CONFIRM_S - (now_s() - last_confirm_t)) or 0)
+  wln(("SETTLE: %.1fs"):format(settle_left))
+
+  if queued then
+    wln(("QUEUED: %s from %s"):format(queued.cmd, queued.src))
+  else
+    wln("QUEUED: none")
   end
 
   wln("")
@@ -172,10 +178,16 @@ local function request_status(reason)
   log("TX -> CORE cmd=request_status id="..id)
 end
 
---------------------------
--- COMMAND GATE
---------------------------
-local function issue_cmd(cmd, src, input_replyCh, input_id)
+local function in_settle()
+  if last_confirm_t <= 0 then return false end
+  return (now_s() - last_confirm_t) < SETTLE_AFTER_CONFIRM_S
+end
+
+local function can_send_new_cmd()
+  return (not pending) and (not in_settle())
+end
+
+local function send_cmd_now(cmd, src, input_replyCh, input_id)
   src = src or "control_room"
   local id = input_id or mk_id("CR")
 
@@ -183,7 +195,19 @@ local function issue_cmd(cmd, src, input_replyCh, input_id)
   ui.last_cmd_src = tostring(src)
   ui.last_cmd_t   = now_s()
 
-  -- If we have status and it already matches, ignore (but ACK the input_panel)
+  tx_ack(input_replyCh, input_id, true, "received_by_control_room")
+
+  pending = { cmd=cmd, id=id, issued_at=now_s(), src=src }
+  log(("TX -> CORE cmd=%s id=%s src=%s"):format(cmd, id, src))
+  tx_core({ type="cmd", cmd=cmd, id=id, src=src })
+
+  draw()
+end
+
+local function issue_cmd(cmd, src, input_replyCh, input_id)
+  src = src or "control_room"
+
+  -- if already satisfied, ignore
   if ui.status and status_matches(cmd, ui.status) then
     log("IGNORED "..cmd.." (already satisfied)")
     tx_ack(input_replyCh, input_id, false, "already_satisfied")
@@ -191,26 +215,16 @@ local function issue_cmd(cmd, src, input_replyCh, input_id)
     return
   end
 
-  -- If pending exists and not timed out, ignore new presses (but ACK)
-  if pending then
-    local age = now_s() - pending.issued_at
-    if age < PENDING_TIMEOUT_S then
-      log("IGNORED "..cmd.." (pending "..pending.cmd..")")
-      tx_ack(input_replyCh, input_id, false, "pending_"..pending.cmd)
-      draw()
-      return
-    end
+  -- if pending or settle, queue newest command (overwrite old queue)
+  if not can_send_new_cmd() then
+    log("QUEUED "..cmd.." (busy: "..(pending and ("pending_"..pending.cmd) or "settle")..")")
+    queued = { cmd=cmd, src=src, input_replyCh=input_replyCh, input_id=input_id }
+    tx_ack(input_replyCh, input_id, false, "queued")
+    draw()
+    return
   end
 
-  -- Accept: ACK input_panel immediately
-  tx_ack(input_replyCh, input_id, true, "received_by_control_room")
-
-  pending = { cmd=cmd, id=id, issued_at=now_s(), src=src }
-  log(("TX -> CORE cmd=%s id=%s src=%s"):format(cmd, id, src))
-  tx_core({ type="cmd", cmd=cmd, id=id, src=src })
-
-  -- poll soon (rate-limited by timer loop)
-  draw()
+  send_cmd_now(cmd, src, input_replyCh, input_id)
 end
 
 --------------------------
@@ -233,11 +247,9 @@ while true do
   if ev == "modem_message" then
     local ch, replyCh, msg = p2, p3, p4
 
-    -- INPUT_PANEL -> CONTROL_ROOM
     if ch == CONTROL_ROOM_INPUT_CH and type(msg) == "table" and msg.cmd then
       issue_cmd(msg.cmd, "input_panel", replyCh, msg.id)
 
-    -- CORE -> CONTROL_ROOM
     elseif ch == CORE_REPLY_CH and type(msg) == "table" then
       if msg.type == "ack" then
         log(("ACK from core id=%s ok=%s note=%s"):format(tostring(msg.id), tostring(msg.ok), tostring(msg.note)))
@@ -249,7 +261,9 @@ while true do
         if pending and status_matches(pending.cmd, ui.status) then
           log(("CONFIRMED %s id=%s"):format(pending.cmd, pending.id))
           pending = nil
+          last_confirm_t = now_s() -- start settle window
         end
+
         draw()
       end
     end
@@ -275,6 +289,13 @@ while true do
   elseif ev == "timer" and p1 == poll_timer then
     local t = now_s()
 
+    -- If we can now send queued command, do it
+    if queued and can_send_new_cmd() then
+      local q = queued
+      queued = nil
+      send_cmd_now(q.cmd, q.src, q.input_replyCh, q.input_id)
+    end
+
     if pending then
       local age = t - pending.issued_at
       if age >= PENDING_TIMEOUT_S then
@@ -282,14 +303,12 @@ while true do
         pending = nil
         draw()
       else
-        -- rate-limited polling while pending
         if (t - last_poll_t) >= POLL_PERIOD_S then
           last_poll_t = t
           request_status("pending_"..pending.cmd)
         end
       end
     else
-      -- occasional idle refresh, not spam
       if (t - last_idle_poll_t) >= POLL_WHEN_IDLE_S then
         last_idle_poll_t = t
         request_status("idle")

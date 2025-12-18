@@ -1,28 +1,23 @@
 -- reactor/control_room.lua
--- VERSION: 0.3.0-router+ui-ack-retry (2025-12-18)
--- Adds:
---   * Seq/ACK support (core sends immediate ACK on CORE_REPLY_CH)
---   * Retry policy while pending:
---       - Retry fast until ACK
---       - After ACK, retry slower until state matches (optional but enabled)
---   * "Satisfied" checks use core latch state (poweredOn / scramLatched), not burnRate
+-- VERSION: 0.2.4-router+ui-confirm+retry (2025-12-18)
+-- Control room router that accepts:
+--   - button cmds from input_panel on 102
+--   - optional local manual commands (typed keys not implemented here; router still works)
+-- Adds support for set_burn_lever with confirm + retry.
 
 --------------------------
 -- CHANNELS
 --------------------------
-local CONTROL_ROOM_INPUT_CH = 102  -- input_panel -> control_room
-local REACTOR_CHANNEL       = 100  -- control_room -> reactor_core
-local CORE_REPLY_CH         = 101  -- reactor_core -> control_room (status + ack)
+local CONTROL_ROOM_INPUT_CH = 102
+local REACTOR_CHANNEL       = 100
+local CORE_REPLY_CH         = 101
 
 --------------------------
 -- TIMING
 --------------------------
-local PENDING_TIMEOUT_S   = 8.0
-local POLL_PERIOD_S       = 0.25
-
--- Retry behavior
-local RETRY_UNTIL_ACK_S   = 0.30   -- resend cmd until ACK
-local RETRY_AFTER_ACK_S   = 1.00   -- resend cmd even after ACK until satisfied (set nil to disable)
+local PENDING_TIMEOUT_S = 8.0
+local POLL_PERIOD_S     = 0.25
+local RETRY_PERIOD_S    = 0.50
 
 --------------------------
 -- PERIPHERALS
@@ -78,20 +73,26 @@ local function status_actual_running(st)
   return formed and (burn > 0)
 end
 
--- IMPORTANT: "satisfied" uses core latch fields, as you requested
-local function status_satisfied(cmd, st)
+local function status_matches(cmd, data, st)
   if type(st) ~= "table" then return false end
-  local poweredOn    = (st.poweredOn == true)
   local scramLatched = (st.scramLatched == true)
 
   if cmd == "power_on" then
-    return poweredOn
-  elseif cmd == "power_off" then
-    return not poweredOn
+    -- confirm by core latch (what you said you care about)
+    return (st.poweredOn == true)
   elseif cmd == "scram" then
     return scramLatched
   elseif cmd == "clear_scram" then
     return not scramLatched
+  elseif cmd == "set_burn_lever" then
+    -- confirm by core latch (targetBurn updated)
+    -- data is 0..15, core maps to targetBurn; so just confirm the lever latched too
+    -- core will echo burn_lever in status.sensors.burnLever (we'll use that)
+    local sens = (type(st.sensors) == "table") and st.sensors or {}
+    if type(sens.burnLever) == "number" then
+      return math.floor(sens.burnLever + 0.5) == math.floor((tonumber(data) or -999) + 0.5)
+    end
+    return false
   end
   return false
 end
@@ -100,36 +101,34 @@ end
 -- UI STATE
 --------------------------
 local ui = {
-  last_btn      = "(none)",
-  last_btn_t    = 0,
+  last_cmd      = "(none)",
+  last_cmd_t    = 0,
   last_status_t = 0,
   status        = nil,
 }
 
--- pending = { cmd, seq, issued_at, last_tx, acked }
 local pending = nil
-local seq_ctr = 0
-local function next_seq()
-  seq_ctr = (seq_ctr + 1) % 1000000000
-  return seq_ctr
-end
+-- pending = { cmd=..., data=..., issued_at=..., last_retry=... }
 
 local function draw()
   clr()
-  wln("CONTROL ROOM (ACK+retry router)  v0.3.0")
+  wln("CONTROL ROOM (confirm+retry router)  v0.2.4")
   wln("INPUT "..CONTROL_ROOM_INPUT_CH.."  CORE "..REACTOR_CHANNEL.."  REPLY "..CORE_REPLY_CH)
   wln("----------------------------------------")
 
-  local age_btn = (ui.last_btn_t > 0) and (now_s() - ui.last_btn_t) or 0
-  wln(string.format("Last BTN: %s (%.1fs)", ui.last_btn, age_btn))
+  local age_cmd = (ui.last_cmd_t > 0) and (now_s() - ui.last_cmd_t) or 0
+  wln(string.format("Last RX: %s (%.1fs)", ui.last_cmd, age_cmd))
 
   local age_st = (ui.last_status_t > 0) and (now_s() - ui.last_status_t) or -1
   wln("Last STATUS: "..((ui.last_status_t > 0) and (string.format("%.1fs", age_st)) or "none"))
 
   if pending then
     local age_p = now_s() - pending.issued_at
-    wln(string.format("PENDING: %s  seq=%d  ack=%s  (%.1fs/%.1fs)",
-      pending.cmd, pending.seq, tostring(pending.acked), age_p, PENDING_TIMEOUT_S))
+    wln(string.format("PENDING: %s%s (%.1fs / %.1fs)",
+      pending.cmd,
+      (pending.data ~= nil) and ("="..tostring(pending.data)) or "",
+      age_p, PENDING_TIMEOUT_S
+    ))
   else
     wln("PENDING: none")
   end
@@ -137,100 +136,54 @@ local function draw()
   wln("")
 
   if type(ui.status) ~= "table" then
-    wln("Waiting for status from reactor_core...")
+    wln("Waiting for status...")
     return
   end
 
   local st = ui.status
   local sens = (type(st.sensors) == "table") and st.sensors or {}
 
-  wln("CORE LATCH (authoritative for 'satisfied')")
+  wln("CORE LATCH")
   wln("  poweredOn    = "..tostring(st.poweredOn))
   wln("  scramLatched = "..tostring(st.scramLatched))
-  wln("")
+  wln("  targetBurn   = "..tostring(st.targetBurn))
 
-  wln("PHYSICAL (best-effort verification)")
+  wln("")
+  wln("SENSORS")
   wln("  formed       = "..tostring(sens.reactor_formed))
   wln("  burnRate     = "..tostring(sens.burnRate))
+  wln("  burnLever    = "..tostring(sens.burnLever))
   wln("  running      = "..tostring(status_actual_running(st)))
 end
 
 --------------------------
--- COMMAND ISSUE / RETRY
+-- COMMAND GATE + RETRY
 --------------------------
-local function tx_cmd(cmd, seq)
-  send_to_core({ type="cmd", cmd=cmd, seq=seq })
+local function issue(cmd, data)
+  local pkt = { type="cmd", cmd=cmd }
+  if data ~= nil then pkt.data = data end
+  send_to_core(pkt)
 end
 
-local function begin_pending(cmd)
-  local seq = next_seq()
-  pending = {
-    cmd       = cmd,
-    seq       = seq,
-    issued_at = now_s(),
-    last_tx   = 0,
-    acked     = false,
-  }
-  log("TX "..cmd.." seq="..seq)
-  tx_cmd(cmd, seq)
-  pending.last_tx = now_s()
-  request_status()
-  draw()
-end
-
-local function try_issue(cmd)
-  -- If already satisfied (from latest status), ignore
-  if ui.status and status_satisfied(cmd, ui.status) then
+local function try_issue(cmd, data)
+  if ui.status and status_matches(cmd, data, ui.status) then
     log("IGNORED "..cmd.." (already satisfied)")
     return
   end
 
-  -- If something pending and not timed out, ignore new presses
   if pending then
     local age = now_s() - pending.issued_at
     if age < PENDING_TIMEOUT_S then
       log("IGNORED "..cmd.." (pending: "..pending.cmd..")")
       return
     end
-    -- timed out: clear and allow new
-    log("TIMEOUT "..pending.cmd.." (auto-clear)")
-    pending = nil
   end
 
-  begin_pending(cmd)
-end
-
-local function handle_retry_tick()
-  if not pending then return end
-
-  local now = now_s()
-  local age = now - pending.issued_at
-
-  if age >= PENDING_TIMEOUT_S then
-    log("TIMEOUT "..pending.cmd.." seq="..pending.seq.." (clearing pending)")
-    pending = nil
-    draw()
-    return
-  end
-
-  -- If satisfied, clear
-  if ui.status and status_satisfied(pending.cmd, ui.status) then
-    log("CONFIRMED "..pending.cmd.." (satisfied)")
-    pending = nil
-    draw()
-    return
-  end
-
-  -- Retry policy
-  local retry_period = pending.acked and RETRY_AFTER_ACK_S or RETRY_UNTIL_ACK_S
-  if retry_period and (now - pending.last_tx) >= retry_period then
-    log("RETRY "..pending.cmd.." seq="..pending.seq.." (acked="..tostring(pending.acked)..")")
-    tx_cmd(pending.cmd, pending.seq)
-    pending.last_tx = now
-  end
-
-  -- Always poll status while pending
+  log("TX "..cmd..((data~=nil) and ("="..tostring(data)) or "").." -> core")
+  pending = { cmd=cmd, data=data, issued_at=now_s(), last_retry=0 }
+  issue(cmd, data)
   request_status()
+  draw()
 end
 
 --------------------------
@@ -254,24 +207,47 @@ while true do
 
     -- INPUT_PANEL -> CONTROL_ROOM
     if ch == CONTROL_ROOM_INPUT_CH and type(msg) == "table" and msg.cmd then
-      ui.last_btn   = tostring(msg.cmd)
-      ui.last_btn_t = now_s()
-      try_issue(msg.cmd)
+      ui.last_cmd   = tostring(msg.cmd)..((msg.data~=nil) and ("="..tostring(msg.data)) or "")
+      ui.last_cmd_t = now_s()
+      try_issue(msg.cmd, msg.data)
 
     -- CORE -> CONTROL_ROOM
-    elseif ch == CORE_REPLY_CH and type(msg) == "table" then
-      if msg.type == "ack" and pending and msg.seq == pending.seq then
-        pending.acked = true
-        -- keep pending until satisfied; retries slow down automatically
-      elseif msg.type == "status" then
+    elseif ch == CORE_REPLY_CH then
+      if type(msg) == "table" and msg.type == "status" then
         ui.status        = msg
         ui.last_status_t = now_s()
+
+        if pending and status_matches(pending.cmd, pending.data, ui.status) then
+          log("CONFIRMED "..pending.cmd)
+          pending = nil
+        end
+
+        draw()
       end
-      draw()
     end
 
   elseif ev == "timer" and p1 == poll_timer then
-    handle_retry_tick()
+    -- retry policy while pending
+    if pending then
+      local now = now_s()
+      local age = now - pending.issued_at
+
+      if age >= PENDING_TIMEOUT_S then
+        log("TIMEOUT "..pending.cmd.." (clearing pending)")
+        pending = nil
+        draw()
+      else
+        -- poll status
+        request_status()
+
+        -- retry transmit periodically
+        if (now - (pending.last_retry or 0)) >= RETRY_PERIOD_S then
+          pending.last_retry = now
+          issue(pending.cmd, pending.data)
+        end
+      end
+    end
+
     poll_timer = os.startTimer(POLL_PERIOD_S)
   end
 end

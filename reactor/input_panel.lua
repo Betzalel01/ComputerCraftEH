@@ -1,12 +1,24 @@
 -- reactor/input_panel.lua
--- VERSION: 0.5.1 (2025-12-17)
--- Sends button pulses -> CONTROL_ROOM only, waits for ACK on 103.
+-- VERSION: 0.4.0 (2025-12-18)
+-- INPUT PANEL -> CONTROL ROOM router
+-- Buttons (1-tick friendly) + analog burn lever (0..15).
+--
+-- Sends to CONTROL_ROOM_INPUT_CH (102):
+--   { type="cmd", cmd="scram" }
+--   { type="cmd", cmd="power_on" }
+--   { type="cmd", cmd="clear_scram" }
+--   { type="cmd", cmd="set_burn_lever", data=<0..15> }
+--
+-- Wiring (TOP relay sitting on TOP of this computer):
+--   SCRAM       -> left   (digital)
+--   POWER ON    -> right  (digital)
+--   CLEAR SCRAM -> top    (digital)
+--   BURN LEVER  -> back   (ANALOG 0..15)  <-- NEW
 
 --------------------------
 -- CHANNELS
 --------------------------
-local CONTROL_ROOM_CH = 102
-local ACK_CH          = 103
+local CONTROL_ROOM_INPUT_CH = 102
 
 --------------------------
 -- MODEM
@@ -14,8 +26,17 @@ local ACK_CH          = 103
 local modem = peripheral.find("modem", function(_, p)
   return type(p) == "table" and type(p.transmit) == "function" and type(p.open) == "function"
 end)
-if not modem then error("No modem found on input_panel computer", 0) end
-pcall(function() modem.open(ACK_CH) end)
+
+if not modem then
+  term.clear()
+  term.setCursorPos(1,1)
+  print("[INPUT_PANEL] ERROR: No usable modem peripheral found.")
+  print("Peripherals seen:")
+  for _, n in ipairs(peripheral.getNames()) do
+    print("  - "..n.." ("..tostring(peripheral.getType(n))..")")
+  end
+  error("Attach a modem to this computer and try again.", 0)
+end
 
 --------------------------
 -- RELAY
@@ -26,73 +47,99 @@ if not relay_top or peripheral.getType("top") ~= "redstone_relay" then
 end
 
 --------------------------
--- MAPPING (your wiring)
---------------------------
-local BTN = {
-  POWER_ON    = { relay = relay_top, relay_name = "top", side = "right", cmd = "power_on" },
-  SCRAM       = { relay = relay_top, relay_name = "top", side = "top",   cmd = "scram" },
-  CLEAR_SCRAM = { relay = relay_top, relay_name = "top", side = "back",  cmd = "clear_scram" },
-}
-
---------------------------
 -- HELPERS
 --------------------------
 local function now_s() return os.epoch("utc") / 1000 end
 local function log(msg) print(string.format("[%.3f][INPUT_PANEL] %s", now_s(), msg)) end
 
-local function get_in(b)
-  local ok, v = pcall(b.relay.getInput, b.side)
+local function send_to_control_room(pkt)
+  modem.transmit(CONTROL_ROOM_INPUT_CH, CONTROL_ROOM_INPUT_CH, pkt)
+end
+
+local function read_digital(relay, side)
+  local ok, v = pcall(relay.getInput, side)
   if not ok then return 0 end
   return (v and 1 or 0)
 end
+
+local function read_analog(relay, side)
+  -- prefer relay.getAnalogInput if present
+  if type(relay.getAnalogInput) == "function" then
+    local ok, v = pcall(relay.getAnalogInput, side)
+    if ok and type(v) == "number" then return math.max(0, math.min(15, math.floor(v + 0.5))) end
+  end
+  -- fallback: ComputerCraft redstone API reading THIS computer side won't see relay input;
+  -- so if getAnalogInput doesn't exist, treat as digital.
+  return read_digital(relay, side) * 15
+end
+
 local function rising(prev, cur) return (prev == 0) and (cur == 1) end
 
-local function mk_id()
-  return "IP-"..tostring(os.epoch("utc")).."-"..tostring(math.random(1000,9999))
-end
+--------------------------
+-- INPUT MAP
+--------------------------
+local BTN = {
+  SCRAM       = { side = "left",  cmd = "scram" },
+  POWER_ON    = { side = "right", cmd = "power_on" },
+  CLEAR_SCRAM = { side = "top",   cmd = "clear_scram" },
+}
 
-local function send_cmd(cmd, id)
-  modem.transmit(CONTROL_ROOM_CH, ACK_CH, { type="cmd", cmd=cmd, id=id })
-end
+local LEVER = {
+  side = "back",
+  cmd  = "set_burn_lever",
+}
 
 --------------------------
 -- STARTUP
 --------------------------
-math.randomseed(os.epoch("utc"))
 term.clear()
 term.setCursorPos(1,1)
-print("[INPUT_PANEL] v0.5.1 -> CONTROL_ROOM CH 102 (ACK on 103)")
-print("POWER_ON    = top relay, side right")
-print("SCRAM       = top relay, side top")
-print("CLEAR_SCRAM = top relay, side back")
-print("Waiting for redstone pulses...")
+print("[INPUT_PANEL] v0.4.0  (buttons + burn lever)")
+print("TOP relay mapping:")
+print("  SCRAM       = left")
+print("  POWER ON    = right")
+print("  CLEAR SCRAM = top")
+print("  BURN LEVER  = back (analog 0..15)")
+print("--------------------------------------------------")
 
-local prev = {}
-for k,b in pairs(BTN) do prev[k] = get_in(b) end
+-- init states
+local prev_btn = {}
+for k, b in pairs(BTN) do
+  prev_btn[k] = read_digital(relay_top, b.side)
+end
+
+local last_lever = read_analog(relay_top, LEVER.side)
+
+-- throttle lever sends (avoid spamming)
+local last_lever_sent = -1
 
 --------------------------
 -- MAIN LOOP
 --------------------------
 while true do
-  local ev, p1, p2, p3, p4 = os.pullEvent()
+  local ev = os.pullEvent()
+
   if ev == "redstone" then
-    for k,b in pairs(BTN) do
-      local cur = get_in(b)
-      if rising(prev[k], cur) then
-        local id = mk_id()
-        log(k.." pressed ("..b.relay_name.."."..b.side..") -> "..b.cmd)
-        log(("TX -> CONTROL_ROOM ch=102 cmd=%s id=%s"):format(b.cmd, id))
-        send_cmd(b.cmd, id)
+    -- buttons (edge-trigger)
+    for k, b in pairs(BTN) do
+      local cur = read_digital(relay_top, b.side)
+      if rising(prev_btn[k], cur) then
+        log(k.." pressed (top."..b.side..") -> "..b.cmd)
+        send_to_control_room({ type="cmd", cmd=b.cmd })
       end
-      prev[k] = cur
+      prev_btn[k] = cur
     end
 
-  elseif ev == "modem_message" then
-    local ch, replyCh, msg = p2, p3, p4
-    if ch == ACK_CH and type(msg) == "table" and msg.type == "ack" then
-      log(("ACK from CONTROL_ROOM id=%s accepted=%s note=%s"):format(
-        tostring(msg.id), tostring(msg.accepted), tostring(msg.note)
-      ))
+    -- lever (level-trigger on change)
+    local lv = read_analog(relay_top, LEVER.side)
+    if lv ~= last_lever then
+      last_lever = lv
+      -- only send if value changed and differs from last sent
+      if lv ~= last_lever_sent then
+        last_lever_sent = lv
+        log("BURN LEVER changed (top."..LEVER.side..") -> "..tostring(lv))
+        send_to_control_room({ type="cmd", cmd=LEVER.cmd, data=lv })
+      end
     end
   end
 end

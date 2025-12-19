@@ -1,9 +1,13 @@
 -- reactor/reactor_core.lua
--- VERSION: 1.3.5 (2025-12-18)
+-- VERSION: 1.3.6 (2025-12-18)
 --
--- FIX: Distinguish MANUAL vs AUTOMATIC trips on the status panel.
---   - Manual trip: operator command "scram"
---   - Automatic trip: safety threshold scrams inside applyControl()
+-- Fixes:
+--   (1) After AUTO scram, POWER ON now does an immediate "kick":
+--       RS ON + setBurnRate(targetBurn) + activate() (even if burn==0)
+--   (2) Dedicated panel broadcast timer so channel 250 stays alive during idle
+--   (3) Tracks last SCRAM cause + reason:
+--       trip_cause = "none" | "manual" | "auto" | "timeout"
+--       last_scram_reason = string
 
 --------------------------
 -- CONFIG
@@ -18,6 +22,7 @@ local STATUS_CHANNEL  = 250
 
 local SENSOR_POLL_PERIOD = 0.2
 local HEARTBEAT_PERIOD   = 10.0
+local PANEL_PERIOD       = 1.0   -- NEW: keep status_display alive while idle
 
 -- Safety thresholds (only enforced if emergencyOn = true)
 local MAX_DAMAGE_PCT   = 5
@@ -59,9 +64,9 @@ local sensors = {
 -- prevents spamming scram when reactor is inactive
 local scramIssued = false
 
--- NEW: trip cause for panel
--- values: "none" | "manual" | "auto" | "timeout"
-local trip_cause = "none"
+-- trip reporting
+local trip_cause        = "none"    -- "none" | "manual" | "auto" | "timeout"
+local last_scram_reason = ""        -- string for operator/debug
 
 --------------------------
 -- DEBUG (minimal)
@@ -99,10 +104,11 @@ local function zeroOutput()
   end
 end
 
--- UPDATED: doScram now accepts a cause ("manual"/"auto"/"timeout")
 local function doScram(reason, cause)
-  trip_cause = cause or "manual"
-  dbg("SCRAM("..trip_cause.."): "..tostring(reason or "unknown"))
+  trip_cause        = cause or "manual"
+  last_scram_reason = tostring(reason or "unknown")
+  dbg("SCRAM("..trip_cause.."): "..last_scram_reason)
+
   scramLatched = true
   poweredOn    = false
   zeroOutput()
@@ -159,7 +165,6 @@ local function getBurnCap()
 end
 
 local function applyControl()
-  -- Off or scrammed => ensure output is cut (and do not spam scram)
   if scramLatched or not poweredOn then
     zeroOutput()
     return
@@ -196,10 +201,9 @@ local function applyControl()
   if burn > cap then burn = cap end
 
   safe_call("reactor.setBurnRate()", reactor.setBurnRate, burn)
-  -- keep your current behavior (only activate if burn > 0)
-  if burn > 0 then
-    safe_call("reactor.activate()", reactor.activate)
-  end
+
+  -- IMPORTANT: allow "active" even at burn==0 (your request)
+  safe_call("reactor.activate()", reactor.activate)
 end
 
 --------------------------
@@ -207,8 +211,6 @@ end
 --------------------------
 local function buildPanelStatus()
   local formed_ok = (sensors.reactor_formed == true)
-
-  -- running = actually burning (burn rate > 0), while operator has poweredOn
   local running = formed_ok and poweredOn and ((sensors.burnRate or 0) > 0)
 
   local trip = (scramLatched == true)
@@ -241,6 +243,10 @@ local function buildPanelStatus()
     hi_waste  = (sensors.wasteFrac or 0) > MAX_WASTE_FRAC,
     lo_ccool  = (sensors.coolantFrac or 0) < MIN_COOLANT_FRAC,
     hi_hcool  = (sensors.heatedFrac or 0) > MAX_HEATED_FRAC,
+
+    -- optional: reason for debug/operator
+    scram_reason = last_scram_reason,
+    scram_cause  = trip_cause,
   }
 end
 
@@ -256,7 +262,8 @@ local function sendStatus(replyCh)
     emergencyOn  = emergencyOn,
     targetBurn   = targetBurn,
     sensors      = sensors,
-    trip_cause   = trip_cause, -- optional, useful for debugging
+    trip_cause   = trip_cause,
+    scram_reason = last_scram_reason,
   }
   modem.transmit(replyCh or CONTROL_CHANNEL, REACTOR_CHANNEL, msg)
   sendPanelStatus()
@@ -269,29 +276,53 @@ end
 --------------------------
 -- COMMAND HANDLING
 --------------------------
+local function kick_startup()
+  -- immediate attempt to bring reactor out of scram/idle
+  scramIssued = false
+  setActivationRS(true)
+
+  local cap  = getBurnCap()
+  local burn = targetBurn or 0
+  if burn < 0 then burn = 0 end
+  if burn > cap then burn = cap end
+
+  safe_call("reactor.setBurnRate()", reactor.setBurnRate, burn)
+  safe_call("reactor.activate()", reactor.activate)
+end
+
 local function handleCommand(cmd, data, replyCh)
   if cmd == "scram" then
     doScram("Remote SCRAM", "manual")
 
   elseif cmd == "power_on" then
-    scramLatched = false
-    trip_cause   = "none"     -- NEW: clear old trip cause
-    poweredOn    = true
+    scramLatched      = false
+    poweredOn         = true
+    trip_cause        = "none"
+    last_scram_reason = ""
     dbg("POWER ON")
+    -- NEW: immediate kick so you don't have to wait for next sensor tick
+    kick_startup()
 
   elseif cmd == "power_off" then
     poweredOn = false
     dbg("POWER OFF")
 
   elseif cmd == "clear_scram" then
-    scramLatched = false
-    trip_cause   = "none"     -- NEW: clear old trip cause
+    scramLatched      = false
+    trip_cause        = "none"
+    last_scram_reason = ""
     dbg("SCRAM CLEARED")
+    -- optional: allow immediate activation attempt after clearing
+    if poweredOn then kick_startup() end
 
   elseif cmd == "set_target_burn" then
     if type(data) == "number" then
       targetBurn = data
       dbg("TARGET BURN "..tostring(targetBurn))
+      -- if running-permitted, apply immediately
+      if poweredOn and (not scramLatched) then
+        kick_startup()
+      end
     end
 
   elseif cmd == "set_emergency" then
@@ -316,6 +347,7 @@ dbg("Online. RX="..REACTOR_CHANNEL.." CTRL="..CONTROL_CHANNEL.." PANEL="..STATUS
 
 local sensorTimer    = os.startTimer(SENSOR_POLL_PERIOD)
 local heartbeatTimer = os.startTimer(HEARTBEAT_PERIOD)
+local panelTimer     = os.startTimer(PANEL_PERIOD)
 
 while true do
   local ev, p1, p2, p3, p4 = os.pullEvent()
@@ -324,12 +356,16 @@ while true do
     if p1 == sensorTimer then
       readSensors()
       applyControl()
-      sendPanelStatus()
       sensorTimer = os.startTimer(SENSOR_POLL_PERIOD)
 
     elseif p1 == heartbeatTimer then
       sendHeartbeat()
       heartbeatTimer = os.startTimer(HEARTBEAT_PERIOD)
+
+    elseif p1 == panelTimer then
+      -- NEW: keep the status_display fed even when idle
+      sendPanelStatus()
+      panelTimer = os.startTimer(PANEL_PERIOD)
     end
 
   elseif ev == "modem_message" then

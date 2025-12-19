@@ -71,8 +71,8 @@ local function status_actual_running(st)
   if type(st) ~= "table" then return false end
   local sens = (type(st.sensors) == "table") and st.sensors or {}
   local formed = (sens.reactor_formed == true)
-  local burn   = tonumber(sens.burnRate) or 0
-  return formed and (burn > 0)
+  local active = (sens.reactor_active == true)  -- Mekanism getStatus()
+  return formed and active
 end
 
 local function nearly(a, b)

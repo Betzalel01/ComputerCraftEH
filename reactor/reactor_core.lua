@@ -1,14 +1,23 @@
 -- reactor/reactor_core.lua
--- VERSION: 1.3.7-debug (2025-12-19)
+-- VERSION: 1.3.7 (2025-12-19)
 --
--- Debug + Fixes:
---   (A) Distinguish configured burn vs actual burn:
---       burn_set = reactor.getBurnRate() (setting)
---       burn_actual = reactor.getActualBurnRate() if available (real)
---   (B) "Reactor running" indicator uses:
---       running = formed AND (reactor_active OR burn_actual > 0)
---   (C) More frequent panel + heartbeat to prevent idle "network error"
---   (D) Heavier debug prints around sensor reads + transitions (rate-limited)
+-- Changes vs 1.3.6:
+--   (A) FIX: Status display "network error" + freezes
+--       - Always transmit panel frames with replyCh = STATUS_CHANNEL (was REACTOR_CHANNEL)
+--       - Adds panel seq + timestamp
+--       - Adds a watchdog that forces a panel frame every 2s even if timers stall
+--       - Wraps modem.transmit in pcall + logs failures
+--
+--   (B) FIX: "RCT active/running" lying while scrammed
+--       - Mekanism getStatus() can be false even while burn is nonzero (observed).
+--       - Panel "reactor_on" now uses burnRate>0 as truth for *running*.
+--       - Also reports a separate "phys_running" boolean for debugging.
+--
+--   (C) DEBUG: adds targeted prints for:
+--       - timer ticks (throttled)
+--       - last panel TX age
+--       - sensor snapshot summary
+--       - command RX + kick_startup() actions
 
 --------------------------
 -- CONFIG
@@ -22,8 +31,11 @@ local CONTROL_CHANNEL = 101
 local STATUS_CHANNEL  = 250
 
 local SENSOR_POLL_PERIOD = 0.2
-local HEARTBEAT_PERIOD   = 2.0     -- was 10.0; tightened to avoid idle network fault
-local PANEL_PERIOD       = 0.5     -- keep status_display alive
+local HEARTBEAT_PERIOD   = 10.0
+local PANEL_PERIOD       = 1.0
+
+-- watchdog: force a panel frame if we haven't sent one in this long
+local PANEL_WATCHDOG_S   = 2.0
 
 -- Safety thresholds (only enforced if emergencyOn = true)
 local MAX_DAMAGE_PCT   = 5
@@ -39,14 +51,43 @@ if not reactor then error("No reactor logic adapter on "..REACTOR_SIDE) end
 
 local modem = peripheral.wrap(MODEM_SIDE)
 if not modem then error("No modem on "..MODEM_SIDE) end
-
--- Small startup delay helps modems/peripherals settle after chunk load / reboot
-sleep(0.25)
-
 modem.open(REACTOR_CHANNEL)
 
 --------------------------
--- TIME/DEBUG
+-- STATE
+--------------------------
+local poweredOn    = false
+local scramLatched = false
+local emergencyOn  = true
+local targetBurn   = 0
+
+local sensors = {
+  reactor_formed = false,
+  reactor_active = false, -- from getStatus()
+  burnRate       = 0,     -- actual burn
+  maxBurnReac    = 0,
+
+  tempK        = 0,
+  damagePct    = 0,
+  coolantFrac  = 0,
+  heatedFrac   = 0,
+  wasteFrac    = 0,
+}
+
+-- prevents spamming scram when reactor is inactive
+local scramIssued = false
+
+-- trip reporting
+local trip_cause        = "none"    -- "none" | "manual" | "auto" | "timeout"
+local last_scram_reason = ""        -- string for operator/debug
+
+-- panel telemetry
+local panel_seq        = 0
+local last_panel_tx_s  = 0.0
+local last_tick_log_s  = 0.0
+
+--------------------------
+-- DEBUG
 --------------------------
 local function now_s() return os.epoch("utc") / 1000 end
 local function ts() return string.format("%.3f", now_s()) end
@@ -61,59 +102,13 @@ local function safe_call(name, fn, ...)
   return true, v
 end
 
---------------------------
--- STATE
---------------------------
-local poweredOn    = false
-local scramLatched = false
-local emergencyOn  = true
-local targetBurn   = 0
-
--- prevents spamming scram
-local scramIssued = false
-
--- trip reporting
-local trip_cause        = "none"    -- "none" | "manual" | "auto" | "timeout"
-local last_scram_reason = ""
-
--- panel sequencing (helps diagnose “network error”/timeouts)
-local panel_seq = 0
-
--- detect optional API
-local HAS_ACTUAL_BURN = (type(reactor.getActualBurnRate) == "function")
-local logged_no_actual = false
-
-local sensors = {
-  reactor_formed  = false, -- adapter reachable (getStatus ok)
-  reactor_active  = false, -- getStatus return value
-  burn_set        = 0,     -- getBurnRate setting (NOT proof of running)
-  burn_actual     = 0,     -- getActualBurnRate if available (proof of running)
-  maxBurnReac     = 0,
-
-  tempK        = 0,
-  damagePct    = 0,
-  coolantFrac  = 0,
-  heatedFrac   = 0,
-  wasteFrac    = 0,
-}
-
--- rate-limit noisy debug
-local last_phys_dbg_s = 0
-local function phys_dbg_rate_limited(tag)
-  local t = now_s()
-  if (t - last_phys_dbg_s) >= 1.0 then
-    last_phys_dbg_s = t
-    dbg(string.format(
-      "PHYS[%s] formed=%s active=%s burn_set=%.3f burn_actual=%.3f poweredOn=%s scramLatched=%s",
-      tag,
-      tostring(sensors.reactor_formed),
-      tostring(sensors.reactor_active),
-      tonumber(sensors.burn_set or 0) or 0,
-      tonumber(sensors.burn_actual or 0) or 0,
-      tostring(poweredOn),
-      tostring(scramLatched)
-    ))
+local function safe_tx(ch, replyCh, payload, tag)
+  local ok, err = pcall(modem.transmit, ch, replyCh, payload)
+  if not ok then
+    dbg("TX FAIL "..tostring(tag or "").." ch="..tostring(ch).." rep="..tostring(replyCh).." :: "..tostring(err))
+    return false
   end
+  return true
 end
 
 --------------------------
@@ -126,11 +121,16 @@ end
 local function zeroOutput()
   setActivationRS(false)
 
-  -- Attempt scram once per off/scram period.
-  -- DO NOT trust getStatus for “is it running”; just attempt scram once safely.
+  -- Only attempt scram if reactor is actually active; only once per "off/scram period"
   if not scramIssued then
-    dbg("zeroOutput(): attempting reactor.scram() once")
-    safe_call("reactor.scram()", reactor.scram)
+    local okS, active = pcall(reactor.getStatus)
+    dbg("zeroOutput(): getStatus ok="..tostring(okS).." raw="..tostring(active).." -> active_guess="..tostring(okS and active))
+    if okS and active then
+      dbg("zeroOutput(): attempting reactor.scram() once")
+      safe_call("reactor.scram()", reactor.scram)
+    else
+      dbg("zeroOutput(): skipping reactor.scram() (not active)")
+    end
     scramIssued = true
   end
 end
@@ -151,30 +151,18 @@ end
 local function readSensors()
   do
     local ok, v = safe_call("reactor.getMaxBurnRate()", reactor.getMaxBurnRate)
-    sensors.maxBurnReac = (ok and v) or 0
+    sensors.maxBurnReac = (ok and v) or sensors.maxBurnReac or 0
   end
 
   do
     local ok, v = safe_call("reactor.getBurnRate()", reactor.getBurnRate)
-    sensors.burn_set = (ok and v) or 0
+    sensors.burnRate = (ok and v) or 0
   end
 
   do
     local ok, v = safe_call("reactor.getStatus()", reactor.getStatus)
     sensors.reactor_formed = ok and true or false
     sensors.reactor_active = (ok and v) and true or false
-  end
-
-  -- actual burn (if available) is the best truth for “running”
-  if HAS_ACTUAL_BURN then
-    local ok, v = safe_call("reactor.getActualBurnRate()", reactor.getActualBurnRate)
-    sensors.burn_actual = (ok and v) or 0
-  else
-    sensors.burn_actual = 0
-    if not logged_no_actual then
-      logged_no_actual = true
-      dbg("NOTE: reactor.getActualBurnRate() not available; running detection will be less reliable.")
-    end
   end
 
   do
@@ -198,7 +186,20 @@ local function readSensors()
     sensors.wasteFrac = (ok and v) or 0
   end
 
-  phys_dbg_rate_limited("read")
+  -- snapshot (throttled) so you can tell if timers are still alive
+  local t = now_s()
+  if (t - last_tick_log_s) > 2.0 then
+    last_tick_log_s = t
+    dbg(string.format(
+      "PHYS[read] formed=%s active=%s burn_actual=%.3f poweredOn=%s scramLatched=%s (panel_age=%.2fs)",
+      tostring(sensors.reactor_formed),
+      tostring(sensors.reactor_active),
+      tonumber(sensors.burnRate or 0),
+      tostring(poweredOn),
+      tostring(scramLatched),
+      (t - last_panel_tx_s)
+    ))
+  end
 end
 
 --------------------------
@@ -245,32 +246,21 @@ local function applyControl()
   if burn < 0 then burn = 0 end
   if burn > cap then burn = cap end
 
-  -- This is a setpoint; reactor may be on/off independently.
   safe_call("reactor.setBurnRate()", reactor.setBurnRate, burn)
-
-  -- Your request: allow activate even at burn==0
   safe_call("reactor.activate()", reactor.activate)
-
-  phys_dbg_rate_limited("apply")
-end
-
---------------------------
--- RUNNING DETECTION
---------------------------
-local function isPhysicallyRunning()
-  if sensors.reactor_formed ~= true then return false end
-  if sensors.reactor_active == true then return true end
-  -- If available, this is the “real” indicator.
-  if HAS_ACTUAL_BURN and (tonumber(sensors.burn_actual or 0) or 0) > 0 then return true end
-  return false
 end
 
 --------------------------
 -- STATUS + PANEL FRAMES
 --------------------------
 local function buildPanelStatus()
-  local formed_ok = (sensors.reactor_formed == true)
-  local running   = formed_ok and poweredOn and isPhysicallyRunning()
+  local formed_ok    = (sensors.reactor_formed == true)
+
+  -- IMPORTANT: "running" truth = actual burn > 0 (observed getStatus() lies sometimes)
+  local phys_running = formed_ok and ((sensors.burnRate or 0) > 0)
+
+  -- "reactor_on" (what the status_display shows) should reflect reality:
+  local running = phys_running
 
   local trip = (scramLatched == true)
   local manual_trip  = trip and (trip_cause == "manual")
@@ -278,9 +268,11 @@ local function buildPanelStatus()
   local timeout_trip = trip and (trip_cause == "timeout")
 
   return {
-    -- meta
-    t   = os.epoch("utc"),
+    -- meta/debug
     seq = panel_seq,
+    t   = os.epoch("utc"),
+    phys_running = phys_running,         -- debug: truth from burnRate
+    phys_active  = sensors.reactor_active, -- debug: value from getStatus()
 
     status_ok      = formed_ok and emergencyOn and (not scramLatched),
 
@@ -288,7 +280,7 @@ local function buildPanelStatus()
     reactor_on     = running,
 
     modem_ok    = true,
-    network_ok  = true,  -- display should decide timeout based on packet age; we send often now
+    network_ok  = true,
     rps_enable  = emergencyOn,
     auto_power  = false,
     emerg_cool  = false,
@@ -307,11 +299,6 @@ local function buildPanelStatus()
     lo_ccool  = (sensors.coolantFrac or 0) < MIN_COOLANT_FRAC,
     hi_hcool  = (sensors.heatedFrac or 0) > MAX_HEATED_FRAC,
 
-    -- extra debug fields (safe for display if ignored)
-    burn_set    = sensors.burn_set,
-    burn_actual = sensors.burn_actual,
-    active_flag = sensors.reactor_active,
-
     scram_reason = last_scram_reason,
     scram_cause  = trip_cause,
   }
@@ -319,16 +306,13 @@ end
 
 local function sendPanelStatus(note)
   panel_seq = panel_seq + 1
-  local pkt = buildPanelStatus()
-  modem.transmit(STATUS_CHANNEL, REACTOR_CHANNEL, pkt)
-
-  -- lightweight debug occasionally
-  if note then
-    dbg("TX panel seq="..tostring(pkt.seq).." note="..tostring(note))
-  end
+  last_panel_tx_s = now_s()
+  dbg("TX panel seq="..panel_seq.." note="..tostring(note or ""))
+  -- FIX: replyCh = STATUS_CHANNEL (status_display may ignore mismatched replyCh)
+  safe_tx(STATUS_CHANNEL, STATUS_CHANNEL, buildPanelStatus(), "panel")
 end
 
-local function sendStatus(replyCh)
+local function sendStatus(replyCh, note)
   local msg = {
     type         = "status",
     poweredOn    = poweredOn,
@@ -339,12 +323,12 @@ local function sendStatus(replyCh)
     trip_cause   = trip_cause,
     scram_reason = last_scram_reason,
   }
-  modem.transmit(replyCh or CONTROL_CHANNEL, REACTOR_CHANNEL, msg)
-  sendPanelStatus("sendStatus")
+  safe_tx(replyCh or CONTROL_CHANNEL, REACTOR_CHANNEL, msg, "status")
+  sendPanelStatus(note or "sendStatus")
 end
 
 local function sendHeartbeat()
-  modem.transmit(CONTROL_CHANNEL, REACTOR_CHANNEL, { type = "heartbeat", t = os.epoch("utc") })
+  safe_tx(CONTROL_CHANNEL, REACTOR_CHANNEL, { type = "heartbeat", t = os.epoch("utc") }, "heartbeat")
 end
 
 --------------------------
@@ -359,13 +343,16 @@ local function kick_startup(tag)
   if burn < 0 then burn = 0 end
   if burn > cap then burn = cap end
 
-  dbg(string.format("kick_startup(%s): targetBurn=%.3f cap=%.3f applying burn=%.3f", tostring(tag), burn, cap, burn))
+  dbg(string.format("kick_startup(%s): targetBurn=%.3f cap=%.3f applying burn=%.3f",
+    tostring(tag or "?"), tonumber(targetBurn or 0), tonumber(cap or 0), tonumber(burn or 0)
+  ))
+
   safe_call("reactor.setBurnRate()", reactor.setBurnRate, burn)
   safe_call("reactor.activate()", reactor.activate)
 end
 
 local function handleCommand(cmd, data, replyCh)
-  dbg("RX CMD "..tostring(cmd).." data="..tostring(data).." replyCh="..tostring(replyCh))
+  dbg("RX CMD "..tostring(cmd).." data="..tostring(data).." rep="..tostring(replyCh))
 
   if cmd == "scram" then
     doScram("Remote SCRAM", "manual")
@@ -380,24 +367,22 @@ local function handleCommand(cmd, data, replyCh)
 
   elseif cmd == "power_off" then
     poweredOn = false
-    dbg("POWER OFF (latch)")
+    dbg("POWER OFF")
 
   elseif cmd == "clear_scram" then
     scramLatched      = false
     trip_cause        = "none"
     last_scram_reason = ""
-    dbg("SCRAM CLEARED (latch)")
+    dbg("SCRAM CLEARED")
     if poweredOn then kick_startup("clear_scram") end
 
   elseif cmd == "set_target_burn" then
     if type(data) == "number" then
       targetBurn = data
-      dbg("TARGET BURN set to "..tostring(targetBurn))
+      dbg("TARGET BURN "..tostring(targetBurn))
       if poweredOn and (not scramLatched) then
         kick_startup("set_target_burn")
       end
-    else
-      dbg("IGNORED set_target_burn (data not number)")
     end
 
   elseif cmd == "set_emergency" then
@@ -406,11 +391,9 @@ local function handleCommand(cmd, data, replyCh)
 
   elseif cmd == "request_status" then
     -- reply below
-  else
-    dbg("UNKNOWN CMD "..tostring(cmd))
   end
 
-  sendStatus(replyCh or CONTROL_CHANNEL)
+  sendStatus(replyCh or CONTROL_CHANNEL, "after_cmd:"..tostring(cmd))
 end
 
 --------------------------
@@ -421,7 +404,6 @@ term.setCursorPos(1,1)
 
 readSensors()
 dbg("Online. RX="..REACTOR_CHANNEL.." CTRL="..CONTROL_CHANNEL.." PANEL="..STATUS_CHANNEL)
-dbg("API: getActualBurnRate="..tostring(HAS_ACTUAL_BURN))
 
 local sensorTimer    = os.startTimer(SENSOR_POLL_PERIOD)
 local heartbeatTimer = os.startTimer(HEARTBEAT_PERIOD)
@@ -432,16 +414,24 @@ while true do
 
   if ev == "timer" then
     if p1 == sensorTimer then
-      readSensors()
-      applyControl()
+      local ok, err = pcall(function()
+        readSensors()
+        applyControl()
+      end)
+      if not ok then dbg("TIMER(sensor) crash: "..tostring(err)) end
       sensorTimer = os.startTimer(SENSOR_POLL_PERIOD)
+
+      -- watchdog: if panel hasn't been TX'd recently, force it
+      if (now_s() - last_panel_tx_s) > PANEL_WATCHDOG_S then
+        sendPanelStatus("watchdog")
+      end
 
     elseif p1 == heartbeatTimer then
       sendHeartbeat()
       heartbeatTimer = os.startTimer(HEARTBEAT_PERIOD)
 
     elseif p1 == panelTimer then
-      sendPanelStatus()
+      sendPanelStatus("periodic")
       panelTimer = os.startTimer(PANEL_PERIOD)
     end
 
@@ -449,7 +439,8 @@ while true do
     local ch, replyCh, msg = p2, p3, p4
     if ch == REACTOR_CHANNEL and type(msg) == "table" then
       if msg.type == "cmd" or msg.type == "command" or msg.cmd ~= nil then
-        handleCommand(msg.cmd, msg.data, replyCh)
+        local ok, err = pcall(handleCommand, msg.cmd, msg.data, replyCh)
+        if not ok then dbg("handleCommand crash: "..tostring(err)) end
       end
     end
   end

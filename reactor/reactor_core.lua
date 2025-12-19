@@ -1,14 +1,13 @@
 -- reactor/reactor_core.lua
--- VERSION: 1.3.7 (2025-12-18)
+-- VERSION: 1.3.8-debug (2025-12-19)
 --
--- Fixes:
---   (A) Panel "RUNNING" reflects PHYSICAL reactor state (active/burn > 0),
---       not the command latch (poweredOn).
---   (B) Robust "active" detection:
---       supports getStatus() returning boolean OR string OR number,
---       and also tries getActive()/isActive() if present.
---   (C) Dedicated panel broadcast timer keeps channel 250 alive while idle.
---   (D) Trip cause flags: manual/auto/timeout, plus scram reason.
+-- Same behavior as 1.3.7, but adds DEBUG prints (rate-limited) to diagnose:
+--   * What reactor.getStatus()/getActive()/isActive() returns (raw type/value)
+--   * Whether burnRate is changing in the adapter
+--   * Whether activate()/setBurnRate()/scram() calls succeed/fail
+--   * What the panel frame is claiming (reactor_on, formed, etc.)
+--
+-- NOTE: Debug is throttled so it won't spam uncontrollably.
 
 --------------------------
 -- CONFIG
@@ -31,6 +30,11 @@ local MIN_COOLANT_FRAC = 0.20
 local MAX_WASTE_FRAC   = 0.90
 local MAX_HEATED_FRAC  = 0.95
 
+-- DEBUG knobs
+local DBG_ON = true
+local DBG_EVERY_SENSORS_S = 1.0   -- print sensor summary at most once per second
+local DBG_EVERY_PANEL_S   = 1.0   -- print panel summary at most once per second
+
 --------------------------
 -- PERIPHERALS
 --------------------------
@@ -50,8 +54,8 @@ local emergencyOn  = true
 local targetBurn   = 0
 
 local sensors = {
-  reactor_formed = false,  -- "we can talk to adapter"
-  reactor_active = false,  -- "reactor is physically active/running" (best-effort)
+  reactor_formed = false,
+  reactor_active = false,
   burnRate       = 0,
   maxBurnReac    = 0,
 
@@ -60,21 +64,38 @@ local sensors = {
   coolantFrac  = 0,
   heatedFrac   = 0,
   wasteFrac    = 0,
+
+  -- debug fields
+  raw_status_src   = "none",
+  raw_status_type  = "nil",
+  raw_status_value = nil,
 }
 
--- prevents spamming scram when reactor is inactive
 local scramIssued = false
 
--- trip reporting
-local trip_cause        = "none"    -- "none" | "manual" | "auto" | "timeout"
-local last_scram_reason = ""        -- string for operator/debug
+local trip_cause        = "none" -- "none" | "manual" | "auto" | "timeout"
+local last_scram_reason = ""
 
 --------------------------
--- DEBUG (minimal)
+-- TIME / DEBUG
 --------------------------
 local function now_s() return os.epoch("utc") / 1000 end
 local function ts() return string.format("%.3f", now_s()) end
-local function dbg(msg) print("["..ts().."][CORE] "..msg) end
+
+local dbg_last = {}
+local function dbg_rl(key, every_s, msg)
+  if not DBG_ON then return end
+  local t = now_s()
+  if (not dbg_last[key]) or (t - dbg_last[key] >= every_s) then
+    dbg_last[key] = t
+    print("["..ts().."][CORE] "..msg)
+  end
+end
+
+local function dbg(msg)
+  if not DBG_ON then return end
+  print("["..ts().."][CORE] "..msg)
+end
 
 local function safe_call(name, fn, ...)
   local ok, v = pcall(fn, ...)
@@ -90,19 +111,27 @@ end
 --------------------------
 local function setActivationRS(state)
   redstone.setOutput(REDSTONE_ACTIVATION_SIDE, state and true or false)
+  dbg("RS "..REDSTONE_ACTIVATION_SIDE.." = "..tostring(state and true or false))
 end
 
 local function zeroOutput()
   setActivationRS(false)
 
-  -- Only attempt scram if reactor is actually active; only once per "off/scram period"
   if not scramIssued then
-    -- best-effort "is active"
-    local okS, active = pcall(reactor.getStatus)
-    if okS and active then
+    local okS, v = safe_call("reactor.getStatus()", reactor.getStatus)
+    local active_guess = okS and (type(v) == "boolean" and v or false) or false
+
+    dbg("zeroOutput(): getStatus ok="..tostring(okS).." raw="..tostring(v).." -> active_guess="..tostring(active_guess))
+
+    if okS and active_guess then
       safe_call("reactor.scram()", reactor.scram)
+      dbg("zeroOutput(): scram() attempted")
+    else
+      dbg("zeroOutput(): scram() skipped (not active or status failed)")
     end
     scramIssued = true
+  else
+    dbg_rl("scramIssuedSpam", 2.0, "zeroOutput(): scram already issued; not re-scramming")
   end
 end
 
@@ -117,7 +146,7 @@ local function doScram(reason, cause)
 end
 
 --------------------------
--- ACTIVE DETECTION (robust)
+-- ACTIVE DETECTION (robust + debug)
 --------------------------
 local function coerce_active_from_value(v)
   local t = type(v)
@@ -127,47 +156,48 @@ local function coerce_active_from_value(v)
     return v ~= 0
   elseif t == "string" then
     local s = string.lower(v)
-    -- handle common status strings
     if s == "running" or s == "active" or s == "on" then return true end
     if s == "idle" or s == "off" or s == "stopped" then return false end
-    -- unknown strings: treat as "formed but not sure active"
     return false
   end
   return false
 end
 
+local function record_raw(src, v)
+  sensors.raw_status_src   = src
+  sensors.raw_status_type  = type(v)
+  sensors.raw_status_value = v
+end
+
 local function readReactorFormedAndActive()
-  -- formed = "adapter reachable"
   local formed_ok = false
   local active = false
 
-  -- 1) Try explicit methods if they exist
   if type(reactor.getActive) == "function" then
     local ok, v = safe_call("reactor.getActive()", reactor.getActive)
     if ok then
       formed_ok = true
       active = coerce_active_from_value(v)
+      record_raw("getActive", v)
       return formed_ok, active
     end
   end
+
   if type(reactor.isActive) == "function" then
     local ok, v = safe_call("reactor.isActive()", reactor.isActive)
     if ok then
       formed_ok = true
       active = coerce_active_from_value(v)
+      record_raw("isActive", v)
       return formed_ok, active
     end
   end
 
-  -- 2) Fallback: getStatus()
   do
     local ok, v = safe_call("reactor.getStatus()", reactor.getStatus)
     formed_ok = ok and true or false
-    if ok then
-      active = coerce_active_from_value(v)
-    else
-      active = false
-    end
+    active = (ok and coerce_active_from_value(v)) or false
+    record_raw("getStatus", v)
   end
 
   return formed_ok, active
@@ -213,6 +243,21 @@ local function readSensors()
     local ok, v = safe_call("reactor.getWasteFilledPercentage()", reactor.getWasteFilledPercentage)
     sensors.wasteFrac = (ok and v) or 0
   end
+
+  dbg_rl(
+    "sens",
+    DBG_EVERY_SENSORS_S,
+    string.format(
+      "SENS formed=%s active=%s burn=%.3f max=%.3f raw[%s]=(%s)%s",
+      tostring(sensors.reactor_formed),
+      tostring(sensors.reactor_active),
+      tonumber(sensors.burnRate) or 0,
+      tonumber(sensors.maxBurnReac) or 0,
+      tostring(sensors.raw_status_src),
+      tostring(sensors.raw_status_type),
+      tostring(sensors.raw_status_value)
+    )
+  )
 end
 
 --------------------------
@@ -223,8 +268,7 @@ local function getBurnCap()
   return 20
 end
 
-local function kick_startup()
-  -- immediate attempt to bring reactor out of scram/idle
+local function kick_startup(tag)
   scramIssued = false
   setActivationRS(true)
 
@@ -233,21 +277,21 @@ local function kick_startup()
   if burn < 0 then burn = 0 end
   if burn > cap then burn = cap end
 
+  dbg(string.format("kick_startup(%s): targetBurn=%.3f cap=%.3f applying burn=%.3f", tostring(tag), targetBurn or 0, cap, burn))
+
   safe_call("reactor.setBurnRate()", reactor.setBurnRate, burn)
-  -- allow activate even at burn==0 (your preference)
   safe_call("reactor.activate()", reactor.activate)
 end
 
 local function applyControl()
   if scramLatched or not poweredOn then
+    dbg_rl("apply_off", 1.0, "applyControl(): OFF or SCRAM -> zeroOutput()")
     zeroOutput()
     return
   end
 
-  -- entering run-permitted state; allow future scram attempts again
   scramIssued = false
 
-  -- emergency safety checks
   if emergencyOn then
     if (sensors.damagePct or 0) > MAX_DAMAGE_PCT then
       doScram(string.format("Damage %.2f%% > %.2f%%", sensors.damagePct, MAX_DAMAGE_PCT), "auto"); return
@@ -270,6 +314,8 @@ local function applyControl()
   if burn < 0 then burn = 0 end
   if burn > cap then burn = cap end
 
+  dbg_rl("apply_on", 1.0, string.format("applyControl(): ON targetBurn=%.3f cap=%.3f burn=%.3f", targetBurn or 0, cap, burn))
+
   safe_call("reactor.setBurnRate()", reactor.setBurnRate, burn)
   safe_call("reactor.activate()", reactor.activate)
 end
@@ -280,14 +326,24 @@ end
 local function buildPanelStatus()
   local formed_ok = (sensors.reactor_formed == true)
 
-  -- PHYSICAL running:
-  -- use "active" if available OR burnRate > 0 (covers cases where getStatus isn't "active")
-  local phys_running = formed_ok and ((sensors.reactor_active == true) or ((tonumber(sensors.burnRate) or 0) > 0))
+  -- PHYSICAL running: active OR burnRate>0
+  local burn = tonumber(sensors.burnRate) or 0
+  local phys_running = formed_ok and ((sensors.reactor_active == true) or (burn > 0))
 
   local trip = (scramLatched == true)
   local manual_trip  = trip and (trip_cause == "manual")
   local auto_trip    = trip and (trip_cause == "auto")
   local timeout_trip = trip and (trip_cause == "timeout")
+
+  dbg_rl(
+    "panel",
+    DBG_EVERY_PANEL_S,
+    string.format(
+      "PANEL formed=%s phys_running=%s (active=%s burn=%.3f) poweredOn=%s scramLatched=%s",
+      tostring(formed_ok), tostring(phys_running), tostring(sensors.reactor_active), burn,
+      tostring(poweredOn), tostring(scramLatched)
+    )
+  )
 
   return {
     status_ok      = formed_ok and emergencyOn and (not scramLatched),
@@ -317,6 +373,11 @@ local function buildPanelStatus()
 
     scram_reason = last_scram_reason,
     scram_cause  = trip_cause,
+
+    -- extra debug fields (harmless for your panel)
+    dbg_raw_src   = sensors.raw_status_src,
+    dbg_raw_type  = sensors.raw_status_type,
+    dbg_raw_value = tostring(sensors.raw_status_value),
   }
 end
 
@@ -347,6 +408,8 @@ end
 -- COMMAND HANDLING
 --------------------------
 local function handleCommand(cmd, data, replyCh)
+  dbg("RX CMD "..tostring(cmd).." data="..tostring(data).." replyCh="..tostring(replyCh))
+
   if cmd == "scram" then
     doScram("Remote SCRAM", "manual")
 
@@ -355,27 +418,29 @@ local function handleCommand(cmd, data, replyCh)
     poweredOn         = true
     trip_cause        = "none"
     last_scram_reason = ""
-    dbg("POWER ON")
-    kick_startup()
+    dbg("POWER ON (latch)")
+    kick_startup("power_on")
 
   elseif cmd == "power_off" then
     poweredOn = false
-    dbg("POWER OFF")
+    dbg("POWER OFF (latch)")
 
   elseif cmd == "clear_scram" then
     scramLatched      = false
     trip_cause        = "none"
     last_scram_reason = ""
     dbg("SCRAM CLEARED")
-    if poweredOn then kick_startup() end
+    if poweredOn then kick_startup("clear_scram") end
 
   elseif cmd == "set_target_burn" then
     if type(data) == "number" then
       targetBurn = data
-      dbg("TARGET BURN "..tostring(targetBurn))
+      dbg("SET TARGET BURN "..tostring(targetBurn))
       if poweredOn and (not scramLatched) then
-        kick_startup()
+        kick_startup("set_target_burn")
       end
+    else
+      dbg("IGNORED set_target_burn (data not number): "..tostring(data))
     end
 
   elseif cmd == "set_emergency" then
@@ -383,7 +448,9 @@ local function handleCommand(cmd, data, replyCh)
     dbg("EMERGENCY "..tostring(emergencyOn))
 
   elseif cmd == "request_status" then
-    -- reply below
+    -- no-op, reply below
+  else
+    dbg("UNKNOWN CMD: "..tostring(cmd))
   end
 
   sendStatus(replyCh or CONTROL_CHANNEL)

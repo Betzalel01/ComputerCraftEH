@@ -211,7 +211,11 @@ end
 --------------------------
 local function buildPanelStatus()
   local formed_ok = (sensors.reactor_formed == true)
-  local running = formed_ok and poweredOn and ((sensors.burnRate or 0) > 0)
+-- OLD:
+-- local running = formed_ok and poweredOn and ((sensors.burnRate or 0) > 0)
+
+-- NEW:
+  local running = formed_ok and poweredOn and (sensors.reactor_active == true)
 
   local trip = (scramLatched == true)
   local manual_trip  = trip and (trip_cause == "manual")

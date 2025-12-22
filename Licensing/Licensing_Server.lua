@@ -19,8 +19,8 @@ local REQUEST_TIMEOUT_S = 30
 local BUSY_MSG = "Licensing desk is busy. Please wait."
 
 -- IDs (keep what you already use)
-local TURTLE_ID = nil
-local TABLET_ID = nil
+local TURTLE_ID = 21
+local TABLET_ID = 5
 
 -------------------------
 -- PERIPHERALS

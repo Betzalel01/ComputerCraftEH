@@ -1,19 +1,21 @@
 -- licensing_agent.lua
--- CC:Tweaked turtle + Advanced Peripherals (chatBox + playerDetector)
+-- Turtle: CC:Tweaked + Advanced Peripherals (chatBox + playerDetector)
+-- Admin approvals moved from DM -> TABLET UI via rednet.
 --
--- Drop-in using YOUR pathing exactly as you provided it (no forward/back “fixes” applied).
--- The only edits are:
---   * added missing return true
---   * standardized error strings so debugging is easier
---   * kept all your turns/steps the same
+-- REQUIREMENTS:
+--   * Turtle has a modem (wireless recommended)
+--   * Pocket computer has a modem (wireless)
+--   * Both run rednet on the same network
 
 -------------------------
 -- CONFIG
 -------------------------
-local ADMIN_NAME = "Shade_Angel"
+local ADMIN_NAME = "Shade_Angel" -- used only for fuel alert DM (optional)
 
-local ZONE_ONE = { x = -1752.0, y = =78, z = 1116 }
-local ZONE_TWO = { x = -1752.9, y = 79.9, z = 1116.9 }
+-- IMPORTANT: Coords must be INTEGERS. getPlayersInCoords is a box.
+-- Upper bounds should be > lower bounds.
+local ZONE_ONE = { x = -1753, y = 78, z = 1116 }
+local ZONE_TWO = { x = -1751, y = 80, z = 1118 }
 
 local POLL_PERIOD_S      = 0.25
 local GREET_COOLDOWN_S   = 30
@@ -21,10 +23,18 @@ local REQUEST_TIMEOUT_S  = 30
 local ADMIN_TIMEOUT_S    = 90
 local BUSY_MSG           = "Licensing desk is busy. Please wait."
 
+-- Dropper trigger
 local DROPPER_RS_SIDE = "front"
 local RS_PULSE_S      = 0.5
 
+-- Fuel
 local FUEL_THRESHOLD  = 200
+
+-- Tablet networking
+local REDNET_PROTOCOL = "licensing_v1"
+-- Optional: set your tablet computer ID for direct send (recommended).
+-- If nil, requests are broadcast and any tablet UI can answer.
+local TABLET_ID = nil
 
 -------------------------
 -- PERIPHERALS
@@ -35,11 +45,15 @@ if not detector then error("No playerDetector found.", 0) end
 local chat = peripheral.find("chatBox")
 if not chat then error("No chatBox found.", 0) end
 
+local modem = peripheral.find("modem")
+if not modem then error("No modem found (required for rednet).", 0) end
+
+rednet.open(peripheral.getName(modem))
+
 -------------------------
 -- UTIL
 -------------------------
 local function dm(player, msg)
-  -- If DMs don't arrive, swap args: pcall(chat.sendMessageToPlayer, player, msg)
   pcall(chat.sendMessageToPlayer, msg, player)
 end
 
@@ -79,22 +93,57 @@ local function parse_player_request(msg)
   return nil
 end
 
-local function parse_admin_decision(msg)
-  msg = tostring(msg or ""):lower()
-  if msg:match("^%s*deny%s*$") then return { approved=false } end
-  local lvl = msg:match("^%s*approve%s+(%d+)%s*$")
-           or msg:match("^%s*allow%s+(%d+)%s*$")
-           or msg:match("^%s*grant%s+(%d+)%s*$")
-  if lvl then return { approved=true, level=tonumber(lvl) } end
-  return nil
-end
-
 local function parse_done(msg)
   msg = tostring(msg or ""):lower()
   return msg:match("^%s*done%s*$")
       or msg:match("^%s*deposited%s*$")
       or msg:match("^%s*ok%s*$")
       or msg:match("^%s*finished%s*$")
+end
+
+local function new_request_id()
+  return ("%d-%d"):format(os.epoch("utc"), math.random(1000, 9999))
+end
+
+-- Send approval request to tablet and wait for response
+-- Returns: decision table {approved=true/false, level=int|nil} or nil,"timeout"
+local function request_tablet_approval(requester, request_text, timeout_s)
+  local id = new_request_id()
+  local payload = {
+    kind = "approval_request",
+    id = id,
+    requester = requester,
+    request_text = request_text,
+    time_utc_ms = os.epoch("utc"),
+  }
+
+  if TABLET_ID then
+    rednet.send(TABLET_ID, payload, REDNET_PROTOCOL)
+  else
+    rednet.broadcast(payload, REDNET_PROTOCOL)
+  end
+
+  local deadline = os.epoch("utc") + math.floor(timeout_s * 1000)
+  while os.epoch("utc") < deadline do
+    local remaining = math.max(0, deadline - os.epoch("utc"))
+    local sender, msg, proto = rednet.receive(REDNET_PROTOCOL, remaining / 1000)
+
+    if sender and type(msg) == "table" and msg.kind == "approval_response" and msg.id == id then
+      -- Expected:
+      -- {kind="approval_response", id=id, approved=true/false, level=number|nil}
+      if msg.approved then
+        local lvl = tonumber(msg.level)
+        if not lvl or lvl < 1 then
+          return { approved=false, reason="invalid level" }
+        end
+        return { approved=true, level=lvl }
+      else
+        return { approved=false }
+      end
+    end
+  end
+
+  return nil, "timeout"
 end
 
 -------------------------
@@ -424,20 +473,11 @@ local function handle_issue(player)
     return
   end
 
-  dm(ADMIN_NAME,
-     ("ACCESS REQUEST: %s requested '%s'. Reply: 'approve <level>' or 'deny'"):format(player, tostring(msg)))
-  dm(player, "Request submitted. Awaiting approval...")
+  dm(player, "Request submitted. Awaiting tablet approval...")
 
-  local ok_dec, admin_msg = wait_for_chat_from(ADMIN_NAME, ADMIN_TIMEOUT_S)
-  if not ok_dec then
-    dm(player, "No decision was made in time. Please try again later.")
-    return
-  end
-
-  local decision = parse_admin_decision(admin_msg)
+  local decision, derr = request_tablet_approval(player, msg, ADMIN_TIMEOUT_S)
   if not decision then
-    dm(ADMIN_NAME, "Invalid format. Reply with: 'approve <level>' or 'deny'")
-    dm(player, "Approval input invalid. Please try again.")
+    dm(player, "No decision was made in time. Please try again later.")
     return
   end
 
@@ -447,12 +487,7 @@ local function handle_issue(player)
   end
 
   local level = decision.level
-  if not level or level < 1 then
-    dm(player, "Denied (invalid level).")
-    return
-  end
-
-  dm(player, ("Approved for keycard level %d. Dispensing..."):format(level))
+  dm(player, ("Approved for keycard level %d. Retrieving..."):format(level))
 
   local ok1, err1 = path_to_card_storage(level)
   if not ok1 then
@@ -494,6 +529,8 @@ end
 -------------------------
 -- MAIN LOOP
 -------------------------
+math.randomseed(os.epoch("utc"))
+
 while true do
   if not busy then
     ensure_fuel()

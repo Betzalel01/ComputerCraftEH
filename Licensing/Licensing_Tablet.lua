@@ -1,15 +1,16 @@
 -- Licensing_Tablet.lua
--- Cleaned GUI (full drop-in):
---   * Pending request display
---   * Buttons: APPROVE / DENY (approve text fixed so it isn't invisible)
---   * APPROVE -> choose LEVEL 1–5 (clickable + typeable)
---   * DENY -> confirm (clickable + Enter/Esc)
---   * Queue support (handles multiple requests in order)
+-- Fixes:
+--  1) CLICKING: tablets often emit monitor_touch (not mouse_click). Now supports BOTH.
+--  2) LEVEL BUTTONS CUT OFF: button width is now computed from screen width (no fixed 7),
+--     so 1–5 always fit (even on small pocket/tablet screens).
+--  3) Keeps number centering (labels centered inside each button).
+--
+-- Behavior:
+--  * APPROVE -> level select 1–5 (click OR press 1–5)
+--  * DENY -> confirm (click OR Enter), Esc cancels.
 
 local PROTOCOL = "licensing_v1"
-
--- Optional hard-code. If nil, binds to first server hello it receives.
-local SERVER_ID = nil
+local SERVER_ID = nil -- optional hard-code
 
 -------------------------
 -- REDNET INIT
@@ -30,7 +31,9 @@ end
 -------------------------
 -- UI UTIL
 -------------------------
-local function clamp(n, a, b) if n < a then return a elseif n > b then return b else return n end end
+local function clamp(n, a, b)
+  if n < a then return a elseif n > b then return b else return n end
+end
 
 local function termSize()
   local w, h = term.getSize()
@@ -45,7 +48,7 @@ local function clear()
 end
 
 local function centerText(y, text, color)
-  local w = termSize()
+  local w = (select(1, termSize()))
   local x = math.floor((w - #text)/2) + 1
   term.setCursorPos(clamp(x,1,w), y)
   if color then term.setTextColor(color) end
@@ -87,7 +90,7 @@ end
 -- STATE
 -------------------------
 local pending = {}
-local mode = "idle"  -- idle | approve_level | confirm_deny
+local mode = "idle" -- idle | approve_level | confirm_deny
 local active = nil
 
 -------------------------
@@ -110,11 +113,29 @@ local function announce()
 end
 
 -------------------------
+-- ACTIONS
+-------------------------
+local function send_response(approved, level)
+  if not SERVER_ID or not active then return end
+  send(SERVER_ID, {
+    kind = "approval_response",
+    id = active.id,
+    approved = approved and true or false,
+    level = level,
+  })
+end
+
+local function next_request()
+  active = nil
+  mode = "idle"
+end
+
+-------------------------
 -- RENDER
 -------------------------
 local function render()
   clear()
-  local w,h = termSize()
+  local w, h = termSize()
 
   centerText(1, "LICENSING APPROVALS", colors.white)
   term.setCursorPos(2,2)
@@ -123,7 +144,7 @@ local function render()
   term.setTextColor(colors.white)
   term.write("Server: " .. tostring(SERVER_ID or "nil"))
 
-  -- Load next request if needed
+  -- Pull next request if needed
   if (not active) and (#pending > 0) then
     active = table.remove(pending, 1)
     mode = "idle"
@@ -151,7 +172,7 @@ local function render()
   }
 
   local y = panelTop + 2
-  for _,ln in ipairs(lines) do
+  for _, ln in ipairs(lines) do
     term.setCursorPos(3, y)
     term.setTextColor(colors.white)
     term.write(ln:sub(1, w-4))
@@ -166,7 +187,7 @@ local function render()
       x2=math.floor(w/2)-1, y2=h-3,
       label="APPROVE",
       bg=colors.green,
-      fg=colors.white,      -- FIX: was black and invisible on some packs
+      fg=colors.white, -- important
     }
     btns.deny = {
       x1=math.floor(w/2)+1, y1=h-5,
@@ -186,17 +207,29 @@ local function render()
   elseif mode == "approve_level" then
     centerText(h-6, "Select approval level (1-5)", colors.yellow)
 
-    -- FIX: center level buttons as a group + ensure odd width so label centers perfectly
+    -- Dynamic button sizing so 1–5 always fit on the current screen
     local gap = 1
-    local bw = 7 -- fixed odd width for better centering
+    local leftMargin = 2
+    local rightMargin = 2
+    local usable = w - leftMargin - rightMargin
+    local bw = math.floor((usable - gap*4) / 5)
+    if bw < 3 then bw = 3 end -- still clickable
+    -- If we're tight, shrink margins automatically
     local total = bw*5 + gap*4
     local startX = math.floor((w - total)/2) + 1
+    if startX < 2 then startX = 2 end
     local x = startX
 
     for lvl=1,5 do
+      local x1 = x
+      local x2 = x + bw - 1
+      -- Clamp to screen just in case
+      x1 = clamp(x1, 2, w-1)
+      x2 = clamp(x2, 2, w-1)
+
       local b = {
-        x1=x, y1=h-5,
-        x2=x+bw-1, y2=h-3,
+        x1=x1, y1=h-5,
+        x2=x2, y2=h-3,
         label=tostring(lvl),
         bg=colors.gray,
         fg=colors.white,
@@ -242,28 +275,24 @@ local function render()
 end
 
 -------------------------
--- ACTIONS
+-- INPUT NORMALIZATION (mouse_click + monitor_touch)
 -------------------------
-local function send_response(approved, level)
-  if not SERVER_ID then return end
-  send(SERVER_ID, {
-    kind = "approval_response",
-    id = active.id,
-    approved = approved and true or false,
-    level = level,
-  })
-end
-
-local function next_request()
-  active = nil
-  mode = "idle"
+local function normalize_click(ev, a, b, c)
+  -- mouse_click: (button, x, y)
+  if ev == "mouse_click" then
+    return b, c
+  end
+  -- monitor_touch: (side, x, y)
+  if ev == "monitor_touch" then
+    return b, c
+  end
+  return nil, nil
 end
 
 -------------------------
 -- MAIN LOOP
 -------------------------
 announce()
-
 local btns = render()
 local lastAnnounce = os.epoch("utc")
 
@@ -271,7 +300,7 @@ while true do
   local e = { os.pullEvent() }
   local ev = e[1]
 
-  -- Periodic announce (helps if server restarts)
+  -- periodic announce (server restarts)
   if (os.epoch("utc") - lastAnnounce) > 3000 then
     announce()
     lastAnnounce = os.epoch("utc")
@@ -284,7 +313,6 @@ while true do
         bind_server(sender)
         announce()
         btns = render()
-
       elseif msg.kind == "approval_request" then
         bind_server(sender)
         table.insert(pending, msg)
@@ -292,38 +320,38 @@ while true do
       end
     end
 
-  elseif ev == "mouse_click" then
-    local _, mx, my = table.unpack(e)
-    if not btns then btns = render() end
+  elseif ev == "mouse_click" or ev == "monitor_touch" then
+    local x, y = normalize_click(ev, e[2], e[3], e[4])
+    if x and y then
+      if mode == "idle" and active then
+        if btns.approve and hit(btns.approve, x, y) then
+          mode = "approve_level"
+          btns = render()
+        elseif btns.deny and hit(btns.deny, x, y) then
+          mode = "confirm_deny"
+          btns = render()
+        end
 
-    if mode == "idle" and active then
-      if btns.approve and hit(btns.approve, mx, my) then
-        mode = "approve_level"
-        btns = render()
-      elseif btns.deny and hit(btns.deny, mx, my) then
-        mode = "confirm_deny"
-        btns = render()
-      end
+      elseif mode == "approve_level" and active then
+        for lvl=1,5 do
+          local b = btns["lvl"..lvl]
+          if b and hit(b, x, y) then
+            send_response(true, lvl)
+            next_request()
+            btns = render()
+            break
+          end
+        end
 
-    elseif mode == "approve_level" and active then
-      for lvl=1,5 do
-        local b = btns["lvl"..lvl]
-        if b and hit(b, mx, my) then
-          send_response(true, lvl)
+      elseif mode == "confirm_deny" and active then
+        if btns.no and hit(btns.no, x, y) then
+          mode = "idle"
+          btns = render()
+        elseif btns.yes and hit(btns.yes, x, y) then
+          send_response(false, nil)
           next_request()
           btns = render()
-          break
         end
-      end
-
-    elseif mode == "confirm_deny" and active then
-      if btns.no and hit(btns.no, mx, my) then
-        mode = "idle"
-        btns = render()
-      elseif btns.yes and hit(btns.yes, mx, my) then
-        send_response(false, nil)
-        next_request()
-        btns = render()
       end
     end
 
@@ -350,7 +378,6 @@ while true do
 
   elseif ev == "key" then
     local key = e[2]
-
     if key == keys.esc then
       if mode ~= "idle" then
         mode = "idle"

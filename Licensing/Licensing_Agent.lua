@@ -1,153 +1,51 @@
--- licensing_agent.lua
--- Turtle: CC:Tweaked + Advanced Peripherals (chatBox + playerDetector)
--- Admin approvals moved from DM -> TABLET UI via rednet.
---
--- REQUIREMENTS:
---   * Turtle has a modem (wireless recommended)
---   * Pocket computer has a modem (wireless)
---   * Both run rednet on the same network
+-- Licensing/Licensing_Agent.lua
+-- Turtle runner: modem upgrade ONLY (no chatbox, no playerDetector needed)
+-- Responsibilities:
+--  * Execute physical actions when commanded by server:
+--      - dispense_card(level)
+--      - return_card()
+--  * Your pathing is kept EXACTLY as you posted.
+
+local PROTOCOL = "licensing_v1"
+
+-------------------------
+-- REDNET INIT
+-------------------------
+local function ensure_rednet()
+  if rednet.isOpen() then return true end
+  for _, s in ipairs({"left","right","top","bottom","front","back"}) do
+    pcall(rednet.open, s)
+    if rednet.isOpen() then return true end
+  end
+  return false
+end
+
+if not ensure_rednet() then
+  error("Rednet not available on turtle. Install a wireless modem upgrade.", 0)
+end
 
 -------------------------
 -- CONFIG
 -------------------------
-local ADMIN_NAME = "Shade_Angel" -- used only for fuel alert DM (optional)
-
--- IMPORTANT: Coords must be INTEGERS. getPlayersInCoords is a box.
--- Upper bounds should be > lower bounds.
-local ZONE_ONE = { x = -1753, y = 78, z = 1116 }
-local ZONE_TWO = { x = -1751, y = 80, z = 1118 }
-
-local POLL_PERIOD_S      = 0.25
-local GREET_COOLDOWN_S   = 30
-local REQUEST_TIMEOUT_S  = 30
-local ADMIN_TIMEOUT_S    = 90
-local BUSY_MSG           = "Licensing desk is busy. Please wait."
-
--- Dropper trigger
 local DROPPER_RS_SIDE = "front"
 local RS_PULSE_S      = 0.5
-
--- Fuel
 local FUEL_THRESHOLD  = 200
-
--- Tablet networking
-local REDNET_PROTOCOL = "licensing_v1"
--- Optional: set your tablet computer ID for direct send (recommended).
--- If nil, requests are broadcast and any tablet UI can answer.
-local TABLET_ID = nil
-
--------------------------
--- PERIPHERALS
--------------------------
-local detector = peripheral.find("playerDetector")
-if not detector then error("No playerDetector found.", 0) end
-
-local chat = peripheral.find("chatBox")
-if not chat then error("No chatBox found.", 0) end
-
-local modem = peripheral.find("modem")
-if not modem then error("No modem found (required for rednet).", 0) end
-
-rednet.open(peripheral.getName(modem))
 
 -------------------------
 -- UTIL
 -------------------------
-local function dm(player, msg)
-  pcall(chat.sendMessageToPlayer, msg, player)
-end
-
 local function pulse_dropper()
   redstone.setOutput(DROPPER_RS_SIDE, true)
   sleep(RS_PULSE_S)
   redstone.setOutput(DROPPER_RS_SIDE, false)
 end
 
-local function wait_for_chat_from(expected_player, timeout_s)
-  local timer = os.startTimer(timeout_s)
-  while true do
-    local ev, a, b = os.pullEvent()
-    if ev == "chat" then
-      local player, msg = a, b
-      if player == expected_player then
-        return true, msg
-      end
-    elseif ev == "timer" and a == timer then
-      return false, "timeout"
-    end
-  end
-end
-
-local function parse_player_request(msg)
-  msg = tostring(msg or ""):lower()
-
-  if msg:match("^%s*return%s*$") then return { kind="return" } end
-  if msg:match("^%s*return%s+keycard%s*$") then return { kind="return" } end
-  if msg:match("^%s*keycard%s+return%s*$") then return { kind="return" } end
-
-  if msg:match("^%s*keycard%s*$") then return { kind="keycard" } end
-  local lvl = msg:match("^%s*keycard%s+(%d+)%s*$")
-  if lvl then return { kind="keycard", level=tonumber(lvl) } end
-  if msg:match("^%s*card%s*$") or msg:match("^%s*access%s*$") then return { kind="keycard" } end
-
-  return nil
-end
-
-local function parse_done(msg)
-  msg = tostring(msg or ""):lower()
-  return msg:match("^%s*done%s*$")
-      or msg:match("^%s*deposited%s*$")
-      or msg:match("^%s*ok%s*$")
-      or msg:match("^%s*finished%s*$")
-end
-
-local function new_request_id()
-  return ("%d-%d"):format(os.epoch("utc"), math.random(1000, 9999))
-end
-
--- Send approval request to tablet and wait for response
--- Returns: decision table {approved=true/false, level=int|nil} or nil,"timeout"
-local function request_tablet_approval(requester, request_text, timeout_s)
-  local id = new_request_id()
-  local payload = {
-    kind = "approval_request",
-    id = id,
-    requester = requester,
-    request_text = request_text,
-    time_utc_ms = os.epoch("utc"),
-  }
-
-  if TABLET_ID then
-    rednet.send(TABLET_ID, payload, REDNET_PROTOCOL)
-  else
-    rednet.broadcast(payload, REDNET_PROTOCOL)
-  end
-
-  local deadline = os.epoch("utc") + math.floor(timeout_s * 1000)
-  while os.epoch("utc") < deadline do
-    local remaining = math.max(0, deadline - os.epoch("utc"))
-    local sender, msg, proto = rednet.receive(REDNET_PROTOCOL, remaining / 1000)
-
-    if sender and type(msg) == "table" and msg.kind == "approval_response" and msg.id == id then
-      -- Expected:
-      -- {kind="approval_response", id=id, approved=true/false, level=number|nil}
-      if msg.approved then
-        local lvl = tonumber(msg.level)
-        if not lvl or lvl < 1 then
-          return { approved=false, reason="invalid level" }
-        end
-        return { approved=true, level=lvl }
-      else
-        return { approved=false }
-      end
-    end
-  end
-
-  return nil, "timeout"
+local function reply(to_id, id, ok, err)
+  rednet.send(to_id, { kind="turtle_resp", id=id, ok=ok, err=err }, PROTOCOL)
 end
 
 -------------------------
--- PATHING (YOUR CURRENT PATHING)
+-- YOUR PATHING (UNCHANGED)
 -------------------------
 -- dropper -> station
 local function path_to_station()
@@ -334,7 +232,6 @@ local function insert_card_into_dropper()
   if not slot then return false, "No card in inventory" end
 
   turtle.select(slot)
-
   if not turtle.drop(1) then
     return false, "Insert failed (wrong side or dropper full)"
   end
@@ -371,13 +268,8 @@ local function ensure_fuel()
   if fuel == "unlimited" then return true end
   if fuel >= FUEL_THRESHOLD then return true end
 
-  dm(ADMIN_NAME, ("FUEL LOW (%d). Refueling..."):format(fuel))
-
   local ok1, err1 = path_to_fuel_storage()
-  if not ok1 then
-    dm(ADMIN_NAME, "FUEL ERROR: can't reach fuel storage: " .. tostring(err1))
-    return false
-  end
+  if not ok1 then return false, "FUEL: can't reach fuel storage: " .. tostring(err1) end
 
   turtle.suck(64)
   for slot = 1, 16 do
@@ -391,169 +283,95 @@ local function ensure_fuel()
   turtle.select(1)
 
   local ok2, err2 = path_fuel_storage_to_station()
-  if not ok2 then
-    dm(ADMIN_NAME, "FUEL WARNING: refueled but couldn't return to station: " .. tostring(err2))
-    return false
-  end
+  if not ok2 then return false, "FUEL: refueled but couldn't return: " .. tostring(err2) end
 
-  dm(ADMIN_NAME, ("FUEL NOW: %s"):format(tostring(turtle.getFuelLevel())))
   return true
 end
 
 -------------------------
--- CORE FLOWS
+-- COMMAND HANDLERS
 -------------------------
-local busy = false
-local last_greet = {}
+local function do_dispense(level)
+  local okf, erf = ensure_fuel()
+  if not okf then return false, erf end
 
-local function handle_return(player)
-  dm(player, "Return accepted. Place your keycard into the dropper, then type: done")
+  local ok1, err1 = path_to_card_storage(level)
+  if not ok1 then return false, err1 end
 
-  local ok_done, msg_done = wait_for_chat_from(player, REQUEST_TIMEOUT_S)
-  if not ok_done then
-    dm(player, "Timed out waiting for confirmation. Step up again to retry.")
-    return
+  local ok2, err2 = grab_one()
+  if not ok2 then
+    -- attempt to return to dropper path then station
+    path_to_dropper(level)
+    path_to_station()
+    return false, err2
   end
-  if not parse_done(msg_done) then
-    dm(player, "Unrecognized response. Type: done after depositing.")
-    return
+
+  local ok3, err3 = path_to_dropper(level)
+  if not ok3 then return false, err3 end
+
+  local ok4, err4 = insert_card_into_dropper()
+  if not ok4 then
+    path_to_station()
+    return false, err4
   end
+
+  path_to_station()
+  return true
+end
+
+local function do_return()
+  local okf, erf = ensure_fuel()
+  if not okf then return false, erf end
 
   local okp, errp = path_station_to_dropper()
-  if not okp then
-    dm(player, "Internal error reaching dropper: " .. tostring(errp))
-    return
-  end
+  if not okp then return false, errp end
 
   local oks, errs = take_return_from_dropper()
   if not oks then
-    dm(player, "No card detected in dropper. Please deposit and try again.")
     path_to_station()
-    return
+    return false, errs
   end
 
   local okr, errr = path_dropper_to_return_chest()
   if not okr then
-    dm(player, "Internal error reaching return chest: " .. tostring(errr))
     path_return_chest_to_station()
-    return
+    return false, errr
   end
 
   local okd, errd = drop_into_return_chest()
   if not okd then
-    dm(player, "Return failed (storage issue): " .. tostring(errd))
     path_return_chest_to_station()
-    return
+    return false, errd
   end
 
   path_return_chest_to_station()
-  dm(player, "Keycard return complete. Thank you.")
-end
-
-local function handle_issue(player)
-  ensure_fuel()
-
-  dm(player, "Licensing desk: What do you need? (type: keycard) OR (type: return)")
-  dm(player, "Note: Keycard requests require approval.")
-
-  local ok_req, msg = wait_for_chat_from(player, REQUEST_TIMEOUT_S)
-  if not ok_req then
-    dm(player, "No response received. Please step up again to retry.")
-    return
-  end
-
-  local req = parse_player_request(msg)
-  if not req then
-    dm(player, "Unrecognized request. Type: keycard OR return")
-    return
-  end
-
-  if req.kind == "return" then
-    handle_return(player)
-    return
-  end
-
-  dm(player, "Request submitted. Awaiting tablet approval...")
-
-  local decision, derr = request_tablet_approval(player, msg, ADMIN_TIMEOUT_S)
-  if not decision then
-    dm(player, "No decision was made in time. Please try again later.")
-    return
-  end
-
-  if not decision.approved then
-    dm(player, "Denied. Please see staff for assistance.")
-    return
-  end
-
-  local level = decision.level
-  dm(player, ("Approved for keycard level %d. Retrieving..."):format(level))
-
-  local ok1, err1 = path_to_card_storage(level)
-  if not ok1 then
-    dm(player, "Internal error reaching storage: " .. tostring(err1))
-    return
-  end
-
-  local ok2, err2 = grab_one()
-  if not ok2 then
-    dm(player, "Unable to dispense (stock issue): " .. tostring(err2))
-    path_to_dropper(level)
-    path_to_station()
-    return
-  end
-
-  local ok3, err3 = path_to_dropper(level)
-  if not ok3 then
-    dm(player, "Internal error reaching dropper: " .. tostring(err3))
-    return
-  end
-
-  local ok4, err4 = insert_card_into_dropper()
-  if not ok4 then
-    dm(player, "Dispense failed at dropper: " .. tostring(err4))
-    path_to_station()
-    return
-  end
-
-  dm(player, ("Keycard level %d has been dispensed."):format(level))
-  path_to_station()
-end
-
-local function handle_interaction(player)
-  busy = true
-  handle_issue(player)
-  busy = false
+  return true
 end
 
 -------------------------
 -- MAIN LOOP
 -------------------------
-math.randomseed(os.epoch("utc"))
+rednet.broadcast({ kind="hello_turtle" }, PROTOCOL)
+print("Licensing Agent turtle online. ID: " .. os.getComputerID())
 
 while true do
-  if not busy then
-    ensure_fuel()
-  end
+  local sender, msg, proto = rednet.receive(PROTOCOL)
+  if type(msg) == "table" and msg.kind == "turtle_cmd" then
+    local id = msg.id
+    local cmd = msg.cmd
+    local payload = msg.payload or {}
 
-  local players = detector.getPlayersInCoords(ZONE_ONE, ZONE_TWO)
-  if #players > 0 then
-    local p = players[1]
-    local last = last_greet[p] or -1e9
-    local t = os.epoch("utc") / 1000
+    if cmd == "dispense_card" then
+      local ok, err = do_dispense(payload.level)
+      reply(sender, id, ok, err)
 
-    if busy then
-      if (t - last) >= GREET_COOLDOWN_S then
-        dm(p, BUSY_MSG)
-        last_greet[p] = t
-      end
+    elseif cmd == "return_card" then
+      local ok, err = do_return()
+      reply(sender, id, ok, err)
+
     else
-      if (t - last) >= GREET_COOLDOWN_S then
-        last_greet[p] = t
-        handle_interaction(p)
-      end
+      reply(sender, id, false, "Unknown cmd: " .. tostring(cmd))
     end
   end
-
-  sleep(POLL_PERIOD_S)
 end
+

@@ -1,194 +1,337 @@
 -- Licensing_Tablet.lua
--- Pocket computer (tablet) UI for licensing approvals
+-- Cleaned GUI:
+--   * Main screen: shows current pending request (or none)
+--   * Buttons: APPROVE / DENY
+--   * If APPROVE: prompts for LEVEL 1–5 (buttons + number keys)
+--   * If DENY: sends deny immediately (with confirm)
 --
--- IMPORTANT:
--- Your error shows `rednet.open("back")` fails because this pocket does NOT have a modem.
--- That means either:
---   (A) You're on a CC:Tweaked version/config where pockets require a Wireless Modem upgrade, OR
---   (B) This "tablet" item is not actually a pocket computer with networking enabled.
---
--- FIX:
---   1) Install a WIRELESS MODEM on the pocket computer (upgrade it).
---   2) Then this program will work.
---
--- This file also runs on a normal computer with an attached modem, unchanged.
+-- Note: Your message said "deny then ask level". That doesn't make sense for the protocol,
+-- so this implements the practical flow: APPROVE -> choose level. If you truly want the
+-- reverse, tell me and I’ll flip it.
 
-local REDNET_PROTOCOL = "licensing_v1"
+local PROTOCOL = "licensing_v1"
+
+-- If you hard-coded the server id, keep it here (optional).
+-- If nil, the tablet will bind to the first server that sends hello_server.
+local SERVER_ID = nil
 
 -------------------------
--- REDNET INIT (robust)
+-- REDNET INIT
 -------------------------
 local function ensure_rednet()
   if rednet.isOpen() then return true end
-
-  -- Try all normal sides (computers)
-  local sides = {"left","right","top","bottom","front","back"}
-  for _, s in ipairs(sides) do
-    local ok = pcall(rednet.open, s)
-    if ok and rednet.isOpen() then
-      return true
-    end
+  for _, s in ipairs({"left","right","top","bottom","front","back"}) do
+    pcall(rednet.open, s)
+    if rednet.isOpen() then return true end
   end
-
   return false
 end
 
 if not ensure_rednet() then
+  error("No modem found / rednet not open. Tablet needs a (wireless/ender) modem.", 0)
+end
+
+-------------------------
+-- UI UTIL
+-------------------------
+local function clamp(n, a, b) if n < a then return a elseif n > b then return b else return n end end
+
+local function termSize()
+  local w, h = term.getSize()
+  return w, h
+end
+
+local function clear()
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
   term.clear()
   term.setCursorPos(1,1)
-  print("ERROR: Rednet not available.")
-  print("")
-  print("Pocket computers in your setup need a WIRELESS MODEM upgrade.")
-  print("Install it, then rerun this program.")
-  print("")
-  print("Also ensure the turtle/computer you talk to has a wireless modem too.")
-  return
 end
 
--------------------------
--- UI HELPERS
--------------------------
-local W, H = term.getSize()
-local queue, idx = {}, 1
-
-local function clamp_idx()
-  if #queue == 0 then idx = 1 return end
-  if idx < 1 then idx = 1 end
-  if idx > #queue then idx = #queue end
-end
-
-local function center(y, text)
-  local x = math.max(1, math.floor((W - #text) / 2))
-  term.setCursorPos(x, y)
+local function centerText(y, text, color)
+  local w = termSize()
+  local x = math.floor((w - #text)/2) + 1
+  term.setCursorPos(clamp(x,1,w), y)
+  if color then term.setTextColor(color) end
   term.write(text)
+  term.setTextColor(colors.white)
 end
 
-local function draw_box(x1, y1, x2, y2)
-  for y = y1, y2 do
-    term.setCursorPos(x1, y)
-    term.write(string.rep(" ", math.max(0, x2 - x1 + 1)))
+local function drawBox(x1,y1,x2,y2,bg)
+  term.setBackgroundColor(bg or colors.gray)
+  for y=y1,y2 do
+    term.setCursorPos(x1,y)
+    term.write(string.rep(" ", x2-x1+1))
   end
+  term.setBackgroundColor(colors.black)
 end
 
-local function draw_button(x1, y1, x2, y2, label)
-  draw_box(x1, y1, x2, y2)
-  local lx = x1 + math.max(0, math.floor((x2 - x1 + 1 - #label) / 2))
-  local ly = y1 + math.floor((y2 - y1) / 2)
-  term.setCursorPos(lx, ly)
-  term.write(label)
+local function drawButton(btn)
+  -- btn: {x1,y1,x2,y2,label,bg,fg}
+  drawBox(btn.x1, btn.y1, btn.x2, btn.y2, btn.bg or colors.gray)
+  term.setTextColor(btn.fg or colors.white)
+  local cx = math.floor((btn.x1 + btn.x2 - #btn.label)/2)
+  local cy = math.floor((btn.y1 + btn.y2)/2)
+  term.setCursorPos(cx, cy)
+  term.write(btn.label)
+  term.setTextColor(colors.white)
+  term.setBackgroundColor(colors.black)
 end
 
-local function hit(x, y, x1, y1, x2, y2)
-  return x >= x1 and x <= x2 and y >= y1 and y <= y2
+local function hit(btn, x, y)
+  return x >= btn.x1 and x <= btn.x2 and y >= btn.y1 and y <= btn.y2
 end
 
-local function current()
-  if #queue == 0 then return nil end
-  clamp_idx()
-  return queue[idx]
+-------------------------
+-- STATE
+-------------------------
+local pending = {}   -- queue of requests
+-- request shape expected from server:
+-- { kind="approval_request", id=..., requester=..., request_text=... }
+
+local mode = "idle"  -- "idle" | "approve_level" | "confirm_deny"
+local active = nil   -- current request
+
+-------------------------
+-- REDNET SEND
+-------------------------
+local function send(to, tbl)
+  rednet.send(to, tbl, PROTOCOL)
 end
 
-local function pop_current()
-  if #queue == 0 then return end
-  clamp_idx()
-  table.remove(queue, idx)
-  clamp_idx()
+local function bind_server(sender)
+  if not SERVER_ID then SERVER_ID = sender end
 end
 
-local function redraw()
-  term.clear()
-  term.setCursorPos(1,1)
-  center(1, "LICENSING APPROVALS")
-  center(2, "Rednet OK. Listening...")
-
-  if #queue == 0 then
-    center(4, "No pending requests.")
+local function announce()
+  if SERVER_ID then
+    send(SERVER_ID, { kind="hello_tablet" })
   else
-    clamp_idx()
-    local r = queue[idx]
-    center(4, ("Request %d/%d"):format(idx, #queue))
-    term.setCursorPos(1,6); term.write(("From:   %s"):format(tostring(r.requester or "?")))
-    term.setCursorPos(1,7); term.write(("Text:   %s"):format(tostring(r.request_text or "?")))
-    term.setCursorPos(1,8); term.write(("Req ID: %s"):format(tostring(r.id or "?")))
-    term.setCursorPos(1,9); term.write(("Server: %s"):format(tostring(r.server_id or "?")))
+    -- If server doesn't have an ID yet, broadcast presence.
+    rednet.broadcast({ kind="hello_tablet" }, PROTOCOL)
   end
-
-  local yb = math.max(10, H - 6)
-  draw_button(2,  yb,     12, yb + 2, "DENY")
-  draw_button(14, yb,     24, yb + 2, "APP 1")
-  draw_button(26, yb,     36, yb + 2, "APP 2")
-  draw_button(38, yb,     48, yb + 2, "APP 3")
-  draw_button(50, yb,     60, yb + 2, "APP 4")
-
-  draw_button(14, yb + 3, 24, yb + 5, "APP 5")
-  draw_button(26, yb + 3, 36, yb + 5, "NEXT")
-  draw_button(38, yb + 3, 60, yb + 5, "CLEAR ALL")
 end
 
-local function send_decision(approved, level)
-  local r = current()
-  if not r then return end
+-------------------------
+-- RENDER
+-------------------------
+local function render()
+  clear()
+  local w,h = termSize()
 
-  local resp = {
-    kind = "approval_response",
-    id = r.id,
-    approved = approved,
-    level = level,
+  centerText(1, "LICENSING APPROVALS", colors.white)
+  term.setCursorPos(2,2)
+  term.setTextColor(colors.lightGray)
+  term.write("Rednet OK. Listening...  ")
+  term.setTextColor(colors.white)
+  term.write("Server: " .. tostring(SERVER_ID or "nil"))
+
+  -- Determine active request
+  if (not active) and (#pending > 0) then
+    active = table.remove(pending, 1)
+    mode = "idle"
+  end
+
+  if not active then
+    centerText(math.floor(h/2), "No pending requests.", colors.lightGray)
+    return
+  end
+
+  -- Request panel
+  local panelTop = 4
+  local panelBottom = h - 7
+  drawBox(2, panelTop, w-1, panelBottom, colors.black)
+
+  term.setCursorPos(3, panelTop)
+  term.setTextColor(colors.cyan)
+  term.write("Pending Request")
+  term.setTextColor(colors.white)
+
+  local lines = {
+    "From: " .. tostring(active.requester),
+    "Text: " .. tostring(active.request_text),
+    "ID:   " .. tostring(active.id),
   }
 
-  if r.server_id then
-    rednet.send(r.server_id, resp, REDNET_PROTOCOL)
-  else
-    rednet.broadcast(resp, REDNET_PROTOCOL)
+  local y = panelTop + 2
+  term.setTextColor(colors.white)
+  for _,ln in ipairs(lines) do
+    term.setCursorPos(3, y); term.write(ln:sub(1, w-4))
+    y = y + 1
   end
 
-  pop_current()
+  -- Buttons / submodes
+  local btns = {}
+
+  if mode == "idle" then
+    btns.approve = {x1=3, y1=h-5, x2=math.floor(w/2)-1, y2=h-3, label="APPROVE", bg=colors.green, fg=colors.black}
+    btns.deny    = {x1=math.floor(w/2)+1, y1=h-5, x2=w-2, y2=h-3, label="DENY", bg=colors.red, fg=colors.white}
+    drawButton(btns.approve)
+    drawButton(btns.deny)
+
+    term.setCursorPos(3, h-2)
+    term.setTextColor(colors.lightGray)
+    term.write("Keys: A=approve  D=deny")
+    term.setTextColor(colors.white)
+
+  elseif mode == "approve_level" then
+    centerText(h-6, "Select approval level (1-5)", colors.yellow)
+
+    local gap = 1
+    local bw = math.floor((w-6 - 4*gap)/5)
+    local x = 3
+    for lvl=1,5 do
+      local b = {x1=x, y1=h-5, x2=x+bw-1, y2=h-3, label=tostring(lvl), bg=colors.gray, fg=colors.white, level=lvl}
+      btns["lvl"..lvl] = b
+      drawButton(b)
+      x = x + bw + gap
+    end
+
+    term.setCursorPos(3, h-2)
+    term.setTextColor(colors.lightGray)
+    term.write("Keys: 1-5 choose level  |  Esc to cancel")
+    term.setTextColor(colors.white)
+
+  elseif mode == "confirm_deny" then
+    centerText(h-6, "Confirm DENY?", colors.yellow)
+    btns.no  = {x1=3, y1=h-5, x2=math.floor(w/2)-1, y2=h-3, label="CANCEL", bg=colors.gray, fg=colors.white}
+    btns.yes = {x1=math.floor(w/2)+1, y1=h-5, x2=w-2, y2=h-3, label="DENY", bg=colors.red, fg=colors.white}
+    drawButton(btns.no)
+    drawButton(btns.yes)
+
+    term.setCursorPos(3, h-2)
+    term.setTextColor(colors.lightGray)
+    term.write("Keys: Enter=deny  Esc=cancel")
+    term.setTextColor(colors.white)
+  end
+
+  return btns
 end
 
 -------------------------
--- MAIN
+-- ACTIONS
 -------------------------
-redraw()
+local function send_response(approved, level)
+  if not SERVER_ID then return end
+  send(SERVER_ID, {
+    kind = "approval_response",
+    id = active.id,
+    approved = approved and true or false,
+    level = level,
+  })
+end
+
+local function next_request()
+  active = nil
+  mode = "idle"
+  render()
+end
+
+-------------------------
+-- MAIN LOOP (EVENT DRIVEN)
+-------------------------
+announce()
+
+local btns = render()
+local lastAnnounce = os.epoch("utc")
 
 while true do
-  local ev, a, b, c = os.pullEvent()
+  local e = { os.pullEvent() }
+  local ev = e[1]
+
+  -- Periodic announce so server can bind if it starts later
+  if (os.epoch("utc") - lastAnnounce) > 3000 then
+    announce()
+    lastAnnounce = os.epoch("utc")
+  end
 
   if ev == "rednet_message" then
-    local sender, msg, proto = a, b, c
-    if proto == REDNET_PROTOCOL and type(msg) == "table" and msg.kind == "approval_request" then
-      msg.server_id = sender
-      table.insert(queue, msg)
-      idx = #queue
-      redraw()
+    local sender, msg, proto = e[2], e[3], e[4]
+    if proto == PROTOCOL and type(msg) == "table" then
+      if msg.kind == "hello_server" then
+        bind_server(sender)
+        announce()
+        btns = render()
+
+      elseif msg.kind == "approval_request" then
+        bind_server(sender)
+        table.insert(pending, msg)
+        btns = render()
+      end
     end
 
-  elseif ev == "mouse_click" or ev == "monitor_touch" then
-    local x, y
-    if ev == "mouse_click" then x, y = b, c else x, y = b, c end
+  elseif ev == "mouse_click" then
+    local _, mx, my = table.unpack(e)
 
-    local yb = math.max(10, H - 6)
+    if not btns then btns = render() end
 
-    if hit(x, y, 2, yb, 12, yb + 2) then
-      send_decision(false, nil); redraw()
-    elseif hit(x, y, 14, yb, 24, yb + 2) then
-      send_decision(true, 1); redraw()
-    elseif hit(x, y, 26, yb, 36, yb + 2) then
-      send_decision(true, 2); redraw()
-    elseif hit(x, y, 38, yb, 48, yb + 2) then
-      send_decision(true, 3); redraw()
-    elseif hit(x, y, 50, yb, 60, yb + 2) then
-      send_decision(true, 4); redraw()
-    elseif hit(x, y, 14, yb + 3, 24, yb + 5) then
-      send_decision(true, 5); redraw()
-    elseif hit(x, y, 26, yb + 3, 36, yb + 5) then
-      if #queue > 0 then
-        idx = idx + 1
-        if idx > #queue then idx = 1 end
+    if mode == "idle" and active then
+      if btns.approve and hit(btns.approve, mx, my) then
+        mode = "approve_level"
+        btns = render()
+      elseif btns.deny and hit(btns.deny, mx, my) then
+        mode = "confirm_deny"
+        btns = render()
       end
-      redraw()
-    elseif hit(x, y, 38, yb + 3, 60, yb + 5) then
-      queue, idx = {}, 1
-      redraw()
+
+    elseif mode == "approve_level" and active then
+      for lvl=1,5 do
+        local b = btns["lvl"..lvl]
+        if b and hit(b, mx, my) then
+          send_response(true, lvl)
+          next_request()
+          btns = render()
+          break
+        end
+      end
+
+    elseif mode == "confirm_deny" and active then
+      if btns.no and hit(btns.no, mx, my) then
+        mode = "idle"
+        btns = render()
+      elseif btns.yes and hit(btns.yes, mx, my) then
+        send_response(false, nil)
+        next_request()
+        btns = render()
+      end
+    end
+
+  elseif ev == "char" then
+    local ch = tostring(e[2])
+
+    if mode == "idle" and active then
+      if ch == "a" or ch == "A" then
+        mode = "approve_level"
+        btns = render()
+      elseif ch == "d" or ch == "D" then
+        mode = "confirm_deny"
+        btns = render()
+      end
+
+    elseif mode == "approve_level" and active then
+      local lvl = tonumber(ch)
+      if lvl and lvl >= 1 and lvl <= 5 then
+        send_response(true, lvl)
+        next_request()
+        btns = render()
+      end
+    end
+
+  elseif ev == "key" then
+    local key = e[2]
+
+    if key == keys.esc then
+      if mode ~= "idle" then
+        mode = "idle"
+        btns = render()
+      end
+
+    elseif mode == "confirm_deny" and active then
+      if key == keys.enter or key == keys.numPadEnter then
+        send_response(false, nil)
+        next_request()
+        btns = render()
+      end
     end
   end
 end

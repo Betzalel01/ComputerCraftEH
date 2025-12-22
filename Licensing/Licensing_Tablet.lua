@@ -1,18 +1,14 @@
 -- Licensing_Tablet.lua
--- Cleaned GUI:
---   * Main screen: shows current pending request (or none)
---   * Buttons: APPROVE / DENY
---   * If APPROVE: prompts for LEVEL 1–5 (buttons + number keys)
---   * If DENY: sends deny immediately (with confirm)
---
--- Note: Your message said "deny then ask level". That doesn't make sense for the protocol,
--- so this implements the practical flow: APPROVE -> choose level. If you truly want the
--- reverse, tell me and I’ll flip it.
+-- Cleaned GUI (full drop-in):
+--   * Pending request display
+--   * Buttons: APPROVE / DENY (approve text fixed so it isn't invisible)
+--   * APPROVE -> choose LEVEL 1–5 (clickable + typeable)
+--   * DENY -> confirm (clickable + Enter/Esc)
+--   * Queue support (handles multiple requests in order)
 
 local PROTOCOL = "licensing_v1"
 
--- If you hard-coded the server id, keep it here (optional).
--- If nil, the tablet will bind to the first server that sends hello_server.
+-- Optional hard-code. If nil, binds to first server hello it receives.
 local SERVER_ID = nil
 
 -------------------------
@@ -67,13 +63,18 @@ local function drawBox(x1,y1,x2,y2,bg)
 end
 
 local function drawButton(btn)
-  -- btn: {x1,y1,x2,y2,label,bg,fg}
   drawBox(btn.x1, btn.y1, btn.x2, btn.y2, btn.bg or colors.gray)
+
   term.setTextColor(btn.fg or colors.white)
-  local cx = math.floor((btn.x1 + btn.x2 - #btn.label)/2)
-  local cy = math.floor((btn.y1 + btn.y2)/2)
+  local bw = (btn.x2 - btn.x1 + 1)
+  local bh = (btn.y2 - btn.y1 + 1)
+
+  local cx = btn.x1 + math.floor((bw - #btn.label)/2)
+  local cy = btn.y1 + math.floor(bh/2)
+
   term.setCursorPos(cx, cy)
   term.write(btn.label)
+
   term.setTextColor(colors.white)
   term.setBackgroundColor(colors.black)
 end
@@ -85,12 +86,9 @@ end
 -------------------------
 -- STATE
 -------------------------
-local pending = {}   -- queue of requests
--- request shape expected from server:
--- { kind="approval_request", id=..., requester=..., request_text=... }
-
-local mode = "idle"  -- "idle" | "approve_level" | "confirm_deny"
-local active = nil   -- current request
+local pending = {}
+local mode = "idle"  -- idle | approve_level | confirm_deny
+local active = nil
 
 -------------------------
 -- REDNET SEND
@@ -107,7 +105,6 @@ local function announce()
   if SERVER_ID then
     send(SERVER_ID, { kind="hello_tablet" })
   else
-    -- If server doesn't have an ID yet, broadcast presence.
     rednet.broadcast({ kind="hello_tablet" }, PROTOCOL)
   end
 end
@@ -126,7 +123,7 @@ local function render()
   term.setTextColor(colors.white)
   term.write("Server: " .. tostring(SERVER_ID or "nil"))
 
-  -- Determine active request
+  -- Load next request if needed
   if (not active) and (#pending > 0) then
     active = table.remove(pending, 1)
     mode = "idle"
@@ -134,7 +131,7 @@ local function render()
 
   if not active then
     centerText(math.floor(h/2), "No pending requests.", colors.lightGray)
-    return
+    return {}
   end
 
   -- Request panel
@@ -154,18 +151,30 @@ local function render()
   }
 
   local y = panelTop + 2
-  term.setTextColor(colors.white)
   for _,ln in ipairs(lines) do
-    term.setCursorPos(3, y); term.write(ln:sub(1, w-4))
+    term.setCursorPos(3, y)
+    term.setTextColor(colors.white)
+    term.write(ln:sub(1, w-4))
     y = y + 1
   end
 
-  -- Buttons / submodes
   local btns = {}
 
   if mode == "idle" then
-    btns.approve = {x1=3, y1=h-5, x2=math.floor(w/2)-1, y2=h-3, label="APPROVE", bg=colors.green, fg=colors.black}
-    btns.deny    = {x1=math.floor(w/2)+1, y1=h-5, x2=w-2, y2=h-3, label="DENY", bg=colors.red, fg=colors.white}
+    btns.approve = {
+      x1=3, y1=h-5,
+      x2=math.floor(w/2)-1, y2=h-3,
+      label="APPROVE",
+      bg=colors.green,
+      fg=colors.white,      -- FIX: was black and invisible on some packs
+    }
+    btns.deny = {
+      x1=math.floor(w/2)+1, y1=h-5,
+      x2=w-2, y2=h-3,
+      label="DENY",
+      bg=colors.red,
+      fg=colors.white,
+    }
     drawButton(btns.approve)
     drawButton(btns.deny)
 
@@ -177,11 +186,22 @@ local function render()
   elseif mode == "approve_level" then
     centerText(h-6, "Select approval level (1-5)", colors.yellow)
 
+    -- FIX: center level buttons as a group + ensure odd width so label centers perfectly
     local gap = 1
-    local bw = math.floor((w-6 - 4*gap)/5)
-    local x = 3
+    local bw = 7 -- fixed odd width for better centering
+    local total = bw*5 + gap*4
+    local startX = math.floor((w - total)/2) + 1
+    local x = startX
+
     for lvl=1,5 do
-      local b = {x1=x, y1=h-5, x2=x+bw-1, y2=h-3, label=tostring(lvl), bg=colors.gray, fg=colors.white, level=lvl}
+      local b = {
+        x1=x, y1=h-5,
+        x2=x+bw-1, y2=h-3,
+        label=tostring(lvl),
+        bg=colors.gray,
+        fg=colors.white,
+        level=lvl
+      }
       btns["lvl"..lvl] = b
       drawButton(b)
       x = x + bw + gap
@@ -194,8 +214,21 @@ local function render()
 
   elseif mode == "confirm_deny" then
     centerText(h-6, "Confirm DENY?", colors.yellow)
-    btns.no  = {x1=3, y1=h-5, x2=math.floor(w/2)-1, y2=h-3, label="CANCEL", bg=colors.gray, fg=colors.white}
-    btns.yes = {x1=math.floor(w/2)+1, y1=h-5, x2=w-2, y2=h-3, label="DENY", bg=colors.red, fg=colors.white}
+
+    btns.no = {
+      x1=3, y1=h-5,
+      x2=math.floor(w/2)-1, y2=h-3,
+      label="CANCEL",
+      bg=colors.gray,
+      fg=colors.white
+    }
+    btns.yes = {
+      x1=math.floor(w/2)+1, y1=h-5,
+      x2=w-2, y2=h-3,
+      label="DENY",
+      bg=colors.red,
+      fg=colors.white
+    }
     drawButton(btns.no)
     drawButton(btns.yes)
 
@@ -224,11 +257,10 @@ end
 local function next_request()
   active = nil
   mode = "idle"
-  render()
 end
 
 -------------------------
--- MAIN LOOP (EVENT DRIVEN)
+-- MAIN LOOP
 -------------------------
 announce()
 
@@ -239,7 +271,7 @@ while true do
   local e = { os.pullEvent() }
   local ev = e[1]
 
-  -- Periodic announce so server can bind if it starts later
+  -- Periodic announce (helps if server restarts)
   if (os.epoch("utc") - lastAnnounce) > 3000 then
     announce()
     lastAnnounce = os.epoch("utc")
@@ -262,7 +294,6 @@ while true do
 
   elseif ev == "mouse_click" then
     local _, mx, my = table.unpack(e)
-
     if not btns then btns = render() end
 
     if mode == "idle" and active then

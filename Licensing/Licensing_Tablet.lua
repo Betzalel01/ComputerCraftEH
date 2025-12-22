@@ -1,13 +1,11 @@
 -- Licensing_Tablet.lua
--- Fixes:
---  1) CLICKING: tablets often emit monitor_touch (not mouse_click). Now supports BOTH.
---  2) LEVEL BUTTONS CUT OFF: button width is now computed from screen width (no fixed 7),
---     so 1–5 always fit (even on small pocket/tablet screens).
---  3) Keeps number centering (labels centered inside each button).
+-- Tablet "Home Screen + Apps" wrapper
+-- Apps:
+--   * Licensing (existing approvals UI)
 --
--- Behavior:
---  * APPROVE -> level select 1–5 (click OR press 1–5)
---  * DENY -> confirm (click OR Enter), Esc cancels.
+-- Fixes kept:
+--   * monitor_touch + mouse_click
+--   * level buttons always fit (1–5) and are clickable + typeable
 
 local PROTOCOL = "licensing_v1"
 local SERVER_ID = nil -- optional hard-code
@@ -31,9 +29,7 @@ end
 -------------------------
 -- UI UTIL
 -------------------------
-local function clamp(n, a, b)
-  if n < a then return a elseif n > b then return b else return n end
-end
+local function clamp(n, a, b) if n < a then return a elseif n > b then return b else return n end end
 
 local function termSize()
   local w, h = term.getSize()
@@ -86,12 +82,11 @@ local function hit(btn, x, y)
   return x >= btn.x1 and x <= btn.x2 and y >= btn.y1 and y <= btn.y2
 end
 
--------------------------
--- STATE
--------------------------
-local pending = {}
-local mode = "idle" -- idle | approve_level | confirm_deny
-local active = nil
+local function normalize_click(ev, a, b, c)
+  if ev == "mouse_click" then return b, c end       -- (button, x, y)
+  if ev == "monitor_touch" then return b, c end     -- (side, x, y)
+  return nil, nil
+end
 
 -------------------------
 -- REDNET SEND
@@ -113,9 +108,20 @@ local function announce()
 end
 
 -------------------------
--- ACTIONS
+-- STATE
 -------------------------
-local function send_response(approved, level)
+local screen = "home" -- home | licensing
+local licensing_mode = "idle" -- idle | approve_level | confirm_deny
+local pending = {}
+local active = nil
+
+-- Home “notification badge”
+local licensing_badge = 0
+
+-------------------------
+-- LICENSING ACTIONS
+-------------------------
+local function licensing_send_response(approved, level)
   if not SERVER_ID or not active then return end
   send(SERVER_ID, {
     kind = "approval_response",
@@ -125,15 +131,69 @@ local function send_response(approved, level)
   })
 end
 
-local function next_request()
+local function licensing_next_request()
   active = nil
-  mode = "idle"
+  licensing_mode = "idle"
 end
 
 -------------------------
--- RENDER
+-- RENDER: HOME
 -------------------------
-local function render()
+local function render_home()
+  clear()
+  local w, h = termSize()
+
+  centerText(1, "BASE TABLET", colors.white)
+  term.setCursorPos(2,2)
+  term.setTextColor(colors.lightGray)
+  term.write("Rednet: OK   Server: " .. tostring(SERVER_ID or "nil"))
+  term.setTextColor(colors.white)
+
+  centerText(4, "APPS", colors.cyan)
+
+  local btns = {}
+
+  -- Big Licensing button
+  local bw = math.min(20, w-6)
+  local bx1 = math.floor((w - bw)/2) + 1
+  local bx2 = bx1 + bw - 1
+  local by1 = 6
+  local by2 = 8
+
+  btns.licensing = {
+    x1=bx1, y1=by1, x2=bx2, y2=by2,
+    label="Licensing",
+    bg=colors.gray,
+    fg=colors.white
+  }
+  drawButton(btns.licensing)
+
+  -- Badge
+  if licensing_badge > 0 then
+    local badgeText = tostring(licensing_badge)
+    local badgeW = #badgeText + 2
+    local rx2 = btns.licensing.x2
+    local ry1 = btns.licensing.y1
+    drawBox(rx2 - badgeW + 1, ry1, rx2, ry1, colors.red)
+    term.setCursorPos(rx2 - badgeW + 2, ry1)
+    term.setTextColor(colors.white)
+    term.write(badgeText)
+    term.setTextColor(colors.white)
+    term.setBackgroundColor(colors.black)
+  end
+
+  term.setCursorPos(2, h-1)
+  term.setTextColor(colors.lightGray)
+  term.write("Tip: Open Licensing to approve/deny requests.")
+  term.setTextColor(colors.white)
+
+  return btns
+end
+
+-------------------------
+-- RENDER: LICENSING APP
+-------------------------
+local function render_licensing()
   clear()
   local w, h = termSize()
 
@@ -144,15 +204,23 @@ local function render()
   term.setTextColor(colors.white)
   term.write("Server: " .. tostring(SERVER_ID or "nil"))
 
+  -- Back button
+  local btns = {}
+  btns.back = { x1=2, y1=1, x2=7, y2=1, label="<Back", bg=colors.black, fg=colors.lightGray }
+  term.setCursorPos(btns.back.x1, btns.back.y1)
+  term.setTextColor(btns.back.fg)
+  term.write(btns.back.label)
+  term.setTextColor(colors.white)
+
   -- Pull next request if needed
   if (not active) and (#pending > 0) then
     active = table.remove(pending, 1)
-    mode = "idle"
+    licensing_mode = "idle"
   end
 
   if not active then
     centerText(math.floor(h/2), "No pending requests.", colors.lightGray)
-    return {}
+    return btns
   end
 
   -- Request panel
@@ -179,15 +247,13 @@ local function render()
     y = y + 1
   end
 
-  local btns = {}
-
-  if mode == "idle" then
+  if licensing_mode == "idle" then
     btns.approve = {
       x1=3, y1=h-5,
       x2=math.floor(w/2)-1, y2=h-3,
       label="APPROVE",
       bg=colors.green,
-      fg=colors.white, -- important
+      fg=colors.white,
     }
     btns.deny = {
       x1=math.floor(w/2)+1, y1=h-5,
@@ -201,35 +267,26 @@ local function render()
 
     term.setCursorPos(3, h-2)
     term.setTextColor(colors.lightGray)
-    term.write("Keys: A=approve  D=deny")
+    term.write("Keys: A=approve  D=deny   (Esc=back)")
     term.setTextColor(colors.white)
 
-  elseif mode == "approve_level" then
+  elseif licensing_mode == "approve_level" then
     centerText(h-6, "Select approval level (1-5)", colors.yellow)
 
-    -- Dynamic button sizing so 1–5 always fit on the current screen
     local gap = 1
-    local leftMargin = 2
-    local rightMargin = 2
+    local leftMargin, rightMargin = 2, 2
     local usable = w - leftMargin - rightMargin
     local bw = math.floor((usable - gap*4) / 5)
-    if bw < 3 then bw = 3 end -- still clickable
-    -- If we're tight, shrink margins automatically
+    if bw < 3 then bw = 3 end
     local total = bw*5 + gap*4
     local startX = math.floor((w - total)/2) + 1
     if startX < 2 then startX = 2 end
+
     local x = startX
-
     for lvl=1,5 do
-      local x1 = x
-      local x2 = x + bw - 1
-      -- Clamp to screen just in case
-      x1 = clamp(x1, 2, w-1)
-      x2 = clamp(x2, 2, w-1)
-
       local b = {
-        x1=x1, y1=h-5,
-        x2=x2, y2=h-3,
+        x1=clamp(x, 2, w-1), y1=h-5,
+        x2=clamp(x+bw-1, 2, w-1), y2=h-3,
         label=tostring(lvl),
         bg=colors.gray,
         fg=colors.white,
@@ -242,10 +299,10 @@ local function render()
 
     term.setCursorPos(3, h-2)
     term.setTextColor(colors.lightGray)
-    term.write("Keys: 1-5 choose level  |  Esc to cancel")
+    term.write("Keys: 1-5 choose level  |  Esc cancel")
     term.setTextColor(colors.white)
 
-  elseif mode == "confirm_deny" then
+  elseif licensing_mode == "confirm_deny" then
     centerText(h-6, "Confirm DENY?", colors.yellow)
 
     btns.no = {
@@ -275,25 +332,10 @@ local function render()
 end
 
 -------------------------
--- INPUT NORMALIZATION (mouse_click + monitor_touch)
--------------------------
-local function normalize_click(ev, a, b, c)
-  -- mouse_click: (button, x, y)
-  if ev == "mouse_click" then
-    return b, c
-  end
-  -- monitor_touch: (side, x, y)
-  if ev == "monitor_touch" then
-    return b, c
-  end
-  return nil, nil
-end
-
--------------------------
 -- MAIN LOOP
 -------------------------
 announce()
-local btns = render()
+local btns = render_home()
 local lastAnnounce = os.epoch("utc")
 
 while true do
@@ -312,45 +354,63 @@ while true do
       if msg.kind == "hello_server" then
         bind_server(sender)
         announce()
-        btns = render()
       elseif msg.kind == "approval_request" then
         bind_server(sender)
         table.insert(pending, msg)
-        btns = render()
+        licensing_badge = licensing_badge + 1
+      end
+
+      -- re-render current screen
+      if screen == "home" then
+        btns = render_home()
+      else
+        btns = render_licensing()
       end
     end
 
   elseif ev == "mouse_click" or ev == "monitor_touch" then
     local x, y = normalize_click(ev, e[2], e[3], e[4])
-    if x and y then
-      if mode == "idle" and active then
-        if btns.approve and hit(btns.approve, x, y) then
-          mode = "approve_level"
-          btns = render()
-        elseif btns.deny and hit(btns.deny, x, y) then
-          mode = "confirm_deny"
-          btns = render()
-        end
 
-      elseif mode == "approve_level" and active then
-        for lvl=1,5 do
-          local b = btns["lvl"..lvl]
-          if b and hit(b, x, y) then
-            send_response(true, lvl)
-            next_request()
-            btns = render()
-            break
+    if screen == "home" then
+      if btns.licensing and hit(btns.licensing, x, y) then
+        screen = "licensing"
+        licensing_badge = 0 -- clear badge when you open the app
+        btns = render_licensing()
+      end
+
+    elseif screen == "licensing" then
+      -- Back
+      if btns.back and hit(btns.back, x, y) then
+        screen = "home"
+        btns = render_home()
+      elseif active then
+        if licensing_mode == "idle" then
+          if btns.approve and hit(btns.approve, x, y) then
+            licensing_mode = "approve_level"
+            btns = render_licensing()
+          elseif btns.deny and hit(btns.deny, x, y) then
+            licensing_mode = "confirm_deny"
+            btns = render_licensing()
           end
-        end
-
-      elseif mode == "confirm_deny" and active then
-        if btns.no and hit(btns.no, x, y) then
-          mode = "idle"
-          btns = render()
-        elseif btns.yes and hit(btns.yes, x, y) then
-          send_response(false, nil)
-          next_request()
-          btns = render()
+        elseif licensing_mode == "approve_level" then
+          for lvl=1,5 do
+            local b = btns["lvl"..lvl]
+            if b and hit(b, x, y) then
+              licensing_send_response(true, lvl)
+              licensing_next_request()
+              btns = render_licensing()
+              break
+            end
+          end
+        elseif licensing_mode == "confirm_deny" then
+          if btns.no and hit(btns.no, x, y) then
+            licensing_mode = "idle"
+            btns = render_licensing()
+          elseif btns.yes and hit(btns.yes, x, y) then
+            licensing_send_response(false, nil)
+            licensing_next_request()
+            btns = render_licensing()
+          end
         end
       end
     end
@@ -358,37 +418,51 @@ while true do
   elseif ev == "char" then
     local ch = tostring(e[2])
 
-    if mode == "idle" and active then
-      if ch == "a" or ch == "A" then
-        mode = "approve_level"
-        btns = render()
-      elseif ch == "d" or ch == "D" then
-        mode = "confirm_deny"
-        btns = render()
+    if screen == "licensing" then
+      if ch == "h" or ch == "H" then
+        screen = "home"
+        btns = render_home()
       end
 
-    elseif mode == "approve_level" and active then
-      local lvl = tonumber(ch)
-      if lvl and lvl >= 1 and lvl <= 5 then
-        send_response(true, lvl)
-        next_request()
-        btns = render()
+      if active then
+        if licensing_mode == "idle" then
+          if ch == "a" or ch == "A" then
+            licensing_mode = "approve_level"
+            btns = render_licensing()
+          elseif ch == "d" or ch == "D" then
+            licensing_mode = "confirm_deny"
+            btns = render_licensing()
+          end
+        elseif licensing_mode == "approve_level" then
+          local lvl = tonumber(ch)
+          if lvl and lvl >= 1 and lvl <= 5 then
+            licensing_send_response(true, lvl)
+            licensing_next_request()
+            btns = render_licensing()
+          end
+        end
       end
     end
 
   elseif ev == "key" then
     local key = e[2]
+
     if key == keys.esc then
-      if mode ~= "idle" then
-        mode = "idle"
-        btns = render()
+      if screen == "licensing" then
+        if licensing_mode == "idle" then
+          screen = "home"
+          btns = render_home()
+        else
+          licensing_mode = "idle"
+          btns = render_licensing()
+        end
       end
 
-    elseif mode == "confirm_deny" and active then
+    elseif screen == "licensing" and active and licensing_mode == "confirm_deny" then
       if key == keys.enter or key == keys.numPadEnter then
-        send_response(false, nil)
-        next_request()
-        btns = render()
+        licensing_send_response(false, nil)
+        licensing_next_request()
+        btns = render_licensing()
       end
     end
   end

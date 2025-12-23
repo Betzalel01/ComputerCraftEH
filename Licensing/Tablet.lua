@@ -1,15 +1,14 @@
 -- Licensing_Tablet.lua
--- Tablet "Home Screen + Apps" wrapper
--- Apps:
---   * Licensing (approvals UI)
---
+-- Home Screen + Licensing app (approval UI)
 -- Fixes:
---   * Button text color always correct (APPROVE no longer black)
---   * Level buttons (1–5) always fit on-screen (auto shrink + re-center)
---   * Clickable (mouse/monitor_touch) + typeable (keys)
+--  * Accept SERVER_ID=0
+--  * Buttons always clickable (mouse_click + monitor_touch)
+--  * APPROVE label color correct
+--  * Level buttons always fit 1-5
+--  * Decision sends once, waits for server ACK
 
 local PROTOCOL = "licensing_v1"
-local SERVER_ID = nil -- optional hard-code (leave nil to auto-bind)
+local SERVER_ID = nil
 
 -------------------------
 -- REDNET INIT
@@ -30,13 +29,8 @@ end
 -------------------------
 -- UI UTIL
 -------------------------
-local function clamp(n, a, b)
-  if n < a then return a elseif n > b then return b else return n end
-end
-
-local function termSize()
-  return term.getSize()
-end
+local function clamp(n,a,b) if n<a then return a elseif n>b then return b else return n end end
+local function termSize() return term.getSize() end
 
 local function clear()
   term.setBackgroundColor(colors.black)
@@ -55,7 +49,7 @@ local function centerText(y, text, color)
 end
 
 local function fillRect(x1,y1,x2,y2,bg)
-  term.setBackgroundColor(bg or colors.gray)
+  term.setBackgroundColor(bg)
   for y=y1,y2 do
     term.setCursorPos(x1,y)
     term.write(string.rep(" ", x2-x1+1))
@@ -64,16 +58,16 @@ local function fillRect(x1,y1,x2,y2,bg)
 end
 
 local function drawButton(btn)
-  -- Ensure label is written WHILE the button bg is active (prevents “black label” issues)
   fillRect(btn.x1, btn.y1, btn.x2, btn.y2, btn.bg or colors.gray)
+
+  term.setBackgroundColor(btn.bg or colors.gray)
+  term.setTextColor(btn.fg or colors.white)
 
   local bw = (btn.x2 - btn.x1 + 1)
   local bh = (btn.y2 - btn.y1 + 1)
   local cx = btn.x1 + math.floor((bw - #btn.label)/2)
   local cy = btn.y1 + math.floor(bh/2)
 
-  term.setBackgroundColor(btn.bg or colors.gray)
-  term.setTextColor(btn.fg or colors.white)
   term.setCursorPos(cx, cy)
   term.write(btn.label)
 
@@ -82,12 +76,12 @@ local function drawButton(btn)
 end
 
 local function hit(btn, x, y)
-  return x >= btn.x1 and x <= btn.x2 and y >= btn.y1 and y <= btn.y2
+  return x and y and x >= btn.x1 and x <= btn.x2 and y >= btn.y1 and y <= btn.y2
 end
 
 local function normalize_click(ev, a, b, c)
-  if ev == "mouse_click" then return b, c end       -- (button, x, y)
-  if ev == "monitor_touch" then return b, c end     -- (side, x, y)
+  if ev == "mouse_click" then return b, c end
+  if ev == "monitor_touch" then return b, c end
   return nil, nil
 end
 
@@ -98,12 +92,8 @@ local function send(to, tbl)
   rednet.send(to, tbl, PROTOCOL)
 end
 
-local function bind_server(sender)
-  if not SERVER_ID then SERVER_ID = sender end
-end
-
 local function announce()
-  if SERVER_ID then
+  if SERVER_ID ~= nil then
     send(SERVER_ID, { kind="hello_tablet" })
   else
     rednet.broadcast({ kind="hello_tablet" }, PROTOCOL)
@@ -114,64 +104,31 @@ end
 -- STATE
 -------------------------
 local screen = "home" -- home | licensing
-local licensing_mode = "idle" -- idle | approve_level | confirm_deny
+local licensing_mode = "idle" -- idle | approve_level | confirm_deny | sending
 local pending = {}
 local active = nil
 local licensing_badge = 0
+local waiting_ack_id = nil
 
 -------------------------
 -- LICENSING ACTIONS
 -------------------------
 local function licensing_send_response(approved, level)
-  if not SERVER_ID or not active then return end
+  if SERVER_ID == nil or not active then return end
+  waiting_ack_id = active.id
+  licensing_mode = "sending"
   send(SERVER_ID, {
-    kind = "approval_response",
-    id = active.id,
-    approved = approved and true or false,
-    level = level,
+    kind="approval_response",
+    id=active.id,
+    approved=approved and true or false,
+    level=level
   })
 end
 
-local function licensing_next_request()
+local function licensing_pop_active()
   active = nil
   licensing_mode = "idle"
-end
-
--------------------------
--- LAYOUT: level buttons that ALWAYS FIT
--------------------------
-local function compute_level_row(w)
-  local leftMargin, rightMargin = 2, 2
-  local usable = w - leftMargin - rightMargin
-
-  local gap = 1
-  local bw = 6 -- nice size when possible
-
-  local function totalWidth(bw_, gap_)
-    return (bw_ * 5) + (gap_ * 4)
-  end
-
-  -- shrink to fit
-  while totalWidth(bw, gap) > usable and bw > 3 do
-    bw = bw - 1
-  end
-
-  -- if still too wide, remove gaps then shrink
-  if totalWidth(bw, gap) > usable then
-    gap = 0
-    while totalWidth(bw, gap) > usable and bw > 3 do
-      bw = bw - 1
-    end
-  end
-
-  -- final safety
-  if bw < 3 then bw = 3 end
-
-  local total = totalWidth(bw, gap)
-  local startX = math.floor((w - total) / 2) + 1
-  if startX < leftMargin then startX = leftMargin end
-
-  return startX, bw, gap
+  waiting_ack_id = nil
 end
 
 -------------------------
@@ -184,7 +141,7 @@ local function render_home()
   centerText(1, "BASE TABLET", colors.white)
   term.setCursorPos(2,2)
   term.setTextColor(colors.lightGray)
-  term.write("Rednet: OK   Server: " .. tostring(SERVER_ID or "nil"))
+  term.write("Rednet: OK   Server: " .. tostring(SERVER_ID))
   term.setTextColor(colors.white)
 
   centerText(4, "APPS", colors.cyan)
@@ -194,9 +151,11 @@ local function render_home()
   local bw = math.min(20, w-6)
   local bx1 = math.floor((w - bw)/2) + 1
   local bx2 = bx1 + bw - 1
-  local by1, by2 = 6, 8
 
-  btns.licensing = { x1=bx1, y1=by1, x2=bx2, y2=by2, label="Licensing", bg=colors.gray, fg=colors.white }
+  btns.licensing = {
+    x1=bx1, y1=6, x2=bx2, y2=8,
+    label="Licensing", bg=colors.gray, fg=colors.white
+  }
   drawButton(btns.licensing)
 
   if licensing_badge > 0 then
@@ -215,14 +174,57 @@ local function render_home()
 
   term.setCursorPos(2, h-1)
   term.setTextColor(colors.lightGray)
-  term.write("Tip: Open Licensing to approve/deny requests.")
+  term.write("Open Licensing to approve keycard requests.")
   term.setTextColor(colors.white)
 
   return btns
 end
 
 -------------------------
--- RENDER: LICENSING APP
+-- LEVEL BUTTON LAYOUT (always fits)
+-------------------------
+local function layout_level_buttons(y1,y2)
+  local w = (select(1, termSize()))
+  local btns = {}
+
+  local gap = 1
+  local leftMargin, rightMargin = 2, 2
+
+  local usable = (w - leftMargin - rightMargin)
+  local bw = math.floor((usable - gap*4) / 5)
+  if bw < 3 then bw = 3 end
+
+  -- shrink if it would overflow
+  while (bw*5 + gap*4) > (w - 2) and bw > 3 do
+    bw = bw - 1
+  end
+
+  local total = bw*5 + gap*4
+  local startX = math.floor((w - total)/2) + 1
+  if startX < 2 then startX = 2 end
+  if (startX + total - 1) > (w-1) then
+    startX = (w-1) - total + 1
+    if startX < 2 then startX = 2 end
+  end
+
+  local x = startX
+  for lvl=1,5 do
+    btns["lvl"..lvl] = {
+      x1=x, y1=y1,
+      x2=x+bw-1, y2=y2,
+      label=tostring(lvl),
+      bg=colors.gray, fg=colors.white,
+      level=lvl
+    }
+    drawButton(btns["lvl"..lvl])
+    x = x + bw + gap
+  end
+
+  return btns
+end
+
+-------------------------
+-- RENDER: LICENSING
 -------------------------
 local function render_licensing()
   clear()
@@ -231,9 +233,8 @@ local function render_licensing()
   centerText(1, "LICENSING APPROVALS", colors.white)
   term.setCursorPos(2,2)
   term.setTextColor(colors.lightGray)
-  term.write("Rednet OK. Listening...  ")
+  term.write("Rednet: OK   Server: " .. tostring(SERVER_ID))
   term.setTextColor(colors.white)
-  term.write("Server: " .. tostring(SERVER_ID or "nil"))
 
   local btns = {}
   btns.back = { x1=2, y1=1, x2=7, y2=1, label="<Back", bg=colors.black, fg=colors.lightGray }
@@ -252,11 +253,7 @@ local function render_licensing()
     return btns
   end
 
-  local panelTop = 4
-  local panelBottom = h - 7
-  fillRect(2, panelTop, w-1, panelBottom, colors.black)
-
-  term.setCursorPos(3, panelTop)
+  term.setCursorPos(3,4)
   term.setTextColor(colors.cyan)
   term.write("Pending Request")
   term.setTextColor(colors.white)
@@ -266,8 +263,7 @@ local function render_licensing()
     "Text: " .. tostring(active.request_text),
     "ID:   " .. tostring(active.id),
   }
-
-  local y = panelTop + 2
+  local y = 6
   for _, ln in ipairs(lines) do
     term.setCursorPos(3, y)
     term.setTextColor(colors.white)
@@ -276,8 +272,14 @@ local function render_licensing()
   end
 
   if licensing_mode == "idle" then
-    btns.approve = { x1=3, y1=h-5, x2=math.floor(w/2)-1, y2=h-3, label="APPROVE", bg=colors.green, fg=colors.white }
-    btns.deny    = { x1=math.floor(w/2)+1, y1=h-5, x2=w-2, y2=h-3, label="DENY",    bg=colors.red,   fg=colors.white }
+    btns.approve = {
+      x1=3, y1=h-5, x2=math.floor(w/2)-1, y2=h-3,
+      label="APPROVE", bg=colors.green, fg=colors.white
+    }
+    btns.deny = {
+      x1=math.floor(w/2)+1, y1=h-5, x2=w-2, y2=h-3,
+      label="DENY", bg=colors.red, fg=colors.white
+    }
     drawButton(btns.approve)
     drawButton(btns.deny)
 
@@ -288,16 +290,8 @@ local function render_licensing()
 
   elseif licensing_mode == "approve_level" then
     centerText(h-6, "Select approval level (1-5)", colors.yellow)
-
-    local startX, bw, gap = compute_level_row(w)
-    local x = startX
-
-    for lvl=1,5 do
-      local b = { x1=x, y1=h-5, x2=x+bw-1, y2=h-3, label=tostring(lvl), bg=colors.gray, fg=colors.white, level=lvl }
-      btns["lvl"..lvl] = b
-      drawButton(b)
-      x = x + bw + gap
-    end
+    local levelBtns = layout_level_buttons(h-5, h-3)
+    for k,v in pairs(levelBtns) do btns[k]=v end
 
     term.setCursorPos(3, h-2)
     term.setTextColor(colors.lightGray)
@@ -307,8 +301,14 @@ local function render_licensing()
   elseif licensing_mode == "confirm_deny" then
     centerText(h-6, "Confirm DENY?", colors.yellow)
 
-    btns.no  = { x1=3, y1=h-5, x2=math.floor(w/2)-1, y2=h-3, label="CANCEL", bg=colors.gray, fg=colors.white }
-    btns.yes = { x1=math.floor(w/2)+1, y1=h-5, x2=w-2, y2=h-3, label="DENY",   bg=colors.red,  fg=colors.white }
+    btns.no = {
+      x1=3, y1=h-5, x2=math.floor(w/2)-1, y2=h-3,
+      label="CANCEL", bg=colors.gray, fg=colors.white
+    }
+    btns.yes = {
+      x1=math.floor(w/2)+1, y1=h-5, x2=w-2, y2=h-3,
+      label="DENY", bg=colors.red, fg=colors.white
+    }
     drawButton(btns.no)
     drawButton(btns.yes)
 
@@ -316,6 +316,9 @@ local function render_licensing()
     term.setTextColor(colors.lightGray)
     term.write("Keys: Enter=deny  Esc=cancel")
     term.setTextColor(colors.white)
+
+  elseif licensing_mode == "sending" then
+    centerText(h-6, "Sending decision... waiting for server ACK...", colors.yellow)
   end
 
   return btns
@@ -341,20 +344,26 @@ while true do
     local sender, msg, proto = e[2], e[3], e[4]
     if proto == PROTOCOL and type(msg) == "table" then
       if msg.kind == "hello_server" then
-        bind_server(sender)
+        -- accept sender even if sender == 0
+        SERVER_ID = sender
         announce()
       elseif msg.kind == "approval_request" then
-        bind_server(sender)
+        SERVER_ID = sender
         table.insert(pending, msg)
         licensing_badge = licensing_badge + 1
-      elseif msg.kind == "notify" then
-        -- generic notifications (future use): increment badge if licensing-related
-        if msg.app == "licensing" then
-          licensing_badge = licensing_badge + 1
+      elseif msg.kind == "approval_ack" then
+        if waiting_ack_id and msg.id == waiting_ack_id then
+          -- clear active and proceed
+          licensing_badge = math.max(0, licensing_badge - 1)
+          licensing_pop_active()
         end
       end
 
-      btns = (screen == "home") and render_home() or render_licensing()
+      if screen == "home" then
+        btns = render_home()
+      else
+        btns = render_licensing()
+      end
     end
 
   elseif ev == "mouse_click" or ev == "monitor_touch" then
@@ -367,12 +376,11 @@ while true do
         btns = render_licensing()
       end
 
-    else -- licensing
+    elseif screen == "licensing" then
       if btns.back and hit(btns.back, x, y) then
         screen = "home"
         btns = render_home()
-
-      elseif active then
+      elseif active and licensing_mode ~= "sending" then
         if licensing_mode == "idle" then
           if btns.approve and hit(btns.approve, x, y) then
             licensing_mode = "approve_level"
@@ -387,7 +395,6 @@ while true do
             local b = btns["lvl"..lvl]
             if b and hit(b, x, y) then
               licensing_send_response(true, lvl)
-              licensing_next_request()
               btns = render_licensing()
               break
             end
@@ -399,7 +406,6 @@ while true do
             btns = render_licensing()
           elseif btns.yes and hit(btns.yes, x, y) then
             licensing_send_response(false, nil)
-            licensing_next_request()
             btns = render_licensing()
           end
         end
@@ -408,8 +414,7 @@ while true do
 
   elseif ev == "char" then
     local ch = tostring(e[2])
-
-    if screen == "licensing" and active then
+    if screen == "licensing" and active and licensing_mode ~= "sending" then
       if licensing_mode == "idle" then
         if ch == "a" or ch == "A" then
           licensing_mode = "approve_level"
@@ -422,7 +427,6 @@ while true do
         local lvl = tonumber(ch)
         if lvl and lvl >= 1 and lvl <= 5 then
           licensing_send_response(true, lvl)
-          licensing_next_request()
           btns = render_licensing()
         end
       end
@@ -430,7 +434,6 @@ while true do
 
   elseif ev == "key" then
     local key = e[2]
-
     if key == keys.esc then
       if screen == "licensing" then
         if licensing_mode == "idle" then
@@ -438,14 +441,13 @@ while true do
           btns = render_home()
         else
           licensing_mode = "idle"
+          waiting_ack_id = nil
           btns = render_licensing()
         end
       end
-
     elseif screen == "licensing" and active and licensing_mode == "confirm_deny" then
       if key == keys.enter or key == keys.numPadEnter then
         licensing_send_response(false, nil)
-        licensing_next_request()
         btns = render_licensing()
       end
     end

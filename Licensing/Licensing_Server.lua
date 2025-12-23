@@ -1,25 +1,28 @@
--- Licensing_Server.lua
--- FIX: removed os.pullEventTimeout (not available on your CC version)
--- Uses rednet.receive(0) for non-blocking message polling.
+-- X Licensing_Server.lua
+-- Drop-in server that fixes:
+--  1) Properly binds BOTH tablet + turtle (no short-circuit after tablet)
+--  2) No os.pullEventTimeout usage (timer pattern only)
+--  3) Keycard requests require tablet approval; RETURN bypasses tablet
+--  4) Server sends ACK back to tablet so it doesn't resend/loop
+--  5) Cooldown so you don't re-greet / re-request while a request is pending
+--
+-- Requires: stationary computer with modem + chatBox + playerDetector
+-- Turtle: runs Licensing_Agent.lua (modem only) and will bind via hello_turtle
+-- Tablet: runs Licensing_Tablet.lua and will bind via hello_tablet
 
 -------------------------
 -- CONFIG
 -------------------------
-local PROTOCOL = "licensing_v1"
+local PROTOCOL   = "licensing_v1"
+local ADMIN_NAME = "Shade_Angel"
 
+-- Updated working zoning info
 local ZONE_ONE = { x = -1752, y = 78.0, z = 1115.0 }
-local ZONE_TWO = { x = -1753, y = 79,   z = 1118 }
+local ZONE_TWO = { x = -1753, y = 79.0, z = 1118.0 }
 
 local POLL_PERIOD_S     = 0.25
 local GREET_COOLDOWN_S  = 10
 local REQUEST_TIMEOUT_S = 30
-local ADMIN_TIMEOUT_S   = 90
-local BUSY_MSG          = "Licensing desk is busy. Please wait."
-
-local ADMIN_NAME = "Shade_Angel"
-
-local TABLET_ID = nil
-local TURTLE_ID = nil
 
 -------------------------
 -- PERIPHERALS
@@ -31,8 +34,17 @@ local chat = peripheral.find("chatBox")
 if not chat then error("No chatBox found.", 0) end
 
 -------------------------
--- REDNET INIT
+-- UTIL
 -------------------------
+local function now_s() return os.epoch("utc") / 1000 end
+local function log(tag, msg)
+  print(("[%.3f][SERVER:%s] %s"):format(now_s(), tag, msg))
+end
+
+local function dm(player, msg)
+  pcall(chat.sendMessageToPlayer, msg, player)
+end
+
 local function ensure_rednet()
   if rednet.isOpen() then return true end
   for _, s in ipairs({"left","right","top","bottom","front","back"}) do
@@ -46,299 +58,267 @@ if not ensure_rednet() then
   error("No modem found / rednet not open on server.", 0)
 end
 
--------------------------
--- UTIL
--------------------------
-local function now_s() return os.epoch("utc") / 1000 end
-local function log(msg)
-  print(string.format("[%.3f][SERVER:%s] %s", now_s(), tostring(os.getComputerID()), msg))
+local function send(to, tbl)
+  if not to then return end
+  rednet.send(to, tbl, PROTOCOL)
 end
 
-local function dm(player, msg)
-  pcall(chat.sendMessageToPlayer, msg, player)
-end
+-------------------------
+-- BINDINGS
+-------------------------
+local SERVER_ID = os.getComputerID()
+local TABLET_ID = nil
+local TURTLE_ID = nil
 
-local function admin_notify(msg)
-  if ADMIN_NAME and ADMIN_NAME ~= "" then
-    dm(ADMIN_NAME, msg)
+local function bind(sender, kind)
+  if kind == "hello_tablet" then
+    if TABLET_ID ~= sender then
+      TABLET_ID = sender
+      log("BIND", "Bound TABLET_ID=" .. tostring(sender))
+    end
+    send(sender, { kind="hello_server", server_id=SERVER_ID })
+  elseif kind == "hello_turtle" then
+    if TURTLE_ID ~= sender then
+      TURTLE_ID = sender
+      log("BIND", "Bound TURTLE_ID=" .. tostring(sender))
+    end
+    send(sender, { kind="hello_server", server_id=SERVER_ID })
   end
+end
+
+-------------------------
+-- REQUEST STATE
+-------------------------
+-- pending_request:
+-- { id, requester, request_text, kind="keycard"|"return", ts, status="waiting"|"sent_to_tablet"|"approved"|"denied" }
+local pending_request = nil
+local last_greet = {} -- per-player cooldown timer
+
+local function new_request_id(player)
+  return ("%s-%d"):format(player, os.epoch("utc"))
 end
 
 local function parse_player_request(msg)
   msg = tostring(msg or ""):lower()
+
   if msg:match("^%s*return%s*$") then return { kind="return" } end
   if msg:match("^%s*return%s+keycard%s*$") then return { kind="return" } end
   if msg:match("^%s*keycard%s+return%s*$") then return { kind="return" } end
 
   if msg:match("^%s*keycard%s*$") then return { kind="keycard" } end
-  local lvl = msg:match("^%s*keycard%s+(%d+)%s*$")
-  if lvl then return { kind="keycard", level=tonumber(lvl) } end
   if msg:match("^%s*card%s*$") or msg:match("^%s*access%s*$") then return { kind="keycard" } end
+
   return nil
 end
 
-local function parse_done(msg)
-  msg = tostring(msg or ""):lower()
-  return msg:match("^%s*done%s*$")
-      or msg:match("^%s*deposited%s*$")
-      or msg:match("^%s*ok%s*$")
-      or msg:match("^%s*finished%s*$")
-end
-
-local function wait_for_chat_from(expected_player, timeout_s)
-  local timer = os.startTimer(timeout_s)
-  while true do
-    local ev, a, b = os.pullEvent()
-    if ev == "chat" then
-      local player, msg = a, b
-      if player == expected_player then
-        return true, msg
-      end
-    elseif ev == "timer" and a == timer then
-      return false, "timeout"
-    end
+-------------------------
+-- TABLET NOTIFY
+-------------------------
+local function notify_tablet(req)
+  if not TABLET_ID then
+    log("WARN", "No TABLET_ID bound; cannot request approval")
+    return false, "no_tablet"
   end
-end
-
-local function send(to, tbl)
-  if not to then return false end
-  rednet.send(to, tbl, PROTOCOL)
+  send(TABLET_ID, {
+    kind         = "approval_request",
+    id           = req.id,
+    requester    = req.requester,
+    request_text = req.request_text,
+    request_kind = req.kind,
+  })
   return true
 end
 
-local function broadcast(tbl)
-  rednet.broadcast(tbl, PROTOCOL)
-end
-
--------------------------
--- BINDING / HELLO
--------------------------
-local function announce()
-  broadcast({ kind="hello_server" })
-end
-
-local function handle_hello(sender, msg)
-  if msg.kind == "hello_tablet" then
-    if TABLET_ID ~= sender then
-      TABLET_ID = sender
-      log("Bound TABLET_ID=" .. tostring(TABLET_ID))
-    end
-    send(sender, { kind="hello_server" })
-  elseif msg.kind == "hello_turtle" then
-    if TURTLE_ID ~= sender then
-      TURTLE_ID = sender
-      log("Bound TURTLE_ID=" .. tostring(TURTLE_ID))
-    end
-    send(sender, { kind="hello_server" })
-  end
-end
-
--------------------------
--- APPROVAL FLOW
--------------------------
-local function wait_for_tablet_response(req_id, timeout_s)
-  local timer = os.startTimer(timeout_s)
-  while true do
-    local ev, a, b, c = os.pullEvent()
-    if ev == "rednet_message" then
-      local sender, msg, proto = a, b, c
-      if proto == PROTOCOL and type(msg) == "table" then
-        if msg.kind == "hello_tablet" or msg.kind == "hello_turtle" then
-          handle_hello(sender, msg)
-        elseif sender == TABLET_ID and msg.kind == "approval_response" and msg.id == req_id then
-          send(TABLET_ID, { kind="approval_ack", id=req_id })
-          return true, msg
-        end
-      end
-    elseif ev == "timer" and a == timer then
-      return false, "timeout"
-    end
-  end
-end
-
-local function command_turtle(payload, timeout_s)
-  if not TURTLE_ID then return false, "No turtle bound" end
-  local req_id = payload.id
-  send(TURTLE_ID, payload)
-
-  local timer = os.startTimer(timeout_s or 60)
-  while true do
-    local ev, a, b, c = os.pullEvent()
-    if ev == "rednet_message" then
-      local sender, msg, proto = a, b, c
-      if proto == PROTOCOL and type(msg) == "table" then
-        if msg.kind == "hello_tablet" or msg.kind == "hello_turtle" then
-          handle_hello(sender, msg)
-        elseif sender == TURTLE_ID and msg.kind == "cmd_ack" and msg.id == req_id then
-          return msg.ok and true or false, msg.err
-        end
-      end
-    elseif ev == "timer" and a == timer then
-      return false, "turtle timeout"
-    end
-  end
-end
-
--------------------------
--- CORE INTERACTION
--------------------------
-local busy = false
-local last_greet = {} -- player -> time
-
-local function do_interaction(player)
-  busy = true
-
-  dm(player, "Licensing desk: type 'keycard' or 'return'")
-  local ok_req, msg = wait_for_chat_from(player, REQUEST_TIMEOUT_S)
-  if not ok_req then
-    dm(player, "Timed out. Step up again to retry.")
-    busy = false
-    return
-  end
-
-  local req = parse_player_request(msg)
-  if not req then
-    dm(player, "Unrecognized request. Type: keycard OR return")
-    busy = false
-    return
-  end
-
-  -- RETURN: no tablet approval
-  if req.kind == "return" then
-    dm(player, "Return accepted. Place your keycard into the dropper, then type: done")
-    local ok_done, msg_done = wait_for_chat_from(player, REQUEST_TIMEOUT_S)
-    if not ok_done or not parse_done(msg_done) then
-      dm(player, "No valid confirmation received. Step up again to retry.")
-      busy = false
-      return
-    end
-
-    if not TURTLE_ID then
-      dm(player, "System offline: turtle not connected.")
-      busy = false
-      return
-    end
-
-    local id = player .. "-" .. tostring(os.epoch("utc"))
-    local okT, errT = command_turtle({ kind="cmd_return", id=id, player=player }, 90)
-    if okT then
-      dm(player, "Return complete. Thank you.")
-    else
-      dm(player, "Return failed: " .. tostring(errT))
-    end
-    busy = false
-    return
-  end
-
-  -- KEYCARD: tablet approval required
-  if not TABLET_ID then
-    dm(player, "System offline: tablet not connected.")
-    busy = false
-    return
-  end
-  if not TURTLE_ID then
-    dm(player, "System offline: turtle not connected.")
-    busy = false
-    return
-  end
-
-  local req_id = player .. "-" .. tostring(os.epoch("utc"))
-  dm(player, "Request submitted. Awaiting approval...")
-  admin_notify("Notification: Pending Licensing (" .. player .. ")")
-
+local function tablet_ack(id, ok, err)
+  if not TABLET_ID then return end
   send(TABLET_ID, {
-    kind="approval_request",
-    id=req_id,
-    requester=player,
-    request_text="keycard"
+    kind = "decision_ack",
+    id   = id,
+    ok   = ok and true or false,
+    err  = err,
   })
-
-  local okA, resp = wait_for_tablet_response(req_id, ADMIN_TIMEOUT_S)
-  if not okA then
-    dm(player, "No decision received in time. Try again later.")
-    busy = false
-    return
-  end
-
-  if not resp.approved then
-    dm(player, "Denied. Please see staff for assistance.")
-    busy = false
-    return
-  end
-
-  local level = tonumber(resp.level)
-  if not level or level < 1 or level > 5 then
-    dm(player, "Denied (invalid level).")
-    busy = false
-    return
-  end
-
-  dm(player, ("Approved for keycard level %d. Dispensing..."):format(level))
-
-  local okT, errT = command_turtle({
-    kind="cmd_issue",
-    id=req_id,
-    player=player,
-    level=level
-  }, 120)
-
-  if okT then
-    dm(player, ("Keycard level %d dispensed."):format(level))
-  else
-    dm(player, "Dispense failed: " .. tostring(errT))
-  end
-
-  busy = false
 end
 
 -------------------------
--- MAIN LOOP (EDGE TRIGGER + NONBLOCKING REDNET POLL)
+-- TURTLE COMMANDS
 -------------------------
-log("Online. Waiting for tablet+turtle hello...")
-announce()
-local last_announce = os.epoch("utc")
+local function turtle_cmd(tbl)
+  if not TURTLE_ID then
+    log("WARN", "No TURTLE_ID bound; cannot command turtle")
+    return false, "no_turtle"
+  end
+  send(TURTLE_ID, tbl)
+  return true
+end
 
-local prev_present = false
+-------------------------
+-- EVENT HANDLERS
+-------------------------
+local function on_tablet_decision(sender, msg)
+  -- msg: { kind="approval_response", id, approved, level }
+  if sender ~= TABLET_ID then
+    log("WARN", "Ignoring approval_response from non-tablet sender=" .. tostring(sender))
+    return
+  end
+  if not pending_request then
+    tablet_ack(msg.id, false, "no_pending")
+    return
+  end
+  if msg.id ~= pending_request.id then
+    tablet_ack(msg.id, false, "id_mismatch")
+    return
+  end
+  if pending_request.kind ~= "keycard" then
+    tablet_ack(msg.id, false, "not_approvable")
+    return
+  end
+
+  if msg.approved then
+    local lvl = tonumber(msg.level)
+    if not lvl or lvl < 1 or lvl > 5 then
+      tablet_ack(msg.id, false, "bad_level")
+      return
+    end
+
+    -- ACK tablet first so it stops resending/looping
+    tablet_ack(msg.id, true)
+
+    -- send to turtle
+    local ok, err = turtle_cmd({
+      kind   = "issue_keycard",
+      id     = pending_request.id,
+      player = pending_request.requester,
+      level  = lvl,
+    })
+    if not ok then
+      dm(pending_request.requester, "Internal error: turtle not connected.")
+      log("ERR", "issue_keycard failed: " .. tostring(err))
+    end
+
+    pending_request = nil
+  else
+    tablet_ack(msg.id, true)
+    dm(pending_request.requester, "Denied. Please see staff for assistance.")
+    pending_request = nil
+  end
+end
+
+local function on_turtle_status(sender, msg)
+  if sender ~= TURTLE_ID then return end
+  -- optional: react to turtle acks
+  -- msg.kind could be "done"|"error"|"log"
+end
+
+local function handle_new_player_interaction(player)
+  if pending_request then
+    dm(player, "Licensing is busy. Please wait.")
+    return
+  end
+
+  dm(player, "Licensing desk: What do you need? (type: keycard) OR (type: return)")
+
+  -- wait for chat from player with timer
+  local deadline = os.startTimer(REQUEST_TIMEOUT_S)
+  while true do
+    local ev, a, b, c = os.pullEvent()
+    if ev == "chat" then
+      local p, text = a, b
+      if p == player then
+        local req = parse_player_request(text)
+        if not req then
+          dm(player, "Unrecognized request. Type: keycard OR return")
+          return
+        end
+
+        local rid = new_request_id(player)
+        pending_request = {
+          id = rid,
+          requester = player,
+          request_text = tostring(text),
+          kind = req.kind,
+          ts = now_s(),
+        }
+
+        -- RETURN bypasses tablet approval
+        if req.kind == "return" then
+          dm(player, "Return accepted. Follow the instructions at the dropper.")
+          local ok, err = turtle_cmd({
+            kind   = "process_return",
+            id     = rid,
+            player = player,
+          })
+          if not ok then
+            dm(player, "Internal error: turtle not connected.")
+            log("ERR", "process_return failed: " .. tostring(err))
+          end
+          pending_request = nil
+          return
+        end
+
+        -- KEYCARD requires tablet approval
+        dm(player, "Request submitted. Awaiting approval...")
+        local ok = notify_tablet(pending_request)
+        if not ok then
+          dm(player, "Internal error: approval tablet not connected.")
+          pending_request = nil
+          return
+        end
+        return
+      end
+    elseif ev == "timer" and a == deadline then
+      dm(player, "Timed out. Step up again to retry.")
+      return
+    elseif ev == "rednet_message" then
+      -- still process binds/decisions while waiting
+      local sender, msg, proto = a, b, c
+      if proto == PROTOCOL and type(msg) == "table" then
+        if msg.kind == "hello_tablet" or msg.kind == "hello_turtle" then
+          bind(sender, msg.kind)
+        elseif msg.kind == "approval_response" then
+          on_tablet_decision(sender, msg)
+        elseif msg.kind == "turtle_status" then
+          on_turtle_status(sender, msg)
+        end
+      end
+    end
+  end
+end
+
+-------------------------
+-- MAIN LOOP
+-------------------------
+log("BOOT", "Online. Waiting for tablet+turtle hello... (server_id=" .. tostring(SERVER_ID) .. ")")
 
 while true do
-  if (os.epoch("utc") - last_announce) > 3000 then
-    announce()
-    last_announce = os.epoch("utc")
-  end
+  -- non-blocking poll loop driven by timer
+  local t = os.startTimer(POLL_PERIOD_S)
+  while true do
+    local ev, a, b, c = os.pullEvent()
+    if ev == "timer" and a == t then break end
 
-  -- non-blocking rednet poll (timeout=0)
-  do
-    local sender, msg, proto = rednet.receive(PROTOCOL, 0)
-    if sender and type(msg) == "table" then
-      if msg.kind == "hello_tablet" or msg.kind == "hello_turtle" then
-        handle_hello(sender, msg)
+    if ev == "rednet_message" then
+      local sender, msg, proto = a, b, c
+      if proto == PROTOCOL and type(msg) == "table" then
+        if msg.kind == "hello_tablet" or msg.kind == "hello_turtle" then
+          bind(sender, msg.kind)
+        elseif msg.kind == "approval_response" then
+          on_tablet_decision(sender, msg)
+        elseif msg.kind == "turtle_status" then
+          on_turtle_status(sender, msg)
+        end
       end
     end
   end
 
-  -- zone poll (edge only)
+  -- zone detect + greet cooldown
   local players = detector.getPlayersInCoords(ZONE_ONE, ZONE_TWO)
-  local present = (#players > 0)
-  local rising_edge = (present and not prev_present)
-  prev_present = present
-
-  if rising_edge then
+  if #players > 0 then
     local p = players[1]
-    local t = now_s()
     local last = last_greet[p] or -1e9
-
-    if busy then
-      if (t - last) >= GREET_COOLDOWN_S then
-        dm(p, BUSY_MSG)
-        last_greet[p] = t
-      end
-    else
-      if (t - last) >= GREET_COOLDOWN_S then
-        last_greet[p] = t
-        do_interaction(p)
-      end
+    local tnow = now_s()
+    if (tnow - last) >= GREET_COOLDOWN_S then
+      last_greet[p] = tnow
+      handle_new_player_interaction(p)
     end
   end
-
-  sleep(POLL_PERIOD_S)
 end

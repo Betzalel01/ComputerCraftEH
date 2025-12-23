@@ -15,8 +15,8 @@ local PROTOCOL = "licensing_v1"
 -------------------------
 local ADMIN_NAME = "Shade_Angel" -- for optional notifications (chat msg), not required
 
-local ZONE_ONE = { x = -1752.0, y = 78.0, z = 1116.0 }
-local ZONE_TWO = { x = -1750.9, y = 79.9, z = 1117.9 }
+local ZONE_ONE = { x = -1752, y = 78.0, z = 1115.0 }
+local ZONE_TWO = { x = -1753, y = 79, z = 1118 }
 
 local POLL_PERIOD_S     = 0.25
 local GREET_COOLDOWN_S  = 10

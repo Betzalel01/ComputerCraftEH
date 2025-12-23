@@ -1,4 +1,4 @@
--- Licensing_Tablet.lua
+-- XLicensing_Tablet.lua
 -- Drop-in tablet GUI wrapper.
 -- Fixes:
 --  * APPROVE text never black (explicit fg reset order)

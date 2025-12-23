@@ -1,12 +1,8 @@
--- Licensing/Licensing_Agent.lua
--- Turtle runner: modem upgrade ONLY (no chatbox, no playerDetector needed)
--- Responsibilities:
---  * Execute physical actions when commanded by server:
---      - dispense_card(level)
---      - return_card()
---  * Your pathing is kept EXACTLY as you posted.
+-- Licensing_Agent.lua (TURTLE)
+-- Turtle has ONLY modem. It receives dispense commands from server.
 
 local PROTOCOL = "licensing_v1"
+local SERVER_ID = nil -- optional hard-code
 
 -------------------------
 -- REDNET INIT
@@ -19,34 +15,31 @@ local function ensure_rednet()
   end
   return false
 end
-
-if not ensure_rednet() then
-  error("Rednet not available on turtle. Install a wireless modem upgrade.", 0)
-end
-
--------------------------
--- CONFIG
--------------------------
-local DROPPER_RS_SIDE = "front"
-local RS_PULSE_S      = 0.5
-local FUEL_THRESHOLD  = 200
+if not ensure_rednet() then error("No modem/rednet not open on turtle.", 0) end
 
 -------------------------
 -- UTIL
 -------------------------
-local function pulse_dropper()
-  redstone.setOutput(DROPPER_RS_SIDE, true)
-  sleep(RS_PULSE_S)
-  redstone.setOutput(DROPPER_RS_SIDE, false)
+local function now_s() return os.epoch("utc") / 1000 end
+local function log(msg) print(string.format("[%.3f][TURTLE] %s", now_s(), msg)) end
+
+local function send(to, tbl)
+  rednet.send(to, tbl, PROTOCOL)
 end
 
-local function reply(to_id, id, ok, err)
-  rednet.send(to_id, { kind="turtle_resp", id=id, ok=ok, err=err }, PROTOCOL)
+local function announce()
+  if SERVER_ID then
+    send(SERVER_ID, { kind="hello_turtle" })
+  else
+    rednet.broadcast({ kind="hello_turtle" }, PROTOCOL)
+  end
 end
 
 -------------------------
--- YOUR PATHING (UNCHANGED)
+-- YOUR EXISTING PATHING / ACTIONS
+-- NOTE: Keep your working implementations here.
 -------------------------
+
 -- dropper -> station
 local function path_to_station()
   if not turtle.up() then return false, "blocked going up (station)" end
@@ -92,6 +85,11 @@ local function path_to_card_storage(level)
   return true
 end
 
+local function grab_one()
+  if turtle.suck(1) then return true end
+  return false, "out of stock"
+end
+
 -- storage(level) -> dropper
 local function path_to_dropper(level)
   level = tonumber(level)
@@ -134,94 +132,13 @@ local function path_to_dropper(level)
   return true
 end
 
--- fuel: station -> fuel storage
-local function path_to_fuel_storage()
-  turtle.turnLeft()
-  if not turtle.forward() then return false, "blocked fuel (1)" end
-  if not turtle.forward() then return false, "blocked fuel (2)" end
-  turtle.turnLeft()
-  if not turtle.down() then return false, "blocked fuel down" end
-  return true
-end
+local DROPPER_RS_SIDE = "front"
+local RS_PULSE_S = 0.5
 
--- fuel: fuel storage -> station
-local function path_fuel_storage_to_station()
-  turtle.turnLeft()
-  if not turtle.up() then return false, "blocked fuel up" end
-  if not turtle.forward() then return false, "blocked fuel return (1)" end
-  if not turtle.forward() then return false, "blocked fuel return (2)" end
-  turtle.turnLeft()
-  return true
-end
-
--- return: station -> dropper
-local function path_station_to_dropper()
-  turtle.turnLeft()
-  if not turtle.forward() then return false, "blocked to dropper (1)" end
-  if not turtle.forward() then return false, "blocked to dropper (2)" end
-  turtle.turnRight()
-  if not turtle.down() then return false, "blocked down to dropper" end
-  return true
-end
-
--- return: dropper -> return chest
-local function path_dropper_to_return_chest()
-  if not turtle.up() then return false, "blocked up from dropper" end
-  turtle.turnRight()
-
-  if not turtle.forward() then return false, "blocked return path (1)" end
-  if not turtle.forward() then return false, "blocked return path (2)" end
-  if not turtle.forward() then return false, "blocked return path (3)" end
-  if not turtle.forward() then return false, "blocked return path (4)" end
-
-  turtle.turnRight()
-
-  if not turtle.forward() then return false, "blocked keyroom (1)" end
-  if not turtle.forward() then return false, "blocked keyroom (2)" end
-  if not turtle.forward() then return false, "blocked keyroom (3)" end
-  if not turtle.forward() then return false, "blocked keyroom (4)" end
-
-  if not turtle.down() then return false, "blocked down (A)" end
-  if not turtle.forward() then return false, "blocked (7)" end
-  if not turtle.down() then return false, "blocked down (B)" end
-  if not turtle.forward() then return false, "blocked (8)" end
-  if not turtle.down() then return false, "blocked down (C)" end
-  if not turtle.forward() then return false, "blocked to return chest" end
-
-  turtle.turnLeft()
-  return true
-end
-
--- return: return chest -> station
-local function path_return_chest_to_station()
-  turtle.turnLeft()
-  if not turtle.forward() then return false, "blocked leaving return chest" end
-
-  if not turtle.up() then return false, "blocked up (1)" end
-  if not turtle.forward() then return false, "blocked (up-hall-a)" end
-  if not turtle.up() then return false, "blocked up (2)" end
-  if not turtle.forward() then return false, "blocked (up-hall-b)" end
-  if not turtle.up() then return false, "blocked up (3)" end
-
-  if not turtle.forward() then return false, "blocked (hall-1)" end
-  if not turtle.forward() then return false, "blocked (hall-2)" end
-  if not turtle.forward() then return false, "blocked (hall-3)" end
-  if not turtle.forward() then return false, "blocked (hall-4)" end
-
-  turtle.turnLeft()
-
-  if not turtle.forward() then return false, "blocked (exit-1)" end
-  if not turtle.forward() then return false, "blocked (exit-2)" end
-  turtle.turnRight()
-  return true
-end
-
--------------------------
--- INVENTORY ACTIONS
--------------------------
-local function grab_one()
-  if turtle.suck(1) then return true end
-  return false, "Out of stock"
+local function pulse_dropper()
+  redstone.setOutput(DROPPER_RS_SIDE, true)
+  sleep(RS_PULSE_S)
+  redstone.setOutput(DROPPER_RS_SIDE, false)
 end
 
 local function insert_card_into_dropper()
@@ -229,11 +146,12 @@ local function insert_card_into_dropper()
   for i = 1, 16 do
     if turtle.getItemDetail(i) then slot = i break end
   end
-  if not slot then return false, "No card in inventory" end
+  if not slot then return false, "no card in inventory" end
 
   turtle.select(slot)
+
   if not turtle.drop(1) then
-    return false, "Insert failed (wrong side or dropper full)"
+    return false, "drop failed (wrong side/full)"
   end
 
   pulse_dropper()
@@ -241,136 +159,74 @@ local function insert_card_into_dropper()
   return true
 end
 
-local function take_return_from_dropper()
-  if turtle.suck(1) then return true end
-  return false, "No card found in dropper"
-end
-
-local function drop_into_return_chest()
-  local slot
-  for i = 1, 16 do
-    if turtle.getItemDetail(i) then slot = i break end
-  end
-  if not slot then return false, "No card in inventory to return" end
-
-  turtle.select(slot)
-  local ok = turtle.drop(1)
-  turtle.select(1)
-  if ok then return true end
-  return false, "Return chest insert failed (full/wrong side)"
-end
-
 -------------------------
--- FUEL CHECK
--------------------------
-local function ensure_fuel()
-  local fuel = turtle.getFuelLevel()
-  if fuel == "unlimited" then return true end
-  if fuel >= FUEL_THRESHOLD then return true end
-
-  local ok1, err1 = path_to_fuel_storage()
-  if not ok1 then return false, "FUEL: can't reach fuel storage: " .. tostring(err1) end
-
-  turtle.suck(64)
-  for slot = 1, 16 do
-    if turtle.getFuelLevel() == "unlimited" then break end
-    if turtle.getFuelLevel() >= FUEL_THRESHOLD then break end
-    if turtle.getItemDetail(slot) then
-      turtle.select(slot)
-      turtle.refuel(64)
-    end
-  end
-  turtle.select(1)
-
-  local ok2, err2 = path_fuel_storage_to_station()
-  if not ok2 then return false, "FUEL: refueled but couldn't return: " .. tostring(err2) end
-
-  return true
-end
-
--------------------------
--- COMMAND HANDLERS
+-- DISPENSE HANDLER
 -------------------------
 local function do_dispense(level)
-  local okf, erf = ensure_fuel()
-  if not okf then return false, erf end
+  local ok, err
 
-  local ok1, err1 = path_to_card_storage(level)
-  if not ok1 then return false, err1 end
+  ok, err = path_to_card_storage(level)
+  if not ok then return false, "path_to_card_storage: " .. tostring(err) end
 
-  local ok2, err2 = grab_one()
-  if not ok2 then
-    -- attempt to return to dropper path then station
-    path_to_dropper(level)
-    path_to_station()
-    return false, err2
+  ok, err = grab_one()
+  if not ok then
+    -- attempt to get back to station safely
+    pcall(path_to_dropper, level)
+    pcall(path_to_station)
+    return false, "grab_one: " .. tostring(err)
   end
 
-  local ok3, err3 = path_to_dropper(level)
-  if not ok3 then return false, err3 end
+  ok, err = path_to_dropper(level)
+  if not ok then return false, "path_to_dropper: " .. tostring(err) end
 
-  local ok4, err4 = insert_card_into_dropper()
-  if not ok4 then
-    path_to_station()
-    return false, err4
+  ok, err = insert_card_into_dropper()
+  if not ok then
+    pcall(path_to_station)
+    return false, "insert_card_into_dropper: " .. tostring(err)
   end
 
-  path_to_station()
-  return true
-end
+  ok, err = path_to_station()
+  if not ok then return false, "path_to_station: " .. tostring(err) end
 
-local function do_return()
-  local okf, erf = ensure_fuel()
-  if not okf then return false, erf end
-
-  local okp, errp = path_station_to_dropper()
-  if not okp then return false, errp end
-
-  local oks, errs = take_return_from_dropper()
-  if not oks then
-    path_to_station()
-    return false, errs
-  end
-
-  local okr, errr = path_dropper_to_return_chest()
-  if not okr then
-    path_return_chest_to_station()
-    return false, errr
-  end
-
-  local okd, errd = drop_into_return_chest()
-  if not okd then
-    path_return_chest_to_station()
-    return false, errd
-  end
-
-  path_return_chest_to_station()
   return true
 end
 
 -------------------------
--- MAIN LOOP
+-- MAIN
 -------------------------
-rednet.broadcast({ kind="hello_turtle" }, PROTOCOL)
-print("Licensing Agent turtle online. ID: " .. os.getComputerID())
+announce()
+local lastAnnounce = os.epoch("utc")
+
+log("Listening...")
 
 while true do
+  if (os.epoch("utc") - lastAnnounce) > 3000 then
+    announce()
+    lastAnnounce = os.epoch("utc")
+  end
+
   local sender, msg, proto = rednet.receive(PROTOCOL)
-  if type(msg) == "table" and msg.kind == "turtle_cmd" then
-    local id = msg.id
-    local cmd = msg.cmd
-    local payload = msg.payload or {}
+  if proto == PROTOCOL and type(msg) == "table" then
+    if msg.kind == "hello_server" then
+      SERVER_ID = sender
+      log("Bound SERVER_ID=" .. tostring(SERVER_ID))
+      announce()
 
-    if cmd == "dispense_card" then
-      local ok, err = do_dispense(payload.level)
-      reply(sender, id, ok, err)
+    elseif msg.kind == "dispense" then
+      SERVER_ID = sender
+      log(("dispense id=%s approved=%s level=%s"):format(tostring(msg.id), tostring(msg.approved), tostring(msg.level)))
 
-    elseif cmd == "return_card" then
-      local ok, err = do_return()
-      reply(sender, id, ok, err)
-
-    else
-      reply(sender, id, false, "Unknown cmd: " .. tostring(cmd))
+      if not msg.approved then
+        send(SERVER_ID, { kind="dispense_ack", id=msg.id, ok=true, reason="denied" })
+      else
+        local lvl = tonumber(msg.level)
+        if not lvl or lvl < 1 or lvl > 5 then
+          send(SERVER_ID, { kind="dispense_ack", id=msg.id, ok=false, reason="invalid level" })
+        else
+          local ok, reason = do_dispense(lvl)
+          send(SERVER_ID, { kind="dispense_ack", id=msg.id, ok=ok, reason=reason })
+        end
+      end
     end
   end
 end

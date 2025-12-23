@@ -1,12 +1,14 @@
--- X Licensing_Agent.lua (TURTLE)
--- Drop-in turtle listener that:
---  * binds to server (hello_turtle)
---  * receives commands:
---      - issue_keycard {player, level, id}
---      - process_return {player, id}
---
--- Keep your existing movement/pathing/inventory functions.
--- This file only fixes the NETWORK + DISPATCH layer so it always receives commands.
+-- Licensing_Agent.lua (TURTLE) - DROP IN
+-- Receives:
+--   - issue_keycard {player, level, id}
+--   - process_return {player, id}
+-- Integrates your working movement/pathing/inventory code.
+-- Fixes:
+--   * pulse_dropper defined
+--   * do_issue_keycard wrapper calls do_issue(level)
+--   * do_return wrapper matches your do_return() signature
+--   * fuel constants defined
+--   * always ACK back to server with turtle_status
 
 local PROTOCOL  = "licensing_v1"
 local SERVER_ID = nil -- optional hard-code, else binds on hello_server
@@ -38,6 +40,21 @@ local function announce()
   else
     rednet.broadcast({ kind="hello_turtle" }, PROTOCOL)
   end
+end
+
+----------------------------------------------------------------------
+-- MOVEMENT / INVENTORY (your working code) + missing defs
+----------------------------------------------------------------------
+
+-- CONFIG (match your working code)
+local DROPPER_RS_SIDE = "front"
+local RS_PULSE_S      = 0.5
+local FUEL_THRESHOLD  = 200
+
+local function pulse_dropper()
+  redstone.setOutput(DROPPER_RS_SIDE, true)
+  sleep(RS_PULSE_S)
+  redstone.setOutput(DROPPER_RS_SIDE, false)
 end
 
 -------------------------
@@ -333,10 +350,20 @@ local function do_return()
   return true
 end
 
+-- wrappers expected by your network layer
+local function do_issue_keycard(player, level)
+  -- player is currently unused by movement, but kept for future logging/rules.
+  return do_issue(level)
+end
 
--- =========================
--- MAIN LOOP
--- =========================
+local function do_process_return(player)
+  return do_return()
+end
+
+----------------------------------------------------------------------
+-- MAIN LOOP (your current network layer, fixed dispatch)
+----------------------------------------------------------------------
+
 announce()
 log("Listening...")
 
@@ -354,26 +381,41 @@ while true do
     if msg.kind == "hello_server" then
       SERVER_ID = sender
       log("Bound SERVER_ID=" .. tostring(SERVER_ID))
-      -- confirm back (optional)
       send(SERVER_ID, { kind="hello_turtle" })
 
     elseif msg.kind == "issue_keycard" then
       if SERVER_ID and sender ~= SERVER_ID then
         log("Ignored issue_keycard from non-server sender=" .. tostring(sender))
       else
+        SERVER_ID = SERVER_ID or sender
         local player = tostring(msg.player or "?")
         local level  = tonumber(msg.level or 0) or 0
-        do_issue_keycard(player, level)
-        send(SERVER_ID, { kind="turtle_status", what="issue_keycard_done", id=msg.id, ok=true })
+
+        local ok, err = do_issue_keycard(player, level)
+        send(SERVER_ID, {
+          kind="turtle_status",
+          what="issue_keycard_done",
+          id=msg.id,
+          ok=ok and true or false,
+          err=err
+        })
       end
 
     elseif msg.kind == "process_return" then
       if SERVER_ID and sender ~= SERVER_ID then
         log("Ignored process_return from non-server sender=" .. tostring(sender))
       else
+        SERVER_ID = SERVER_ID or sender
         local player = tostring(msg.player or "?")
-        do_return(player)
-        send(SERVER_ID, { kind="turtle_status", what="return_done", id=msg.id, ok=true })
+
+        local ok, err = do_process_return(player)
+        send(SERVER_ID, {
+          kind="turtle_status",
+          what="return_done",
+          id=msg.id,
+          ok=ok and true or false,
+          err=err
+        })
       end
     end
   end

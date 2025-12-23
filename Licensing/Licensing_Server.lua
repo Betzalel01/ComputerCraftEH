@@ -1,7 +1,6 @@
 -- Licensing_Server.lua
 -- Stationary computer: modem + chatBox + playerDetector
--- Sends approval requests to tablet, forwards tablet decisions to turtle.
--- Also sends admin chat notifications: "Notification: Pending Licensing"
+-- Detects player, queues approvals to tablet, forwards decisions to turtle, ACKs tablet.
 
 -------------------------
 -- CONFIG
@@ -17,7 +16,7 @@ local GREET_COOLDOWN_S  = 30
 local REQUEST_TIMEOUT_S = 30
 local BUSY_MSG          = "Licensing desk is busy. Please wait."
 
--- If you want to hard-set IDs, put numbers here. Otherwise leave nil and it will bind on hello.
+-- Optional hard IDs (can be nil if your tablet/turtle says hello)
 local TURTLE_ID = nil
 local TABLET_ID = nil
 
@@ -92,9 +91,33 @@ local function mk_id()
   return ("%d-%d"):format(math.random(0,9), os.epoch("utc"))
 end
 
-local function send_to_tablet(req)
+local function send_to_tablet(payload)
   if TABLET_ID then
-    rednet.send(TABLET_ID, req, PROTOCOL)
+    rednet.send(TABLET_ID, payload, PROTOCOL)
+  end
+end
+
+local function remove_from_queue(id)
+  approvals[id] = nil
+  for i = #queue, 1, -1 do
+    if queue[i] == id then
+      table.remove(queue, i)
+      break
+    end
+  end
+end
+
+local function resend_queue_to_tablet()
+  for _, id in ipairs(queue) do
+    local r = approvals[id]
+    if r then
+      send_to_tablet({
+        kind="approval_request",
+        id=id,
+        requester=r.requester,
+        request_text=r.request_text,
+      })
+    end
   end
 end
 
@@ -112,18 +135,6 @@ local function enqueue_request(requester, request_text)
 
   admin_notify("Pending Licensing")
   return id
-end
-
-local function resend_queue_to_tablet()
-  for _, id in ipairs(queue) do
-    local r = approvals[id]
-    send_to_tablet({
-      kind="approval_request",
-      id=id,
-      requester=r.requester,
-      request_text=r.request_text,
-    })
-  end
 end
 
 -------------------------
@@ -176,13 +187,19 @@ local function poll_zone_once()
   end
 
   if req.kind == "keycard" then
-    enqueue_request(p, "keycard")
-    dm(p, "Request submitted. Awaiting approval...")
+    if not TURTLE_ID then
+      dm(p, "System offline (turtle not connected). Try later.")
+      admin_notify("Licensing request blocked: turtle not connected")
+    else
+      enqueue_request(p, "keycard")
+      dm(p, "Request submitted. Awaiting approval...")
+    end
   else
     if TURTLE_ID then
       rednet.send(TURTLE_ID, { kind="return_start", player=p }, PROTOCOL)
     else
       dm(p, "Return system offline (turtle not connected).")
+      admin_notify("Return requested but turtle not connected")
     end
   end
 
@@ -190,7 +207,7 @@ local function poll_zone_once()
 end
 
 -------------------------
--- MAIN EVENT LOOP (NO pullEventTimeout)
+-- MAIN LOOP
 -------------------------
 local poll_timer = os.startTimer(POLL_PERIOD_S)
 
@@ -207,11 +224,33 @@ while true do
       if msg.kind == "hello_tablet" then
         TABLET_ID = sender
         resend_queue_to_tablet()
+
       elseif msg.kind == "hello_turtle" then
         TURTLE_ID = sender
+
       elseif msg.kind == "approval_response" then
-        if TURTLE_ID then
-          rednet.send(TURTLE_ID, msg, PROTOCOL)
+        -- Expect msg fields: id, approved(boolean), level(number if approved)
+        local id = msg.id
+        if not id or not approvals[id] then
+          -- Still ACK tablet so UI doesn't loop on stale request
+          if TABLET_ID then
+            rednet.send(TABLET_ID, { kind="approval_ack", id=id, ok=false, reason="unknown_id" }, PROTOCOL)
+          end
+        else
+          -- Remove from queue immediately (prevents re-show)
+          remove_from_queue(id)
+
+          -- Forward to turtle
+          if TURTLE_ID then
+            rednet.send(TURTLE_ID, msg, PROTOCOL)
+          else
+            admin_notify("Approval received but turtle not connected")
+          end
+
+          -- ACK tablet so it stops re-sending / clears UI
+          if TABLET_ID then
+            rednet.send(TABLET_ID, { kind="approval_ack", id=id, ok=true }, PROTOCOL)
+          end
         end
       end
     end

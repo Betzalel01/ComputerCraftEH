@@ -1,8 +1,15 @@
 -- ============================================================
 --  ElevatorController.lua  |  COMPUTER
 --
---  Controls 3 Create elevators across 2 floors using bundled
---  redstone cables and Create Redstone Links.
+--  Controls 3 Create elevators across 2 floors.
+--
+--  LEFT  side (input)  : call buttons + arrival sensors (shared wire)
+--  RIGHT side (output) : dispatch commands
+--
+--  Each (elevator, floor) pair shares one color on both sides.
+--  A rising edge on the input wire is disambiguated by state:
+--    - If that elevator is busy heading to that floor -> arrival
+--    - Otherwise                                      -> call button
 --
 --  Preferred resting state : 2 elevators on Top, 1 on Bottom
 --  Hard constraint         : at least 1 elevator on each floor
@@ -11,105 +18,86 @@
 --  WIRING GUIDE
 -- ============================================================
 --
---  You need TWO bundled cables connected to this computer:
+--  LEFT side  (bundled cable) = INPUTS
+--  RIGHT side (bundled cable) = OUTPUTS
 --
---    INPUT_SIDE  ("back"  by default)  <-- call buttons
---    OUTPUT_SIDE ("front" by default)  <-- indicators / move commands
+--  Color map (same color = same elevator+floor on both sides):
 --
---  Color assignments  (same color = same pair on both cables):
+--    Color    Signal
+--    ──────   ──────────────────────────────────────────────
+--    Red      Elevator 1 - Top floor    (E1T)
+--    Blue     Elevator 2 - Top floor    (E2T)
+--    Green    Elevator 3 - Top floor    (E3T)
+--    Yellow   Elevator 1 - Bottom floor (E1B)
+--    Purple   Elevator 2 - Bottom floor (E2B)
+--    White    Elevator 3 - Bottom floor (E3B)
 --
---    COLOR        ELEVATOR   FLOOR
---    ─────────    ─────────  ──────
---    White        A          Bottom
---    Orange       B          Bottom
---    Magenta      C          Bottom
---    Light Blue   A          Top
---    Yellow       B          Top
---    Lime         C          Top
+--  LEFT side wiring (inputs):
+--    For each (elevator, floor) pair, wire TWO signals into
+--    the same colored wire on the left bundled cable:
+--      1. The call button at that floor for that elevator shaft
+--         (player presses button -> Redstone Link transmitter
+--          -> Redstone Link receiver -> into bundled cable)
+--      2. The Create elevator position sensor that fires when
+--         the elevator arrives at that floor
+--         (elevator arrives -> contact/sensor output
+--          -> Redstone Link transmitter -> receiver -> same wire)
+--    Both signals share the wire. The computer tells them apart
+--    by checking whether the elevator was in transit.
 --
---  INPUT cable (call buttons):
---    For each (Elevator, Floor) pair, place a Create Redstone
---    Link set to RECEIVE mode near the call button location.
---    Wire its redstone output into the matching color of the
---    bundled cable on the INPUT_SIDE of this computer.
---    When a player activates the button, the Redstone Link
---    transmitter at the button sends a signal to the receiver
---    here, which feeds into the correct bundled color.
---
---  OUTPUT cable (indicators + move commands):
---    For each (Elevator, Floor) pair, place a Create Redstone
---    Link set to TRANSMIT mode adjacent to the matching color
---    of the OUTPUT_SIDE bundled cable.
---    Wire this link's RECEIVER at the elevator mechanism so
---    that when the computer activates that color, the elevator
---    receives its move command.
---    Use the same signal (or a lamp/indicator light tapped off
---    the same wire) to show players which elevators are present
---    on each floor.
---
---  Redstone Link frequencies:
---    Assign one unique frequency pair per (Elevator, Floor).
---    Label them e.g. "A-Bot", "A-Top", "B-Bot" etc. for
---    easy identification in-world.
+--  RIGHT side wiring (outputs):
+--    For each (elevator, floor) pair, wire the matching colored
+--    wire on the right bundled cable to a Create Redstone Link
+--    transmitter. Place its receiver at the elevator mechanism
+--    so that when the computer pulses that color the elevator
+--    is commanded to move to that floor.
 --
 -- ============================================================
 
 -- ============================================================
---  CONFIG  ← edit these to match your build
+--  CONFIG
 -- ============================================================
+local INPUT_SIDE  = "left"
+local OUTPUT_SIDE = "right"
 
--- Sides of the computer the bundled cables are connected to
-local INPUT_SIDE  = "left"    -- bundled cable with call button signals
-local OUTPUT_SIDE = "right"   -- bundled cable with indicator/command signals
+local PULSE_S     = 0.5    -- dispatch command pulse duration (seconds)
+local POLL_S      = 0.1    -- input scan rate (seconds)
 
--- How long (seconds) an elevator takes to travel between floors
--- Tune this to match your actual Create elevator travel time
-local TRAVEL_S    = 5
+-- Preferred resting floor per elevator  (1 = Bottom, 2 = Top)
+-- { E1, E2, E3 }
+local PREFERRED = { 2, 2, 1 }
 
--- How long to hold the command pulse when dispatching an elevator
-local PULSE_S     = 0.5
-
--- How often to scan inputs (seconds)
-local POLL_S      = 0.1
-
--- Which floor each elevator should rest on when idle
--- { Elevator_A, Elevator_B, Elevator_C }
--- 1 = Bottom, 2 = Top
-local PREFERRED   = { 2, 2, 1 }
-
--- Floor display names
-local FLOOR_NAME  = { "Bottom", "Top" }
+local FLOOR_NAME = { "Bottom", "Top" }
+local ELEV_NAME  = { "E1", "E2", "E3" }
+local NUM_E      = 3
+local NUM_F      = 2
 
 -- ============================================================
---  SIGNAL MAP  ← must match your wiring
---  SIGNALS[elevator_index][floor_index] = colors.xxx
+--  SIGNAL MAP
+--  SIGNAL[elevator][floor] = color
+--  Used for BOTH input (left) and output (right) sides.
 -- ============================================================
-local SIGNALS = {
-  [1] = { [1] = colors.white,     [2] = colors.lightBlue },  -- Elevator A
-  [2] = { [1] = colors.orange,    [2] = colors.yellow    },  -- Elevator B
-  [3] = { [1] = colors.magenta,   [2] = colors.lime      },  -- Elevator C
+local SIGNAL = {
+  --          Bottom          Top
+  [1] = { [1] = colors.yellow, [2] = colors.red    },  -- Elevator 1
+  [2] = { [1] = colors.purple, [2] = colors.blue   },  -- Elevator 2
+  [3] = { [1] = colors.white,  [2] = colors.green  },  -- Elevator 3
 }
-
-local ELEV_NAME = { "Elevator A", "Elevator B", "Elevator C" }
-local NUM_E     = 3
-local NUM_F     = 2
 
 -- ============================================================
 --  STATE
 -- ============================================================
-local floor  = {}   -- floor[e] = current floor of elevator e
-local busy   = {}   -- busy[e]  = true while elevator e is in transit
-local dest   = {}   -- dest[e]  = destination floor (only valid while busy)
-local timers = {}   -- timers[e]= os.startTimer handle for travel (or nil)
+local floor  = {}   -- floor[e]  = current floor of elevator e (1 or 2)
+local busy   = {}   -- busy[e]   = true while elevator e is in transit
+local dest   = {}   -- dest[e]   = destination floor (valid while busy)
 
 for e = 1, NUM_E do
-  floor[e]  = PREFERRED[e]
-  busy[e]   = false
-  dest[e]   = 0
-  timers[e] = nil
+  floor[e] = PREFERRED[e]
+  busy[e]  = false
+  dest[e]  = 0
 end
 
-local last_inputs = 0  -- bundled input state last cycle (for rising-edge detection)
+local last_inputs = 0   -- previous bundled input state (rising-edge detection)
 
 -- ============================================================
 --  LOGGING
@@ -123,37 +111,23 @@ local function log(msg)
 end
 
 -- ============================================================
---  OUTPUT MANAGEMENT
+--  OUTPUTS
 -- ============================================================
 
---- Rebuild the bundled output to reflect current positions.
---- Only lights an elevator's indicator when it is NOT in transit.
-local function update_outputs()
-  local out = 0
-  for e = 1, NUM_E do
-    if not busy[e] then
-      out = colors.combine(out, SIGNALS[e][floor[e]])
-    end
-  end
-  redstone.setBundledOutput(OUTPUT_SIDE, out)
-end
-
---- Pulse the command color for a specific elevator + destination.
---- This is what the Create Redstone Link at the elevator picks up.
---- We add the pulse color on top of the current output, sleep,
---- then restore the normal output state.
-local function pulse_command(e, f)
+--- Pulse the dispatch command for elevator e to floor f.
+local function pulse_dispatch(e, f)
+  local color   = SIGNAL[e][f]
   local current = redstone.getBundledOutput(OUTPUT_SIDE)
-  redstone.setBundledOutput(OUTPUT_SIDE, colors.combine(current, SIGNALS[e][f]))
+  redstone.setBundledOutput(OUTPUT_SIDE, colors.combine(current, color))
   sleep(PULSE_S)
-  update_outputs()
+  redstone.setBundledOutput(OUTPUT_SIDE, colors.subtract(
+    redstone.getBundledOutput(OUTPUT_SIDE), color))
 end
 
 -- ============================================================
 --  CONSTRAINT HELPERS
 -- ============================================================
 
---- Count idle (non-busy) elevators on a given floor.
 local function idle_on_floor(f)
   local n = 0
   for e = 1, NUM_E do
@@ -162,8 +136,6 @@ local function idle_on_floor(f)
   return n
 end
 
---- Return true if elevator e can safely move away from its current
---- floor (i.e., at least one OTHER idle elevator will still be there).
 local function safe_to_move(e)
   local src = floor[e]
   for other = 1, NUM_E do
@@ -177,60 +149,55 @@ end
 -- ============================================================
 --  DISPATCH
 -- ============================================================
-
---- Send elevator e to destination floor f.
---- Assumes safe_to_move has been checked.
 local function dispatch(e, f)
   log(ELEV_NAME[e] .. ": " .. FLOOR_NAME[floor[e]] .. " -> " .. FLOOR_NAME[f])
-  busy[e]    = true
-  dest[e]    = f
-  timers[e]  = os.startTimer(TRAVEL_S)
-  update_outputs()      -- turn off this elevator's indicator while moving
-  pulse_command(e, f)   -- send move command to Create mechanism
-end
-
---- Called when a travel timer fires for elevator e.
-local function on_arrived(e)
-  floor[e]  = dest[e]
-  busy[e]   = false
-  dest[e]   = 0
-  timers[e] = nil
-  log(ELEV_NAME[e] .. " arrived at " .. FLOOR_NAME[floor[e]])
-  update_outputs()
+  busy[e] = true
+  dest[e] = f
+  pulse_dispatch(e, f)
 end
 
 -- ============================================================
---  CALL HANDLING
+--  RISING-EDGE HANDLER
+--  Called once per (elevator, floor) pair when their shared
+--  wire goes LOW->HIGH.
+--  Disambiguates arrival vs call based on elevator state.
 -- ============================================================
-local function handle_call(e, f)
-  -- Already there and idle
-  if not busy[e] and floor[e] == f then
-    return
-  end
-
-  -- Already heading there
+local function on_rising_edge(e, f)
+  -- Arrival: elevator was heading to exactly this floor
   if busy[e] and dest[e] == f then
+    floor[e] = f
+    busy[e]  = false
+    dest[e]  = 0
+    log(ELEV_NAME[e] .. " arrived at " .. FLOOR_NAME[f])
     return
   end
 
-  -- Busy going elsewhere — ignore (could queue; keeping simple for now)
-  if busy[e] then
-    log(ELEV_NAME[e] .. " is busy. Call to " .. FLOOR_NAME[f] .. " ignored.")
+  -- Arrival on unexpected floor (sensor noise / manual move)
+  if busy[e] and dest[e] ~= f then
+    log(ELEV_NAME[e] .. " unexpected sensor at " .. FLOOR_NAME[f] ..
+        " (expected " .. FLOOR_NAME[dest[e]] .. ") — ignoring.")
     return
   end
 
-  -- Would violate floor constraint
+  -- Call button: elevator is idle
+  log("Call: " .. ELEV_NAME[e] .. " to " .. FLOOR_NAME[f])
+
+  -- Already there
+  if floor[e] == f then
+    log("  -> already at " .. FLOOR_NAME[f] .. ", no action needed.")
+    return
+  end
+
+  -- Would leave source floor empty
   if not safe_to_move(e) then
-    log(ELEV_NAME[e] .. " cannot move — would leave " .. FLOOR_NAME[floor[e]] .. " empty.")
-    -- Try to find a different idle elevator already on the target floor
-    -- so the call is not silently dropped.
+    log("  -> cannot move, would leave " .. FLOOR_NAME[floor[e]] .. " empty.")
+    -- Check if the target floor already has an elevator
     for alt = 1, NUM_E do
       if alt ~= e and not busy[alt] and floor[alt] == f then
-        log("  -> " .. FLOOR_NAME[f] .. " already has " .. ELEV_NAME[alt] .. ", call satisfied.")
+        log("  -> " .. FLOOR_NAME[f] .. " already has " .. ELEV_NAME[alt] .. ".")
         return
       end
     end
-    -- No alternative found — just log and return.
     return
   end
 
@@ -238,19 +205,23 @@ local function handle_call(e, f)
 end
 
 -- ============================================================
---  INPUT POLLING  (rising-edge only)
+--  INPUT POLLING
 -- ============================================================
+local ALL_COLORS = {
+  colors.red, colors.blue, colors.green,
+  colors.yellow, colors.purple, colors.white,
+}
+
 local function poll_inputs()
   local inputs = redstone.getBundledInput(INPUT_SIDE)
 
   for e = 1, NUM_E do
     for f = 1, NUM_F do
-      local color   = SIGNALS[e][f]
-      local was_on  = colors.test(last_inputs, color)
-      local is_on   = colors.test(inputs, color)
+      local color = SIGNAL[e][f]
+      local is_on  = colors.test(inputs, color)
+      local was_on = colors.test(last_inputs, color)
       if is_on and not was_on then
-        log("Call button: " .. ELEV_NAME[e] .. " to " .. FLOOR_NAME[f])
-        handle_call(e, f)
+        on_rising_edge(e, f)
       end
     end
   end
@@ -266,55 +237,54 @@ local function draw_status()
   term.setCursorPos(1, 1)
   print("====== Elevator Controller ======")
   print("")
-
   for e = 1, NUM_E do
     local state
     if busy[e] then
-      state = "moving  -> " .. FLOOR_NAME[dest[e]] .. "..."
+      state = "moving  ->  " .. FLOOR_NAME[dest[e]] .. "..."
     else
-      state = "idle    at " .. FLOOR_NAME[floor[e]]
+      state = "idle    at  " .. FLOOR_NAME[floor[e]]
     end
-    print(("  %s : %s"):format(ELEV_NAME[e], state))
+    print(("  %s :  %s"):format(ELEV_NAME[e], state))
   end
-
   print("")
-  print(("  Bottom floor : %d elevator(s)"):format(idle_on_floor(1)))
-  print(("  Top floor    : %d elevator(s)"):format(idle_on_floor(2)))
-  print("")
-  print("  Input  : left  side (bundled call buttons)")
-  print("  Output : right side (bundled indicators/commands)")
+  print(("  Bottom :  %d idle elevator(s)"):format(idle_on_floor(1)))
+  print(("  Top    :  %d idle elevator(s)"):format(idle_on_floor(2)))
   print("")
   print("  Signal map:")
-  print("    White      = A-Bottom    LightBlue = A-Top")
-  print("    Orange     = B-Bottom    Yellow    = B-Top")
-  print("    Magenta    = C-Bottom    Lime      = C-Top")
+  print("  Red=E1T  Blue=E2T  Green=E3T")
+  print("  Yel=E1B  Purp=E2B  Wht=E3B")
 end
 
 -- ============================================================
 --  STARTUP
 -- ============================================================
 local function startup()
-  -- Assume elevators are physically at their preferred floors on boot.
-  -- Set state and pulse all outputs so Create Redstone Links
-  -- at each elevator receive the initial position signal.
-  log("Startup: setting preferred positions...")
-  log("  A -> " .. FLOOR_NAME[PREFERRED[1]])
-  log("  B -> " .. FLOOR_NAME[PREFERRED[2]])
-  log("  C -> " .. FLOOR_NAME[PREFERRED[3]])
+  redstone.setBundledOutput(OUTPUT_SIDE, 0)
+  log("Reading arrival sensors for initial positions...")
+  local inputs = redstone.getBundledInput(INPUT_SIDE)
 
   for e = 1, NUM_E do
-    floor[e] = PREFERRED[e]
-    busy[e]  = false
+    local detected = false
+    for f = 1, NUM_F do
+      if colors.test(inputs, SIGNAL[e][f]) then
+        floor[e]  = f
+        busy[e]   = false
+        detected  = true
+        log(ELEV_NAME[e] .. " detected at " .. FLOOR_NAME[f])
+      end
+    end
+
+    if not detected then
+      log(ELEV_NAME[e] .. " not detected — dispatching to "
+          .. FLOOR_NAME[PREFERRED[e]])
+      floor[e] = PREFERRED[e]
+      busy[e]  = true
+      dest[e]  = PREFERRED[e]
+      pulse_dispatch(e, PREFERRED[e])
+    end
   end
 
-  -- Pulse each elevator's command output so their Create
-  -- mechanisms receive the initial floor assignment on boot.
-  update_outputs()
-  for e = 1, NUM_E do
-    pulse_command(e, floor[e])
-  end
-
-  update_outputs()
+  last_inputs = redstone.getBundledInput(INPUT_SIDE)
   draw_status()
 end
 
@@ -327,20 +297,9 @@ local poll_timer = os.startTimer(POLL_S)
 
 while true do
   local ev, param = os.pullEvent("timer")
-
   if param == poll_timer then
     poll_inputs()
     draw_status()
     poll_timer = os.startTimer(POLL_S)
-
-  else
-    -- Check if it is a travel-arrival timer for any elevator
-    for e = 1, NUM_E do
-      if timers[e] and param == timers[e] then
-        on_arrived(e)
-        draw_status()
-        break
-      end
-    end
   end
 end

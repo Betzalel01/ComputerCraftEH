@@ -4,12 +4,7 @@
 --  Controls 3 Create elevators across 2 floors.
 --
 --  LEFT  side (input)  : call buttons + arrival sensors (shared wire)
---  RIGHT side (output) : dispatch commands
---
---  Each (elevator, floor) pair shares one color on both sides.
---  A rising edge on the input wire is disambiguated by state:
---    - If that elevator is busy heading to that floor -> arrival
---    - Otherwise                                      -> call button
+--  RIGHT side (output) : dispatch commands + position indicators
 --
 --  Preferred resting state : 2 elevators on Top, 1 on Bottom
 --  Hard constraint         : at least 1 elevator on each floor
@@ -32,102 +27,134 @@
 --    Purple   Elevator 2 - Bottom floor (E2B)
 --    White    Elevator 3 - Bottom floor (E3B)
 --
---  LEFT side wiring (inputs):
---    For each (elevator, floor) pair, wire TWO signals into
---    the same colored wire on the left bundled cable:
---      1. The call button at that floor for that elevator shaft
---         (player presses button -> Redstone Link transmitter
---          -> Redstone Link receiver -> into bundled cable)
---      2. The Create elevator position sensor that fires when
---         the elevator arrives at that floor
---         (elevator arrives -> contact/sensor output
---          -> Redstone Link transmitter -> receiver -> same wire)
---    Both signals share the wire. The computer tells them apart
---    by checking whether the elevator was in transit.
+--  LEFT side (inputs):
+--    Each color carries TWO signals merged onto one wire:
+--      1. Call button at that floor for that elevator shaft
+--      2. Arrival sensor that fires when that elevator reaches
+--         that floor
+--    The computer tells them apart automatically (see below).
 --
---  RIGHT side wiring (outputs):
---    For each (elevator, floor) pair, wire the matching colored
---    wire on the right bundled cable to a Create Redstone Link
---    transmitter. Place its receiver at the elevator mechanism
---    so that when the computer pulses that color the elevator
---    is commanded to move to that floor.
+--  RIGHT side (outputs):
+--    The computer holds each elevator's color HIGH while the
+--    elevator is confirmed at that floor (position indicator).
+--    It briefly pulses the destination color when dispatching
+--    an elevator (Create mechanism responds to the rising edge).
+--
+--  How call vs arrival is disambiguated (shared wire):
+--    When a signal goes HIGH the computer re-reads it after a
+--    short delay. If still HIGH it is a sustained arrival
+--    sensor. If already LOW it was a brief button press.
+--    This assumes call buttons are momentary (brief pulse) and
+--    arrival sensors hold HIGH while elevator is present.
+--
+--  Press R in-game to force a full resync from sensors.
 --
 -- ============================================================
 
 -- ============================================================
 --  CONFIG
 -- ============================================================
-local INPUT_SIDE  = "left"
-local OUTPUT_SIDE = "right"
+local INPUT_SIDE   = "left"
+local OUTPUT_SIDE  = "right"
 
-local PULSE_S     = 0.5    -- dispatch command pulse duration (seconds)
-local POLL_S      = 0.1    -- input scan rate (seconds)
+local POLL_S       = 0.05    -- input scan rate  (50 ms)
+local DISPLAY_S    = 0.5     -- screen refresh rate (500 ms)
+local PULSE_S      = 0.3     -- dispatch command pulse duration
+local CONFIRM_S    = 0.15    -- time to wait before deciding call vs sensor
 
 -- Preferred resting floor per elevator  (1 = Bottom, 2 = Top)
--- { E1, E2, E3 }
-local PREFERRED = { 2, 2, 1 }
+local PREFERRED    = { 2, 2, 1 }
 
-local FLOOR_NAME = { "Bottom", "Top" }
-local ELEV_NAME  = { "E1", "E2", "E3" }
-local NUM_E      = 3
-local NUM_F      = 2
+local FLOOR_NAME   = { "Bottom", "Top" }
+local ELEV_NAME    = { "E1", "E2", "E3" }
+local NUM_E        = 3
+local NUM_F        = 2
 
 -- ============================================================
 --  SIGNAL MAP
 --  SIGNAL[elevator][floor] = color
---  Used for BOTH input (left) and output (right) sides.
+--  Same color used for both input (left) and output (right).
 -- ============================================================
 local SIGNAL = {
-  --          Bottom          Top
-  [1] = { [1] = colors.yellow, [2] = colors.red    },  -- Elevator 1
-  [2] = { [1] = colors.purple, [2] = colors.blue   },  -- Elevator 2
-  [3] = { [1] = colors.white,  [2] = colors.green  },  -- Elevator 3
+  --          Bottom            Top
+  [1] = { [1] = colors.yellow, [2] = colors.red   },  -- Elevator 1
+  [2] = { [1] = colors.purple, [2] = colors.blue  },  -- Elevator 2
+  [3] = { [1] = colors.white,  [2] = colors.green },  -- Elevator 3
 }
+
+-- All colors we care about (for iterating)
+local ALL_COLORS = {}
+for e = 1, NUM_E do
+  for f = 1, NUM_F do
+    table.insert(ALL_COLORS, SIGNAL[e][f])
+  end
+end
 
 -- ============================================================
 --  STATE
 -- ============================================================
-local floor  = {}   -- floor[e]  = current floor of elevator e (1 or 2)
-local busy   = {}   -- busy[e]   = true while elevator e is in transit
-local dest   = {}   -- dest[e]   = destination floor (valid while busy)
+local floor  = {}   -- floor[e]  = last confirmed floor of elevator e
+local busy   = {}   -- busy[e]   = true while dispatched and in transit
+local dest   = {}   -- dest[e]   = target floor (valid while busy)
+
+-- pending_confirm[e][f] = timer id when we are waiting to confirm
+-- whether a rising edge is a call button or arrival sensor
+local pending_confirm = {}
 
 for e = 1, NUM_E do
-  floor[e] = PREFERRED[e]
-  busy[e]  = false
-  dest[e]  = 0
+  floor[e]  = PREFERRED[e]
+  busy[e]   = false
+  dest[e]   = 0
+  pending_confirm[e] = {}
+  for f = 1, NUM_F do
+    pending_confirm[e][f] = nil
+  end
 end
 
-local last_inputs = 0   -- previous bundled input state (rising-edge detection)
+-- Previous bundled input state for edge detection
+local last_inputs = 0
 
 -- ============================================================
 --  LOGGING
 -- ============================================================
-local function ts()
-  return os.epoch("utc") / 1000
-end
+local log_lines = {}
+local MAX_LOG   = 8
 
 local function log(msg)
-  print(("[%.2f] %s"):format(ts(), msg))
+  local line = ("[%.1f] %s"):format(os.epoch("utc") / 1000, msg)
+  table.insert(log_lines, line)
+  if #log_lines > MAX_LOG then table.remove(log_lines, 1) end
 end
 
 -- ============================================================
---  OUTPUTS
+--  OUTPUT MANAGEMENT
 -- ============================================================
 
+--- Rebuild the right-side output to reflect confirmed positions.
+--- Only lights an elevator's indicator when idle and confirmed.
+local function update_outputs()
+  local out = 0
+  for e = 1, NUM_E do
+    if not busy[e] then
+      out = colors.combine(out, SIGNAL[e][floor[e]])
+    end
+  end
+  redstone.setBundledOutput(OUTPUT_SIDE, out)
+end
+
 --- Pulse the dispatch command for elevator e to floor f.
+--- Temporarily adds the destination color, then restores normal output.
 local function pulse_dispatch(e, f)
-  local color   = SIGNAL[e][f]
-  local current = redstone.getBundledOutput(OUTPUT_SIDE)
-  redstone.setBundledOutput(OUTPUT_SIDE, colors.combine(current, color))
+  local out = redstone.getBundledOutput(OUTPUT_SIDE)
+  redstone.setBundledOutput(OUTPUT_SIDE, colors.combine(out, SIGNAL[e][f]))
   sleep(PULSE_S)
-  redstone.setBundledOutput(OUTPUT_SIDE, colors.subtract(
-    redstone.getBundledOutput(OUTPUT_SIDE), color))
+  -- Restore: busy[e] is already true so update_outputs won't include e's color
+  update_outputs()
 end
 
 -- ============================================================
 --  CONSTRAINT HELPERS
 -- ============================================================
-
 local function idle_on_floor(f)
   local n = 0
   for e = 1, NUM_E do
@@ -137,9 +164,8 @@ local function idle_on_floor(f)
 end
 
 local function safe_to_move(e)
-  local src = floor[e]
   for other = 1, NUM_E do
-    if other ~= e and not busy[other] and floor[other] == src then
+    if other ~= e and not busy[other] and floor[other] == floor[e] then
       return true
     end
   end
@@ -153,75 +179,96 @@ local function dispatch(e, f)
   log(ELEV_NAME[e] .. ": " .. FLOOR_NAME[floor[e]] .. " -> " .. FLOOR_NAME[f])
   busy[e] = true
   dest[e] = f
-  pulse_dispatch(e, f)
+  update_outputs()      -- turn off position indicator while moving
+  pulse_dispatch(e, f)  -- send command to Create mechanism
 end
 
 -- ============================================================
---  RISING-EDGE HANDLER
---  Called once per (elevator, floor) pair when their shared
---  wire goes LOW->HIGH.
---  Disambiguates arrival vs call based on elevator state.
+--  ARRIVAL CONFIRMATION
 -- ============================================================
-local function on_rising_edge(e, f)
-  -- Arrival: elevator was heading to exactly this floor
-  if busy[e] and dest[e] == f then
-    floor[e] = f
-    busy[e]  = false
-    dest[e]  = 0
-    log(ELEV_NAME[e] .. " arrived at " .. FLOOR_NAME[f])
+local function confirm_arrival(e, f)
+  floor[e] = f
+  busy[e]  = false
+  dest[e]  = 0
+  log(ELEV_NAME[e] .. " arrived at " .. FLOOR_NAME[f])
+  update_outputs()
+end
+
+-- ============================================================
+--  CALL HANDLING
+-- ============================================================
+local function handle_call(e, f)
+  if not busy[e] and floor[e] == f then
+    log(ELEV_NAME[e] .. " already at " .. FLOOR_NAME[f])
     return
   end
-
-  -- Arrival on unexpected floor (sensor noise / manual move)
-  if busy[e] and dest[e] ~= f then
-    log(ELEV_NAME[e] .. " unexpected sensor at " .. FLOOR_NAME[f] ..
-        " (expected " .. FLOOR_NAME[dest[e]] .. ") — ignoring.")
+  if busy[e] and dest[e] == f then return end  -- already going there
+  if busy[e] then
+    log(ELEV_NAME[e] .. " busy, call ignored")
     return
   end
-
-  -- Call button: elevator is idle
-  log("Call: " .. ELEV_NAME[e] .. " to " .. FLOOR_NAME[f])
-
-  -- Already there
-  if floor[e] == f then
-    log("  -> already at " .. FLOOR_NAME[f] .. ", no action needed.")
-    return
-  end
-
-  -- Would leave source floor empty
   if not safe_to_move(e) then
-    log("  -> cannot move, would leave " .. FLOOR_NAME[floor[e]] .. " empty.")
-    -- Check if the target floor already has an elevator
-    for alt = 1, NUM_E do
-      if alt ~= e and not busy[alt] and floor[alt] == f then
-        log("  -> " .. FLOOR_NAME[f] .. " already has " .. ELEV_NAME[alt] .. ".")
-        return
+    log(ELEV_NAME[e] .. " cannot move, would empty " .. FLOOR_NAME[floor[e]])
+    return
+  end
+  dispatch(e, f)
+end
+
+-- ============================================================
+--  CONFIRM TIMER HANDLER
+--  Called when a confirm timer fires for (e, f).
+--  Re-reads the signal to decide call vs sensor.
+-- ============================================================
+local function on_confirm_timer(e, f)
+  pending_confirm[e][f] = nil
+
+  local inputs = redstone.getBundledInput(INPUT_SIDE)
+  local still_high = colors.test(inputs, SIGNAL[e][f])
+
+  if still_high then
+    -- Signal is sustained → arrival sensor (elevator is physically here)
+    if busy[e] and dest[e] == f then
+      -- Normal dispatch arrival
+      confirm_arrival(e, f)
+    elseif busy[e] and dest[e] ~= f then
+      log(ELEV_NAME[e] .. " unexpected sensor at " .. FLOOR_NAME[f]
+          .. " (expected " .. FLOOR_NAME[dest[e]] .. ")")
+      -- Don't update — wait for correct floor sensor
+    else
+      -- Elevator was idle but sensor says it's at f (manual move)
+      if floor[e] ~= f then
+        log(ELEV_NAME[e] .. " manual move detected -> " .. FLOOR_NAME[f])
+        floor[e] = f
+        update_outputs()
       end
     end
-    return
+  else
+    -- Signal went LOW quickly → call button press
+    log("Call btn: " .. ELEV_NAME[e] .. " -> " .. FLOOR_NAME[f])
+    handle_call(e, f)
   end
-
-  dispatch(e, f)
 end
 
 -- ============================================================
 --  INPUT POLLING
 -- ============================================================
-local ALL_COLORS = {
-  colors.red, colors.blue, colors.green,
-  colors.yellow, colors.purple, colors.white,
-}
-
 local function poll_inputs()
   local inputs = redstone.getBundledInput(INPUT_SIDE)
 
   for e = 1, NUM_E do
     for f = 1, NUM_F do
-      local color = SIGNAL[e][f]
+      local color  = SIGNAL[e][f]
       local is_on  = colors.test(inputs, color)
       local was_on = colors.test(last_inputs, color)
+
+      -- Rising edge: start confirm timer
       if is_on and not was_on then
-        on_rising_edge(e, f)
+        if pending_confirm[e][f] then
+          -- Cancel old confirm if somehow double-triggered
+          -- (os.cancelTimer not strictly needed but tidy)
+          pending_confirm[e][f] = nil
+        end
+        pending_confirm[e][f] = os.startTimer(CONFIRM_S)
       end
     end
   end
@@ -230,12 +277,12 @@ local function poll_inputs()
 end
 
 -- ============================================================
---  STATUS DISPLAY
+--  DISPLAY
 -- ============================================================
 local function draw_status()
   term.clear()
   term.setCursorPos(1, 1)
-  print("====== Elevator Controller ======")
+  print("===== Elevator Controller =====")
   print("")
   for e = 1, NUM_E do
     local state
@@ -244,15 +291,39 @@ local function draw_status()
     else
       state = "idle    at  " .. FLOOR_NAME[floor[e]]
     end
-    print(("  %s :  %s"):format(ELEV_NAME[e], state))
+    print(("  %s : %s"):format(ELEV_NAME[e], state))
   end
   print("")
-  print(("  Bottom :  %d idle elevator(s)"):format(idle_on_floor(1)))
-  print(("  Top    :  %d idle elevator(s)"):format(idle_on_floor(2)))
+  print(("  Bottom : %d idle   Top : %d idle"):format(
+    idle_on_floor(1), idle_on_floor(2)))
   print("")
-  print("  Signal map:")
-  print("  Red=E1T  Blue=E2T  Green=E3T")
-  print("  Yel=E1B  Purp=E2B  Wht=E3B")
+  print("  [R] = resync from sensors")
+  print("  --- Log ---")
+  for _, ln in ipairs(log_lines) do
+    print("  " .. ln)
+  end
+end
+
+-- ============================================================
+--  RESYNC  (press R to re-read all sensors)
+-- ============================================================
+local function resync()
+  log("Resyncing from sensors...")
+  local inputs = redstone.getBundledInput(INPUT_SIDE)
+  for e = 1, NUM_E do
+    for f = 1, NUM_F do
+      if colors.test(inputs, SIGNAL[e][f]) then
+        floor[e] = f
+        if busy[e] and dest[e] == f then
+          busy[e] = false
+          dest[e] = 0
+        end
+        log(ELEV_NAME[e] .. " at " .. FLOOR_NAME[f])
+      end
+    end
+  end
+  last_inputs = inputs
+  update_outputs()
 end
 
 -- ============================================================
@@ -260,27 +331,35 @@ end
 -- ============================================================
 local function startup()
   redstone.setBundledOutput(OUTPUT_SIDE, 0)
-  log("Reading arrival sensors for initial positions...")
-  local inputs = redstone.getBundledInput(INPUT_SIDE)
+  log("Reading sensors...")
+
+  local inputs   = redstone.getBundledInput(INPUT_SIDE)
+  local detected = {}
 
   for e = 1, NUM_E do
-    local detected = false
+    detected[e] = false
     for f = 1, NUM_F do
       if colors.test(inputs, SIGNAL[e][f]) then
-        floor[e]  = f
-        busy[e]   = false
-        detected  = true
-        log(ELEV_NAME[e] .. " detected at " .. FLOOR_NAME[f])
+        floor[e]    = f
+        busy[e]     = false
+        detected[e] = true
+        log(ELEV_NAME[e] .. " at " .. FLOOR_NAME[f])
       end
     end
-
-    if not detected then
-      log(ELEV_NAME[e] .. " not detected — dispatching to "
-          .. FLOOR_NAME[PREFERRED[e]])
+    if not detected[e] then
+      log(ELEV_NAME[e] .. " not found, dispatching to " .. FLOOR_NAME[PREFERRED[e]])
       floor[e] = PREFERRED[e]
       busy[e]  = true
       dest[e]  = PREFERRED[e]
-      pulse_dispatch(e, PREFERRED[e])
+    end
+  end
+
+  update_outputs()
+
+  -- Dispatch any elevators that weren't detected
+  for e = 1, NUM_E do
+    if busy[e] then
+      pulse_dispatch(e, dest[e])
     end
   end
 
@@ -293,13 +372,37 @@ end
 -- ============================================================
 startup()
 
-local poll_timer = os.startTimer(POLL_S)
+local poll_timer    = os.startTimer(POLL_S)
+local display_timer = os.startTimer(DISPLAY_S)
 
 while true do
-  local ev, param = os.pullEvent("timer")
-  if param == poll_timer then
-    poll_inputs()
-    draw_status()
-    poll_timer = os.startTimer(POLL_S)
+  -- Pull ALL events so the queue never overflows
+  local ev, a, b = os.pullEvent()
+
+  if ev == "timer" then
+    if a == poll_timer then
+      poll_inputs()
+      poll_timer = os.startTimer(POLL_S)
+
+    elseif a == display_timer then
+      draw_status()
+      display_timer = os.startTimer(DISPLAY_S)
+
+    else
+      -- Check if it matches any pending confirm timer
+      for e = 1, NUM_E do
+        for f = 1, NUM_F do
+          if pending_confirm[e][f] == a then
+            on_confirm_timer(e, f)
+          end
+        end
+      end
+    end
+
+  elseif ev == "char" then
+    if a == "r" or a == "R" then
+      resync()
+      draw_status()
+    end
   end
 end

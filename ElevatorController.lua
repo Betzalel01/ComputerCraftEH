@@ -59,8 +59,8 @@
 -- ============================================================
 
 -- Sides of the computer the bundled cables are connected to
-local INPUT_SIDE  = "back"    -- bundled cable with call button signals
-local OUTPUT_SIDE = "front"   -- bundled cable with indicator/command signals
+local INPUT_SIDE  = "left"    -- bundled cable with call button signals
+local OUTPUT_SIDE = "right"   -- bundled cable with indicator/command signals
 
 -- How long (seconds) an elevator takes to travel between floors
 -- Tune this to match your actual Create elevator travel time
@@ -281,8 +281,8 @@ local function draw_status()
   print(("  Bottom floor : %d elevator(s)"):format(idle_on_floor(1)))
   print(("  Top floor    : %d elevator(s)"):format(idle_on_floor(2)))
   print("")
-  print("  Input  : " .. INPUT_SIDE  .. " side (bundled)")
-  print("  Output : " .. OUTPUT_SIDE .. " side (bundled)")
+  print("  Input  : left  side (bundled call buttons)")
+  print("  Output : right side (bundled indicators/commands)")
   print("")
   print("  Signal map:")
   print("    White      = A-Bottom    LightBlue = A-Top")

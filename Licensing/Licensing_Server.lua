@@ -4,25 +4,37 @@
 --        tablet approval and turtle execution.
 --
 --  Flow:
---    KEYCARD  -> prompt player -> notify tablet -> wait for
---               approval -> command turtle -> confirm to player
+--    KEYCARD  -> prompt player -> notify tablet + owner DM ->
+--               wait for approval -> command turtle -> confirm
 --    RETURN   -> prompt player -> wait for DONE -> command
 --               turtle -> confirm to player
+--
+--  Changes:
+--    * Only speaks to players currently inside the zone
+--    * Owner is DM'd when a keycard approval is waiting
+--    * Tablet reconnecting mid-flow immediately receives any
+--      pending approval_request it missed
 -- ============================================================
 
 -- ============================================================
 --  CONFIG  (edit these to match your setup)
 -- ============================================================
-local PROTOCOL          = "licensing_v1"
+local PROTOCOL        = "licensing_v1"
+
+-- The in-game username of the admin who approves requests.
+-- They will receive a DM whenever a keycard approval is queued.
+local OWNER_NAME      = "Shade_Angel"
 
 -- Two opposite corners of the detection zone (inclusive)
-local ZONE_A            = { x = -1752, y = 78, z = 1115 }
-local ZONE_B            = { x = -1753, y = 79, z = 1118 }
+local ZONE_A          = { x = -1752, y = 78, z = 1115 }
+local ZONE_B          = { x = -1753, y = 79, z = 1118 }
 
-local POLL_INTERVAL_S   = 0.25   -- how often to scan the zone
-local GREET_COOLDOWN_S  = 10     -- min seconds between greets per player
-local CHAT_TIMEOUT_S    = 30     -- how long to wait for player to type
-local TURTLE_TIMEOUT_S  = 90     -- how long to wait for turtle to finish
+local POLL_INTERVAL_S = 0.25   -- zone scan frequency
+local ZONE_CHECK_S    = 1.0    -- how often to re-check zone during waits
+local GREET_COOLDOWN_S= 10     -- min seconds between greets per player
+local CHAT_TIMEOUT_S  = 30     -- how long to wait for a player to type
+local TABLET_TIMEOUT_S= 120    -- how long to wait for tablet decision (longer to allow reconnect)
+local TURTLE_TIMEOUT_S= 90     -- how long to wait for turtle completion
 
 -- ============================================================
 --  PERIPHERALS
@@ -59,14 +71,48 @@ local function log(tag, msg)
 end
 
 -- ============================================================
+--  ZONE HELPERS
+-- ============================================================
+
+--- Returns true if `player` is currently inside the detection zone.
+local function is_player_in_zone(player)
+  local list = detector.getPlayersInCoords(ZONE_A, ZONE_B)
+  if not list then return false end
+  for _, name in ipairs(list) do
+    if name == player then return true end
+  end
+  return false
+end
+
+--- Returns the first player found in the zone, or nil.
+local function first_player_in_zone()
+  local list = detector.getPlayersInCoords(ZONE_A, ZONE_B)
+  if list and #list > 0 then return list[1] end
+  return nil
+end
+
+-- ============================================================
 --  MESSAGING
 -- ============================================================
+
+--- Send a DM to `player`. No zone check — used for status
+--- updates that should always reach the recipient.
 local function dm(player, msg)
-  -- sendMessageToPlayer(message, player)
   local ok, err = pcall(chatbox.sendMessageToPlayer, msg, player)
   if not ok then
-    log("DM_ERR", "Failed to DM " .. player .. ": " .. tostring(err))
+    log("DM_ERR", "Failed to DM " .. tostring(player) .. ": " .. tostring(err))
   end
+end
+
+--- Send a DM only if the player is still in the zone.
+--- Returns true if the message was sent, false if they left.
+local function dm_if_present(player, msg)
+  if not is_player_in_zone(player) then
+    log("ZONE", player .. " has left the zone; skipping DM.")
+    return false
+  end
+  dm(player, msg)
+  return true
 end
 
 -- ============================================================
@@ -81,52 +127,10 @@ local function net_send(to, tbl)
   rednet.send(to, tbl, PROTOCOL)
 end
 
-local function bind(sender, kind)
-  if kind == "hello_tablet" then
-    if tablet_id ~= sender then
-      tablet_id = sender
-      log("BIND", "Tablet bound: ID " .. sender)
-    end
-    net_send(sender, { kind = "hello_server", server_id = SERVER_ID })
-
-  elseif kind == "hello_turtle" then
-    if turtle_id ~= sender then
-      turtle_id = sender
-      log("BIND", "Turtle bound: ID " .. sender)
-    end
-    net_send(sender, { kind = "hello_server", server_id = SERVER_ID })
-  end
-end
-
--- ============================================================
---  REQUEST STATE MACHINE
--- ============================================================
--- Phases:
---   "awaiting_tablet"  - keycard sent to tablet, waiting for admin decision
---   "awaiting_turtle"  - turtle command sent, waiting for completion
---
--- We only hold one request at a time. A new player approaching
--- while busy gets a "please wait" message.
-
-local request     = nil   -- active request table or nil
-local greet_times = {}    -- last_greet[player] = epoch_s
-
-local function new_id(player)
-  return player .. "-" .. os.epoch("utc")
-end
-
-local function clear_request()
-  request = nil
-end
-
--- ============================================================
---  TABLET COMMUNICATION
--- ============================================================
-local function send_to_tablet(req)
-  if not tablet_id then
-    log("WARN", "No tablet bound, cannot send approval request")
-    return false, "no_tablet"
-  end
+--- Build and send an approval_request packet to the tablet.
+--- Used both on initial send and on tablet reconnect replay.
+local function send_approval_request(req)
+  if not tablet_id then return false, "no_tablet" end
   net_send(tablet_id, {
     kind         = "approval_request",
     id           = req.id,
@@ -147,58 +151,105 @@ local function ack_tablet(id, ok, err)
   })
 end
 
--- ============================================================
---  TURTLE COMMUNICATION
--- ============================================================
 local function send_to_turtle(tbl)
-  if not turtle_id then
-    log("WARN", "No turtle bound, cannot send command")
-    return false, "no_turtle"
-  end
+  if not turtle_id then return false, "no_turtle" end
   net_send(turtle_id, tbl)
   return true
 end
 
 -- ============================================================
---  EVENT PUMP
---  Called anywhere we are blocking on os.pullEvent so that
---  binds and status updates are never dropped.
+--  REQUEST STATE
 -- ============================================================
-local function pump(sender, msg, proto)
-  if proto ~= PROTOCOL or type(msg) ~= "table" then return end
+-- Phases:
+--   "awaiting_tablet"  — sent to tablet, waiting for decision
+--   "awaiting_turtle"  — turtle command sent, waiting for done
+local request     = nil
+local greet_times = {}
 
-  if msg.kind == "hello_tablet" then
-    bind(sender, "hello_tablet")
+local function clear_request()
+  request = nil
+end
 
-  elseif msg.kind == "hello_turtle" then
-    bind(sender, "hello_turtle")
+local function new_id(player)
+  return player .. "-" .. os.epoch("utc")
+end
 
-  elseif msg.kind == "approval_response" then
-    -- handled inside wait_for_tablet_decision; ignore here
-    -- (shouldn't arrive outside that context, but safe to silently drop)
+-- ============================================================
+--  BIND  (called whenever hello_tablet / hello_turtle arrives)
+--  If a tablet reconnects while we are waiting for its decision,
+--  immediately replay the pending approval_request so the admin
+--  sees it without needing to restart anything.
+-- ============================================================
+local function bind(sender, kind)
+  if kind == "hello_tablet" then
+    local is_new = (tablet_id ~= sender)
+    tablet_id = sender
+    if is_new then
+      log("BIND", "Tablet bound: ID " .. sender)
+    else
+      log("BIND", "Tablet re-bound: ID " .. sender)
+    end
+    -- always ACK the tablet so it knows the server is alive
+    net_send(sender, { kind = "hello_server", server_id = SERVER_ID })
 
-  elseif msg.kind == "turtle_status" then
-    -- handled inside wait_for_turtle; ignore here
+    -- replay pending approval_request if the tablet missed it
+    if request and request.phase == "awaiting_tablet" then
+      log("REPLAY", "Replaying pending approval_request to tablet for " .. request.player)
+      send_approval_request(request)
+    end
+
+  elseif kind == "hello_turtle" then
+    local is_new = (turtle_id ~= sender)
+    turtle_id = sender
+    if is_new then
+      log("BIND", "Turtle bound: ID " .. sender)
+    else
+      log("BIND", "Turtle re-bound: ID " .. sender)
+    end
+    net_send(sender, { kind = "hello_server", server_id = SERVER_ID })
   end
 end
 
 -- ============================================================
+--  EVENT PUMP  (keeps binds live inside blocking wait loops)
+-- ============================================================
+local function pump(sender, msg, proto)
+  if proto ~= PROTOCOL or type(msg) ~= "table" then return end
+  if msg.kind == "hello_tablet" then bind(sender, "hello_tablet")
+  elseif msg.kind == "hello_turtle" then bind(sender, "hello_turtle")
+  end
+  -- approval_response and turtle_status are handled by their
+  -- respective wait functions; silently ignored here.
+end
+
+-- ============================================================
 --  BLOCKING WAIT HELPERS
---  These run their own inner event loops so the server stays
---  responsive to binds while blocked.
 -- ============================================================
 
---- Wait for the player to type a valid request.
---- Returns { kind = "keycard"|"return" } or nil on timeout.
+--- Wait for the player to type a valid request keyword.
+--- Cancels early if the player leaves the zone.
+--- Returns { kind } or nil on timeout/departure.
 local function wait_for_player_request(player)
-  local deadline = os.startTimer(CHAT_TIMEOUT_S)
+  local chat_deadline = os.startTimer(CHAT_TIMEOUT_S)
+  local zone_check    = os.startTimer(ZONE_CHECK_S)
 
   while true do
     local ev, a, b, c = os.pullEvent()
 
-    if ev == "timer" and a == deadline then
-      dm(player, "No response received. Step up again when ready.")
-      return nil
+    if ev == "timer" then
+      if a == chat_deadline then
+        if is_player_in_zone(player) then
+          dm(player, "No response received. Step up again when ready.")
+        end
+        return nil
+
+      elseif a == zone_check then
+        if not is_player_in_zone(player) then
+          log("ZONE", player .. " left the zone during request prompt.")
+          return nil
+        end
+        zone_check = os.startTimer(ZONE_CHECK_S)
+      end
 
     elseif ev == "chat" then
       local who, text = a, b
@@ -209,10 +260,13 @@ local function wait_for_player_request(player)
         elseif t == "return" or t == "return keycard" or t == "keycard return" then
           return { kind = "return" }
         else
-          dm(player, "Unrecognized. Please type: keycard  OR  return")
-          -- reset timer so they get a fresh window
-          os.cancelTimer(deadline)
-          deadline = os.startTimer(CHAT_TIMEOUT_S)
+          if dm_if_present(player, "Unrecognized. Please type:  keycard  OR  return") then
+            -- reset chat deadline since they are still there and trying
+            os.cancelTimer(chat_deadline)
+            chat_deadline = os.startTimer(CHAT_TIMEOUT_S)
+          else
+            return nil  -- left zone
+          end
         end
       end
 
@@ -223,17 +277,31 @@ local function wait_for_player_request(player)
 end
 
 --- Wait for the player to type DONE after placing card in return slot.
---- Returns true on DONE, false on timeout.
+--- Cancels early if the player leaves the zone.
+--- Returns true on DONE, false on timeout/departure.
 local function wait_for_done(player)
-  dm(player, "Place your keycard in the return slot, then type: done")
-  local deadline = os.startTimer(CHAT_TIMEOUT_S)
+  dm_if_present(player, "Place your keycard in the return slot, then type:  done")
+
+  local chat_deadline = os.startTimer(CHAT_TIMEOUT_S)
+  local zone_check    = os.startTimer(ZONE_CHECK_S)
 
   while true do
     local ev, a, b, c = os.pullEvent()
 
-    if ev == "timer" and a == deadline then
-      dm(player, "Timed out. Step up again to retry.")
-      return false
+    if ev == "timer" then
+      if a == chat_deadline then
+        if is_player_in_zone(player) then
+          dm(player, "Timed out waiting for DONE. Step up again to retry.")
+        end
+        return false
+
+      elseif a == zone_check then
+        if not is_player_in_zone(player) then
+          log("ZONE", player .. " left the zone during return flow.")
+          return false
+        end
+        zone_check = os.startTimer(ZONE_CHECK_S)
+      end
 
     elseif ev == "chat" then
       local who, text = a, b
@@ -241,7 +309,7 @@ local function wait_for_done(player)
         if text:lower():match("^%s*done%s*$") then
           return true
         else
-          dm(player, "Type done when the card is in the slot.")
+          dm_if_present(player, "Type  done  once the card is in the slot.")
         end
       end
 
@@ -252,9 +320,11 @@ local function wait_for_done(player)
 end
 
 --- Wait for the tablet admin to approve or deny.
+--- If the tablet reconnects during this wait, bind() will
+--- automatically replay the approval_request.
 --- Returns approved (bool), level (number or nil).
 local function wait_for_tablet_decision(req)
-  local deadline = os.startTimer(CHAT_TIMEOUT_S * 2)
+  local deadline = os.startTimer(TABLET_TIMEOUT_S)
 
   while true do
     local ev, a, b, c = os.pullEvent()
@@ -268,15 +338,19 @@ local function wait_for_tablet_decision(req)
     elseif ev == "rednet_message" then
       local sender, msg, proto = a, b, c
       if proto == PROTOCOL and type(msg) == "table" then
+
+        -- binds (including tablet reconnect + replay) are handled inside bind()
         if msg.kind == "hello_tablet" or msg.kind == "hello_turtle" then
           bind(sender, msg.kind)
 
         elseif msg.kind == "approval_response" and sender == tablet_id then
           if msg.id ~= req.id then
             ack_tablet(msg.id, false, "id_mismatch")
+
           elseif not msg.approved then
             ack_tablet(msg.id, true)
             return false, nil
+
           else
             local lvl = tonumber(msg.level)
             if not lvl or lvl < 1 or lvl > 5 then
@@ -292,7 +366,7 @@ local function wait_for_tablet_decision(req)
   end
 end
 
---- Wait for turtle to report completion.
+--- Wait for the turtle to report completion.
 --- Returns ok (bool).
 local function wait_for_turtle(req)
   local deadline = os.startTimer(TURTLE_TIMEOUT_S)
@@ -309,6 +383,7 @@ local function wait_for_turtle(req)
     elseif ev == "rednet_message" then
       local sender, msg, proto = a, b, c
       if proto == PROTOCOL and type(msg) == "table" then
+
         if msg.kind == "hello_tablet" or msg.kind == "hello_turtle" then
           bind(sender, msg.kind)
 
@@ -322,7 +397,7 @@ local function wait_for_turtle(req)
                 dm(req.player, "Return complete. Thank you!")
               end
             else
-              dm(req.player, "Something went wrong: " .. tostring(msg.err or "unknown error"))
+              dm(req.player, "Something went wrong: " .. tostring(msg.err or "unknown"))
             end
             clear_request()
             return ok
@@ -334,7 +409,7 @@ local function wait_for_turtle(req)
 end
 
 -- ============================================================
---  PLAYER INTERACTION  (top-level handler per player visit)
+--  PLAYER INTERACTION
 -- ============================================================
 local function handle_player(player)
   if request then
@@ -342,17 +417,26 @@ local function handle_player(player)
     return
   end
 
-  dm(player, "Welcome to the Licensing Desk! Type:  keycard  or  return")
-  local choice = wait_for_player_request(player)
-  if not choice then return end  -- timed out
+  if not dm_if_present(player, "Welcome to the Licensing Desk! Type:  keycard  or  return") then
+    return  -- left zone before we could greet them
+  end
 
-  -- create request record
+  local choice = wait_for_player_request(player)
+  if not choice then return end  -- timed out or left zone
+
+  -- verify still present before committing to a request
+  if not is_player_in_zone(player) then
+    log("ZONE", player .. " left before request was created.")
+    return
+  end
+
   request = {
     id     = new_id(player),
     player = player,
     text   = choice.kind,
     kind   = choice.kind,
     ts     = ts(),
+    phase  = "init",
   }
 
   -- ---- RETURN FLOW ----
@@ -376,21 +460,27 @@ local function handle_player(player)
     end
 
     request.phase = "awaiting_turtle"
+    request.ts    = ts()
     dm(player, "Processing your return, please wait...")
     wait_for_turtle(request)
     return
   end
 
   -- ---- KEYCARD FLOW ----
-  dm(player, "Request received. Awaiting admin approval...")
   request.phase = "awaiting_tablet"
 
-  local sent, err = send_to_tablet(request)
+  -- DM the owner so they know to check the tablet
+  dm(OWNER_NAME, "Licensing: " .. player .. " is requesting a keycard. Check your tablet.")
+
+  -- notify tablet (or best-effort if not yet connected)
+  local sent, err = send_approval_request(request)
   if not sent then
-    dm(player, "Error: approval tablet is offline. Please contact staff.")
-    log("ERR", "Tablet send failed: " .. tostring(err))
-    clear_request()
-    return
+    log("WARN", "Tablet not connected, request queued. Will replay on reconnect. (" .. tostring(err) .. ")")
+    dm(player, "Request received. Awaiting admin approval — this may take a moment.")
+    -- We still fall through to wait_for_tablet_decision; when the tablet
+    -- connects and sends hello_tablet, bind() will replay the request.
+  else
+    dm_if_present(player, "Request received. Awaiting admin approval...")
   end
 
   local approved, level = wait_for_tablet_decision(request)
@@ -414,7 +504,8 @@ local function handle_player(player)
   end
 
   request.phase = "awaiting_turtle"
-  dm(player, "Approved for level " .. level .. ". Issuing your keycard, please wait...")
+  request.ts    = ts()
+  dm_if_present(player, "Approved for level " .. level .. ". Issuing your keycard, please wait...")
   wait_for_turtle(request)
 end
 
@@ -425,44 +516,28 @@ log("BOOT", "Server online. ID=" .. SERVER_ID)
 log("BOOT", "Waiting for tablet and turtle to connect...")
 
 while true do
-  -- zone poll timer
   local t = os.startTimer(POLL_INTERVAL_S)
 
   while true do
     local ev, a, b, c = os.pullEvent()
-
-    if ev == "timer" and a == t then
-      break  -- time to do a zone scan
-
-    elseif ev == "rednet_message" then
-      local sender, msg, proto = a, b, c
-      if proto == PROTOCOL and type(msg) == "table" then
-        if msg.kind == "hello_tablet" then bind(sender, "hello_tablet")
-        elseif msg.kind == "hello_turtle" then bind(sender, "hello_turtle")
-        end
-        -- turtle_status and approval_response arriving outside their
-        -- wait contexts are stale; silently ignore them.
-      end
-    end
+    if ev == "timer" and a == t then break end
+    if ev == "rednet_message" then pump(a, b, c) end
   end
 
-  -- stale request soft-timeout (safety net in case a wait was bypassed)
+  -- safety-net timeout for stale turtle jobs
   if request and request.phase == "awaiting_turtle" then
     if ts() - request.ts > TURTLE_TIMEOUT_S then
       log("WARN", "Stale turtle request cleared for " .. request.player)
       dm(request.player, "Your request timed out. Please contact staff.")
       clear_request()
     end
-    -- don't greet anyone new while turtle is working
-    goto continue
+    goto continue  -- don't greet new players while turtle is working
   end
 
-  -- zone detection
-  local players_in_zone = detector.getPlayersInCoords(ZONE_A, ZONE_B)
-  if players_in_zone and #players_in_zone > 0 then
-    local player = players_in_zone[1]
-    local last   = greet_times[player] or 0
-
+  -- zone scan + greet
+  local player = first_player_in_zone()
+  if player then
+    local last  = greet_times[player] or 0
     if ts() - last >= GREET_COOLDOWN_S then
       greet_times[player] = ts()
       handle_player(player)

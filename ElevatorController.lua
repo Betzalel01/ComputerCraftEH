@@ -22,9 +22,10 @@
 local INPUT_SIDE  = "left"
 local OUTPUT_SIDE = "right"
 
-local POLL_S    = 0.1    -- sensor read rate (seconds)
-local DISPLAY_S = 0.5    -- screen refresh rate (seconds)
-local PULSE_S   = 0.5    -- command pulse duration (seconds)
+local POLL_S      = 0.1    -- sensor read rate (seconds)
+local DISPLAY_S   = 0.5    -- screen refresh rate (seconds)
+local PULSE_S     = 0.5    -- command pulse duration (seconds)
+local PREF_DELAY  = 4.0    -- seconds to wait after arrival before preference rebalance
 
 local BOTTOM = 1
 local TOP    = 2
@@ -41,13 +42,21 @@ local SIGNAL = {
 
 -- ============================================================
 --  STATE
---  pos[e]     : last confirmed floor (BOTTOM/TOP) or 0 if in
---               transit. Updated directly from sensors each poll.
---  sent_to[e] : floor we last sent a command to (0 = none).
---               Cleared when destination sensor confirms arrival.
+--  pos[e]        : last confirmed floor (BOTTOM/TOP) or 0 if
+--                  in transit. Updated from sensors each poll.
+--  sent_to[e]    : floor we last sent a command to (0 = none).
+--                  Cleared when destination sensor confirms arrival.
+--  last_moved_down : index of elevator most recently commanded
+--                  toward BOTTOM; excluded from immediate return
+--                  to TOP to prevent ping-pong. Reset to 0 once
+--                  another elevator is sent up in its place.
+--  pref_timer    : os timer ID for the preference-rebalance delay,
+--                  or nil if no timer is pending.
 -- ============================================================
-local pos     = { 0, 0, 0 }
-local sent_to = { 0, 0, 0 }
+local pos              = { 0, 0, 0 }
+local sent_to          = { 0, 0, 0 }
+local last_moved_down  = 0
+local pref_timer       = nil
 
 -- ============================================================
 --  LOGGING  (fixed-size buffer)
@@ -62,10 +71,13 @@ end
 --  READ SENSORS
 --  Reads current bundled input and derives each elevator's
 --  position. Returns true if any position changed.
+--  On confirmed arrival, schedules the preference-rebalance
+--  timer (does not affect emergency logic).
 -- ============================================================
 local function update_positions()
   local inputs  = redstone.getBundledInput(INPUT_SIDE)
   local changed = false
+  local arrival = false
 
   for e = 1, NUM_E do
     local at_bot = colors.test(inputs, SIGNAL[e][BOTTOM])
@@ -73,25 +85,32 @@ local function update_positions()
 
     local new_pos
     if at_bot and at_top then
-      -- Both HIGH: sensor error, keep previous value
-      new_pos = pos[e]
+      new_pos = pos[e]   -- sensor error, keep previous
     elseif at_bot then
       new_pos = BOTTOM
     elseif at_top then
       new_pos = TOP
     else
-      new_pos = 0  -- in transit
+      new_pos = 0        -- in transit
     end
 
     if new_pos ~= pos[e] then
       changed = true
       if new_pos > 0 then
+        -- Elevator confirmed at a floor
         if sent_to[e] == new_pos then
           log(ELEV_NAME[e] .. " arrived " .. FLOOR_NAME[new_pos])
-          sent_to[e] = 0
         else
           log(ELEV_NAME[e] .. " now at " .. FLOOR_NAME[new_pos])
-          sent_to[e] = 0
+        end
+        sent_to[e] = 0
+        arrival = true
+
+        -- If the elevator that was last sent down has now returned
+        -- to Top on its own (shouldn't happen but guard it), clear
+        -- the ping-pong lock.
+        if e == last_moved_down and new_pos == TOP then
+          last_moved_down = 0
         end
       else
         if pos[e] > 0 then
@@ -100,6 +119,12 @@ local function update_positions()
       end
       pos[e] = new_pos
     end
+  end
+
+  -- Schedule a delayed preference rebalance on any arrival,
+  -- cancelling any existing pending timer so we restart the window.
+  if arrival then
+    pref_timer = os.startTimer(PREF_DELAY)
   end
 
   return changed
@@ -147,17 +172,23 @@ end
 
 -- ============================================================
 --  REBALANCE
---  Called after any sensor change. Dispatches at most one
---  elevator per call — triggered again on the next change.
+--  emergency_only = true  : only enforce hard minimums (instant)
+--  emergency_only = false : also try preferred distribution
+--
+--  Anti-ping-pong rule: when filling the preferred 2@Top,
+--  skip the elevator indexed by last_moved_down so it is not
+--  immediately sent back up after having just come down.
+--  The lock clears once a different elevator is dispatched upward.
 -- ============================================================
-local function rebalance()
-  -- Priority 1: enforce minimum 1 per floor
+local function rebalance(emergency_only)
+  -- Priority 1: enforce minimum 1 per floor (no delay, no exclusion)
   for f = 1, 2 do
     if effective(f) == 0 then
       local other = (f == BOTTOM) and TOP or BOTTOM
       for e = 1, NUM_E do
         if pos[e] == other and sent_to[e] == 0 and effective(other) > 1 then
           log("EMERG: " .. FLOOR_NAME[f] .. " empty, sending " .. ELEV_NAME[e])
+          if f == BOTTOM then last_moved_down = e end
           dispatch(e, f)
           return
         end
@@ -165,26 +196,35 @@ local function rebalance()
     end
   end
 
+  if emergency_only then return end
+
   -- Priority 2: preferred state (2 Top, 1 Bottom)
-  -- Only act when all elevators are fully settled
+  -- Only act when all elevators are fully settled.
   for e = 1, NUM_E do
     if pos[e] == 0 or sent_to[e] ~= 0 then return end
   end
 
+  -- Need more at Top: send one up from Bottom, skipping last_moved_down
   if effective(TOP) < 2 and effective(BOTTOM) > 1 then
     for e = 1, NUM_E do
-      if pos[e] == BOTTOM and sent_to[e] == 0 then
+      if pos[e] == BOTTOM and sent_to[e] == 0 and e ~= last_moved_down then
         log("PREF: " .. ELEV_NAME[e] .. " Bottom -> Top")
+        last_moved_down = 0   -- lock no longer needed once someone else goes up
         dispatch(e, TOP)
         return
       end
     end
+    -- If every bottom elevator is the locked one, log and wait
+    log("PREF: skipping ping-pong, waiting for another elevator")
+    return
   end
 
+  -- Need more at Bottom
   if effective(BOTTOM) < 1 and effective(TOP) > 1 then
     for e = 1, NUM_E do
       if pos[e] == TOP and sent_to[e] == 0 then
         log("PREF: " .. ELEV_NAME[e] .. " Top -> Bottom")
+        last_moved_down = e
         dispatch(e, BOTTOM)
         return
       end
@@ -209,8 +249,9 @@ local function draw()
     else
       state = "in transit"
     end
+    local lock = (e == last_moved_down) and " [locked]" or ""
     term.setCursorPos(1, 2 + e)
-    term.write(("  %s :  %s"):format(ELEV_NAME[e], state))
+    term.write(("  %s :  %s%s"):format(ELEV_NAME[e], state, lock))
   end
 
   term.setCursorPos(1, 7)
@@ -241,7 +282,9 @@ for e = 1, NUM_E do
   end
 end
 
-rebalance()
+-- Immediate full rebalance on startup (no arrival delay needed at boot)
+log("Boot: running startup rebalance")
+rebalance(false)
 draw()
 
 -- ============================================================
@@ -255,18 +298,26 @@ while true do
 
   if ev == "redstone" then
     local changed = update_positions()
-    if changed then rebalance() end
+    -- Emergency check fires immediately on any redstone change
+    if changed then rebalance(true) end
     draw()
 
   elseif ev == "timer" then
     if a == poll_timer then
       local changed = update_positions()
-      if changed then rebalance() end
+      if changed then rebalance(true) end
       poll_timer = os.startTimer(POLL_S)
 
     elseif a == display_timer then
       draw()
       display_timer = os.startTimer(DISPLAY_S)
+
+    elseif a == pref_timer then
+      -- Delayed preference rebalance fires here
+      pref_timer = nil
+      log("Pref rebalance triggered")
+      rebalance(false)
+      draw()
     end
   end
 end

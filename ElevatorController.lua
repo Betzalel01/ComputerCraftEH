@@ -1,6 +1,6 @@
 -- ============================================================
 --  ElevatorController.lua
---  Version: v1.1.0
+--  Version: v1.2.0
 --
 --  LEFT  side (input)  : position sensors via bundled cable
 --    Signal HIGH = elevator IS at that floor (steady)
@@ -21,19 +21,23 @@
 -- ============================================================
 --
 --  CHANGELOG
---  v1.1.0 - Fixed ping-pong: exclusion now based on arrival
---           timestamp at Bottom, not who the code dispatched,
---           so manually-moved elevators are also protected.
---           Fixed re-entrancy race: pulse() no longer sleeps
---           inside rebalance(); commands are queued and drained
---           by the main loop, preventing mid-decision redstone
---           events from triggering a second rebalance while a
---           pulse is in progress.
---  v1.0.0 - Initial release. Anti-ping-pong via last_moved_down,
---           preference delay, startup rebalance.
+--  v1.2.0 - Reverted pulse() back to direct blocking sleep as
+--           in v1.0.0; CC:Tweaked coroutines cannot use sleep()
+--           reliably (sleep steals the timer event from the main
+--           loop, leaving pulsing=true forever and corrupting the
+--           output side). Re-entrancy race fixed instead with a
+--           simple rebalancing mutex: if a pulse is already in
+--           progress, incoming redstone/timer events are recorded
+--           as a pending dirty flag and rebalance runs once after
+--           the pulse completes rather than mid-pulse.
+--           Ping-pong fix (timestamp window) retained from v1.1.0.
+--  v1.1.0 - Fixed ping-pong via bottom_arrived timestamp window.
+--           Fixed re-entrancy via pulse coroutine (reverted in
+--           v1.2.0 due to CC:Tweaked sleep/event incompatibility).
+--  v1.0.0 - Initial release.
 -- ============================================================
 
-local VERSION    = "v1.1.0"
+local VERSION     = "v1.2.0"
 
 local INPUT_SIDE  = "left"
 local OUTPUT_SIDE = "right"
@@ -42,7 +46,7 @@ local POLL_S      = 0.1    -- sensor read rate (seconds)
 local DISPLAY_S   = 0.5    -- screen refresh rate (seconds)
 local PULSE_S     = 0.5    -- command pulse duration (seconds)
 local PREF_DELAY  = 4.0    -- seconds after arrival before preference rebalance
-local PINGPONG_S  = 10.0   -- seconds an elevator is excluded from going back up
+local PINGPONG_S  = 10.0   -- seconds an elevator is locked out of going back up
                             -- after arriving at Bottom (catches manual moves too)
 
 local BOTTOM = 1
@@ -61,23 +65,22 @@ local SIGNAL = {
 -- ============================================================
 --  STATE
 --  pos[e]           : last confirmed floor (BOTTOM/TOP) or 0
---  sent_to[e]       : floor commanded to (0 = none); cleared
---                     on confirmed arrival
---  bottom_arrived[e]: os.epoch time (ms) when elevator e last
---                     confirmed arrival at BOTTOM, or 0.
---                     Used for ping-pong exclusion window.
+--  sent_to[e]       : floor commanded to (0 = none)
+--  bottom_arrived[e]: epoch ms when e last arrived at BOTTOM;
+--                     0 means not recently. Cleared on Top arrival.
 --  pref_timer       : timer ID for delayed preference rebalance
---  cmd_queue        : list of {e, f} commands to pulse; drained
---                     by the main loop so rebalance never sleeps
---  pulsing          : true while a pulse coroutine is active;
---                     blocks new pulses until the current one ends
+--  rebalancing      : mutex; true while pulse() is sleeping.
+--                     Prevents re-entrant rebalance calls.
+--  dirty            : set true when a sensor change arrives
+--                     while rebalancing=true; triggers an
+--                     emergency rebalance after the pulse ends.
 -- ============================================================
 local pos            = { 0, 0, 0 }
 local sent_to        = { 0, 0, 0 }
 local bottom_arrived = { 0, 0, 0 }
 local pref_timer     = nil
-local cmd_queue      = {}
-local pulsing        = false
+local rebalancing    = false
+local dirty          = false
 
 -- ============================================================
 --  LOGGING  (fixed-size ring buffer)
@@ -90,19 +93,17 @@ end
 
 -- ============================================================
 --  PING-PONG GUARD
---  Returns true if elevator e arrived at Bottom recently enough
---  that it should not yet be sent back up.
+--  True if elevator e arrived at Bottom recently enough that
+--  it should not yet be sent back up.
 -- ============================================================
 local function recently_at_bottom(e)
   if bottom_arrived[e] == 0 then return false end
-  local age_ms = os.epoch("utc") - bottom_arrived[e]
-  return age_ms < (PINGPONG_S * 1000)
+  return (os.epoch("utc") - bottom_arrived[e]) < (PINGPONG_S * 1000)
 end
 
 -- ============================================================
 --  READ SENSORS
 --  Returns true if any position changed.
---  Schedules the preference-rebalance delay on any arrival.
 -- ============================================================
 local function update_positions()
   local inputs  = redstone.getBundledInput(INPUT_SIDE)
@@ -115,13 +116,13 @@ local function update_positions()
 
     local new_pos
     if at_bot and at_top then
-      new_pos = pos[e]        -- sensor error, keep previous
+      new_pos = pos[e]
     elseif at_bot then
       new_pos = BOTTOM
     elseif at_top then
       new_pos = TOP
     else
-      new_pos = 0             -- in transit
+      new_pos = 0
     end
 
     if new_pos ~= pos[e] then
@@ -135,8 +136,6 @@ local function update_positions()
         sent_to[e] = 0
         arrival = true
 
-        -- Record Bottom arrival timestamp for ping-pong guard.
-        -- Arriving at Top clears the record (elevator is back up).
         if new_pos == BOTTOM then
           bottom_arrived[e] = os.epoch("utc")
         else
@@ -151,7 +150,6 @@ local function update_positions()
     end
   end
 
-  -- Restart the preference-rebalance delay window on any arrival.
   if arrival then
     pref_timer = os.startTimer(PREF_DELAY)
   end
@@ -161,7 +159,6 @@ end
 
 -- ============================================================
 --  EFFECTIVE COUNT
---  Elevators confirmed at f plus those en-route to f.
 -- ============================================================
 local function effective(f)
   local n = 0
@@ -174,55 +171,55 @@ local function effective(f)
 end
 
 -- ============================================================
---  ENQUEUE COMMAND
---  Marks the elevator as dispatched and adds to the pulse
---  queue. The actual redstone pulse is sent by the main loop
---  so rebalance() never calls sleep() and cannot be interrupted
---  by a redstone event mid-decision.
+--  PULSE  (blocking, must not be called re-entrantly)
+--  Sends a brief HIGH signal on the correct output color then
+--  returns it LOW. Uses direct sleep() as in v1.0.0 — this is
+--  correct for CC:Tweaked's single-threaded event model.
+-- ============================================================
+local function pulse(e, f)
+  local color   = SIGNAL[e][f]
+  local current = redstone.getBundledOutput(OUTPUT_SIDE)
+  redstone.setBundledOutput(OUTPUT_SIDE, colors.combine(current, color))
+  sleep(PULSE_S)
+  redstone.setBundledOutput(OUTPUT_SIDE,
+    colors.subtract(redstone.getBundledOutput(OUTPUT_SIDE), color))
+end
+
+-- ============================================================
+--  DISPATCH
 -- ============================================================
 local function dispatch(e, f)
   if sent_to[e] ~= 0 then return false end
   if pos[e] == f      then return false end
   sent_to[e] = f
-  table.insert(cmd_queue, { e = e, f = f })
   log("CMD: " .. ELEV_NAME[e] .. " -> " .. FLOOR_NAME[f])
+  rebalancing = true
+  pulse(e, f)
+  rebalancing = false
+  -- If sensor events arrived during the pulse, do an emergency check now
+  if dirty then
+    dirty = false
+    update_positions()
+  end
   return true
 end
 
 -- ============================================================
---  DRAIN ONE PULSE
---  Called from the main loop when cmd_queue is non-empty and
---  no pulse is currently in progress. Runs the pulse in a
---  coroutine so the main loop stays responsive.
--- ============================================================
-local pulse_co = nil
-
-local function start_next_pulse()
-  if pulsing or #cmd_queue == 0 then return end
-  local cmd = table.remove(cmd_queue, 1)
-  pulsing = true
-  pulse_co = coroutine.create(function()
-    local color   = SIGNAL[cmd.e][cmd.f]
-    local current = redstone.getBundledOutput(OUTPUT_SIDE)
-    redstone.setBundledOutput(OUTPUT_SIDE, colors.combine(current, color))
-    sleep(PULSE_S)
-    redstone.setBundledOutput(OUTPUT_SIDE,
-      colors.subtract(redstone.getBundledOutput(OUTPUT_SIDE), color))
-    pulsing = false
-    pulse_co = nil
-  end)
-  coroutine.resume(pulse_co)
-end
-
--- ============================================================
 --  REBALANCE
---  emergency_only = true  : enforce hard minimums only (instant)
---  emergency_only = false : also enforce preferred distribution
+--  emergency_only = true  : hard minimums only (no delay)
+--  emergency_only = false : also preferred distribution
 --
---  Never calls sleep(). Dispatches at most one elevator per call.
+--  If called while a pulse is in progress (rebalancing=true),
+--  sets the dirty flag instead of running — dispatch() will
+--  re-check sensors and run an emergency pass after the pulse.
 -- ============================================================
 local function rebalance(emergency_only)
-  -- Priority 1: hard minimum — 1 elevator per floor always
+  if rebalancing then
+    dirty = true
+    return
+  end
+
+  -- Priority 1: hard minimum
   for f = 1, 2 do
     if effective(f) == 0 then
       local other = (f == BOTTOM) and TOP or BOTTOM
@@ -238,13 +235,11 @@ local function rebalance(emergency_only)
 
   if emergency_only then return end
 
-  -- Priority 2: preferred state (2 Top, 1 Bottom)
-  -- Only act when every elevator is settled (no unknowns in transit).
+  -- Priority 2: preferred state — only when all elevators settled
   for e = 1, NUM_E do
     if pos[e] == 0 or sent_to[e] ~= 0 then return end
   end
 
-  -- Need more at Top: pick a Bottom elevator outside the ping-pong window
   if effective(TOP) < 2 and effective(BOTTOM) > 1 then
     for e = 1, NUM_E do
       if pos[e] == BOTTOM and sent_to[e] == 0 and not recently_at_bottom(e) then
@@ -253,11 +248,10 @@ local function rebalance(emergency_only)
         return
       end
     end
-    log("PREF: all Bottom elevators in ping-pong window, waiting")
+    log("PREF: all Bottom elevators in cooldown, waiting")
     return
   end
 
-  -- Need more at Bottom (shouldn't normally trigger given 2T/1B preferred)
   if effective(BOTTOM) < 1 and effective(TOP) > 1 then
     for e = 1, NUM_E do
       if pos[e] == TOP and sent_to[e] == 0 then
@@ -297,9 +291,9 @@ local function draw()
 
   term.setCursorPos(1, 9)
   term.write("  Log:")
-  local start = math.max(1, #log_buf - 8)
-  for i = start, #log_buf do
-    term.setCursorPos(1, 9 + (i - start + 1))
+  local start_i = math.max(1, #log_buf - 8)
+  for i = start_i, #log_buf do
+    term.setCursorPos(1, 9 + (i - start_i + 1))
     term.write("    " .. log_buf[i])
   end
 end
@@ -321,7 +315,6 @@ end
 
 log("Boot: running startup rebalance")
 rebalance(false)
-start_next_pulse()
 draw()
 
 -- ============================================================
@@ -333,22 +326,15 @@ local display_timer = os.startTimer(DISPLAY_S)
 while true do
   local ev, a = os.pullEvent()
 
-  -- Resume an in-progress pulse coroutine on timer events
-  if pulse_co and coroutine.status(pulse_co) ~= "dead" then
-    coroutine.resume(pulse_co)
-  end
-
   if ev == "redstone" then
     local changed = update_positions()
     if changed then rebalance(true) end
-    start_next_pulse()
     draw()
 
   elseif ev == "timer" then
     if a == poll_timer then
       local changed = update_positions()
       if changed then rebalance(true) end
-      start_next_pulse()
       poll_timer = os.startTimer(POLL_S)
 
     elseif a == display_timer then
@@ -359,11 +345,7 @@ while true do
       pref_timer = nil
       log("Pref rebalance triggered")
       rebalance(false)
-      start_next_pulse()
       draw()
     end
   end
-
-  -- Kick off the next queued pulse if one is waiting
-  start_next_pulse()
 end

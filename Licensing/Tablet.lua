@@ -1,6 +1,6 @@
 -- ============================================================
 --  XLicensing_Tablet.lua  |  TABLET / COMPUTER (admin UI)
---  Version: v2.1.0
+--  Version: v2.1.1
 --
 --  Screens / navigation:
 --    home          - app launcher grid with badge overlays
@@ -26,6 +26,11 @@
 --    gate_v1      : gate commands and state broadcasts
 --
 --  CHANGELOG
+--  v2.1.1 - Fixed lockdown display flickering: gate_state.lockdown
+--           is now updated optimistically on button press so the UI
+--           switches to lockdown mode instantly rather than waiting
+--           for the broadcast confirmation from the GateController.
+--           Same fix applied to release lockdown.
 --  v2.1.0 - Lockdown state on Gates screen now replaces all gate
 --           toggle buttons with a full red LOCKDOWN banner showing
 --           individual gate states as text. Only RELEASE LOCKDOWN
@@ -626,6 +631,7 @@ while true do
         elseif gate_state.lockdown then
           -- Lockdown active: only release button is live
           if hit(btns.lockdown_off, x, y) then
+            gate_state.lockdown = false   -- optimistic local update
             net_send_gate({ kind="gate_cmd", cmd="lockdown_off" })
             btns = render()
           end
@@ -643,6 +649,7 @@ while true do
             if hit(btns.open_all, x, y) then
               net_send_gate({ kind="gate_cmd", cmd="open_all" })
             elseif hit(btns.lockdown_on, x, y) then
+              gate_state.lockdown = true   -- optimistic local update
               net_send_gate({ kind="gate_cmd", cmd="lockdown_on" })
             end
           end

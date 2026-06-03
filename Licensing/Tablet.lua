@@ -1,6 +1,6 @@
 -- ============================================================
 --  XLicensing_Tablet.lua  |  TABLET / COMPUTER (admin UI)
---  Version: v2.1.1
+--  Version: v2.2.0
 --
 --  Screens / navigation:
 --    home          - app launcher grid with badge overlays
@@ -26,7 +26,13 @@
 --    gate_v1      : gate commands and state broadcasts
 --
 --  CHANGELOG
---  v2.1.1 - Fixed lockdown display flickering: gate_state.lockdown
+--  v2.2.0 - Gates screen: replaced text toggle buttons with color
+--           squares (cyan=G1, pink=G2, red=G3, brown=G4). Added
+--           per-gate "in progress" orange row highlight with
+--           countdown: 13s for open, 9s for close. Open All
+--           triggers individual countdowns per gate being opened.
+--           Progress is display-only; tracked locally on tablet.
+--  v2.1.1 - Fixed lockdown flicker via optimistic local state.
 --           is now updated optimistically on button press so the UI
 --           switches to lockdown mode instantly rather than waiting
 --           for the broadcast confirmation from the GateController.
@@ -416,9 +422,58 @@ local function draw_reactor()
 end
 
 -- ============================================================
---  SCREEN: REACTOR > GATES
+--  GATE PROGRESS STATE
+--  Tracks local countdown timers per gate for the "in progress"
+--  display. Purely cosmetic — not synced with GateController.
+--    gate_progress[g].ends_at  : os.epoch ms when done, or 0
+--    gate_progress[g].opening  : true = opening, false = closing
 -- ============================================================
-local GATE_NAME = { "Gate 1", "Gate 2", "Gate 3", "Gate 4" }
+local OPEN_PROGRESS_S  = 13
+local CLOSE_PROGRESS_S = 9
+
+local gate_progress = {}
+for g = 1, 4 do
+  gate_progress[g] = { ends_at = 0, opening = false }
+end
+
+local progress_timer = nil   -- display refresh timer while any gate is in progress
+
+local function start_progress(g, opening)
+  local dur = opening and OPEN_PROGRESS_S or CLOSE_PROGRESS_S
+  gate_progress[g].ends_at = os.epoch("utc") + dur * 1000
+  gate_progress[g].opening = opening
+  if not progress_timer then
+    progress_timer = os.startTimer(0.5)
+  end
+end
+
+local function progress_remaining(g)
+  local p = gate_progress[g]
+  if p.ends_at == 0 then return 0 end
+  local rem = math.ceil((p.ends_at - os.epoch("utc")) / 1000)
+  if rem <= 0 then
+    p.ends_at = 0
+    return 0
+  end
+  return rem
+end
+
+local function any_in_progress()
+  for g = 1, 4 do
+    if progress_remaining(g) > 0 then return true end
+  end
+  return false
+end
+
+-- ============================================================
+--  SCREEN: REACTOR > GATES
+--
+--  Layout per gate row:
+--    [color square] Gate N  |  in progress Xs  |  (status)
+--  Color squares: Gate1=cyan, Gate2=pink, Gate3=red, Gate4=brown
+-- ============================================================
+local GATE_NAME   = { "Gate 1", "Gate 2", "Gate 3", "Gate 4" }
+local GATE_COLORS = { colors.cyan, colors.pink, colors.red, colors.brown }
 
 local function draw_reactor_gates()
   clear_screen()
@@ -431,32 +486,31 @@ local function draw_reactor_gates()
   local locked = gate_state.lockdown
 
   if locked then
-    -- ---- LOCKDOWN ACTIVE: fill gate rows with a single banner ----
+    -- ---- LOCKDOWN ACTIVE ----
     fill_rect(1, 4, W, 8, colors.red)
     center(5, "*** LOCKDOWN ACTIVE ***", colors.white, colors.red)
     center(6, "All gates secured.",      colors.white, colors.red)
-    -- Still show individual gate states as text underneath the banner
     for g = 1, 4 do
-      local open = gate_state.gate_open[g]
-      local row  = 3 + g
-      -- Overwrite banner row with gate status (dimmed)
+      local open     = gate_state.gate_open[g]
+      local row      = 3 + g
       term.setCursorPos(2, row)
       term.setBackgroundColor(colors.red)
       term.setTextColor(colors.white)
-      local state_str = open and "OPEN" or "closed"
-      term.write(GATE_NAME[g] .. ": " .. state_str ..
-        string.rep(" ", W - 2 - #GATE_NAME[g] - 2 - #state_str))
+      -- Color square
+      term.setBackgroundColor(GATE_COLORS[g])
+      term.write("  ")
+      term.setBackgroundColor(colors.red)
+      term.write(" " .. GATE_NAME[g] .. ": " .. (open and "OPEN" or "closed"))
+      term.write(string.rep(" ", W))  -- clear to end of row
       term.setBackgroundColor(colors.black)
       term.setTextColor(colors.white)
     end
 
-    -- Separator
     term.setCursorPos(1, 9)
     term.setTextColor(colors.gray)
     term.write(string.rep("-", W))
     term.setTextColor(colors.white)
 
-    -- Release lockdown button spans full width
     btns.lockdown_off = draw_button(2, 10, W - 1, 12, "RELEASE LOCKDOWN", colors.orange, colors.white)
 
     term.setCursorPos(2, H)
@@ -465,36 +519,50 @@ local function draw_reactor_gates()
     term.setTextColor(colors.white)
 
   else
-    -- ---- NORMAL: gate status rows with individual toggle buttons ----
+    -- ---- NORMAL: gate rows ----
     for g = 1, 4 do
       local open = gate_state.gate_open[g]
-      local cd   = gate_state.cooldown_rem[g] or 0
+      local rem  = progress_remaining(g)
+      local in_prog = rem > 0
+      local row  = 3 + g
 
-      local state_label, state_col
-      if open then
-        state_label = "OPEN  "; state_col = colors.green
-      else
-        state_label = "closed"; state_col = colors.lightGray
-      end
+      -- Row background: orange if in progress, black otherwise
+      local row_bg = in_prog and colors.orange or colors.black
+      fill_rect(1, row, W, row, row_bg)
 
-      local row = 3 + g
+      -- Color square (2 chars wide)
       term.setCursorPos(2, row)
-      term.setTextColor(colors.white)
-      term.write(GATE_NAME[g] .. ": ")
-      term.setTextColor(state_col)
-      term.write(state_label)
-      term.setTextColor(colors.white)
+      term.setBackgroundColor(GATE_COLORS[g])
+      term.write("  ")
+      term.setBackgroundColor(row_bg)
 
-      if cd > 0 then
-        term.setTextColor(colors.yellow)
-        term.write(" [" .. cd .. "s]")
+      -- Gate name
+      term.setTextColor(colors.white)
+      term.write(" " .. GATE_NAME[g])
+
+      -- Status / progress
+      if in_prog then
+        local dir = gate_progress[g].opening and "opening" or "closing"
+        term.setTextColor(colors.white)
+        term.write("  in progress " .. rem .. "s")
+      else
+        local state_label = open and "OPEN  " or "closed"
+        local state_col   = open and colors.green or colors.lightGray
+        term.write("  ")
+        term.setTextColor(state_col)
+        term.write(state_label)
         term.setTextColor(colors.white)
       end
 
-      -- Toggle button (right side of row)
-      local btn_label = open and "Close" or "Open"
-      local btn_col   = open and colors.red or colors.green
-      btns["gate"..g] = draw_button(W - 8, row, W - 1, row, btn_label, btn_col, colors.white)
+      -- Color square toggle button (right side, 4 chars wide)
+      local sq_x = W - 4
+      term.setCursorPos(sq_x, row)
+      term.setBackgroundColor(GATE_COLORS[g])
+      term.write("    ")
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(colors.white)
+
+      btns["gate"..g] = { x1=sq_x, y1=row, x2=W, y2=row }
     end
 
     -- Separator
@@ -629,32 +697,48 @@ while true do
         if hit(btns.back, x, y) then
           screen = "reactor"; btns = render()
         elseif gate_state.lockdown then
-          -- Lockdown active: only release button is live
           if hit(btns.lockdown_off, x, y) then
-            gate_state.lockdown = false   -- optimistic local update
+            gate_state.lockdown = false
             net_send_gate({ kind="gate_cmd", cmd="lockdown_off" })
             btns = render()
           end
         else
-          -- Normal: individual toggles + global controls
           local handled = false
           for g = 1, 4 do
             if hit(btns["gate"..g], x, y) then
+              local opening = not gate_state.gate_open[g]
               net_send_gate({ kind="gate_cmd", cmd="toggle", gate=g })
+              start_progress(g, opening)
               handled = true
               break
             end
           end
           if not handled then
             if hit(btns.open_all, x, y) then
+              -- Start progress for every gate that is currently closed
+              for g = 1, 4 do
+                if not gate_state.gate_open[g] then
+                  start_progress(g, true)
+                end
+              end
               net_send_gate({ kind="gate_cmd", cmd="open_all" })
             elseif hit(btns.lockdown_on, x, y) then
-              gate_state.lockdown = true   -- optimistic local update
+              gate_state.lockdown = true
               net_send_gate({ kind="gate_cmd", cmd="lockdown_on" })
             end
           end
           btns = render()
         end
+      end
+    end
+
+  elseif ev == "timer" then
+    local a = e[2]
+    if a == progress_timer then
+      progress_timer = nil
+      if screen == "reactor.gates" then btns = render() end
+      if any_in_progress() then
+        progress_timer = os.startTimer(0.5)
       end
     end
 

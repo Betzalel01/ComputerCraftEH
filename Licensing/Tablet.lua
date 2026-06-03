@@ -1,6 +1,6 @@
 -- ============================================================
 --  XLicensing_Tablet.lua  |  TABLET / COMPUTER (admin UI)
---  Version: v2.0.0
+--  Version: v2.1.0
 --
 --  Screens / navigation:
 --    home          - app launcher grid with badge overlays
@@ -26,7 +26,12 @@
 --    gate_v1      : gate commands and state broadcasts
 --
 --  CHANGELOG
---  v2.0.0 - Refactored home screen into a data-driven app
+--  v2.1.0 - Lockdown state on Gates screen now replaces all gate
+--           toggle buttons with a full red LOCKDOWN banner showing
+--           individual gate states as text. Only RELEASE LOCKDOWN
+--           button is active during lockdown; all other inputs
+--           including Back are suppressed until released.
+--  v2.0.0 - Initial refactor with app registry, Reactor app,
 --           registry (APPS table) so adding future apps requires
 --           no changes to draw/click logic.
 --           Added Reactor app with Gates subsection: live gate
@@ -418,64 +423,91 @@ local function draw_reactor_gates()
   draw_header("REACTOR > GATES",
     "GateCtrl: " .. (gate_id and tostring(gate_id) or "searching..."))
 
-  -- Gate status rows (rows 4-7)
-  for g = 1, 4 do
-    local open = gate_state.gate_open[g]
-    local cd   = gate_state.cooldown_rem[g] or 0
-    local locked = gate_state.lockdown
+  local locked = gate_state.lockdown
 
-    -- State label
-    local state_label, state_col
-    if locked then
-      state_label = "LOCKED"; state_col = colors.orange
-    elseif open then
-      state_label = "OPEN  "; state_col = colors.green
-    else
-      state_label = "closed"; state_col = colors.lightGray
-    end
-
-    local row = 3 + g
-    term.setCursorPos(2, row)
-    term.setTextColor(colors.white)
-    term.write(GATE_NAME[g] .. ": ")
-    term.setTextColor(state_col)
-    term.write(state_label)
-    term.setTextColor(colors.white)
-
-    if cd > 0 then
-      term.setTextColor(colors.yellow)
-      term.write(" [" .. cd .. "s]")
+  if locked then
+    -- ---- LOCKDOWN ACTIVE: fill gate rows with a single banner ----
+    fill_rect(1, 4, W, 8, colors.red)
+    center(5, "*** LOCKDOWN ACTIVE ***", colors.white, colors.red)
+    center(6, "All gates secured.",      colors.white, colors.red)
+    -- Still show individual gate states as text underneath the banner
+    for g = 1, 4 do
+      local open = gate_state.gate_open[g]
+      local row  = 3 + g
+      -- Overwrite banner row with gate status (dimmed)
+      term.setCursorPos(2, row)
+      term.setBackgroundColor(colors.red)
+      term.setTextColor(colors.white)
+      local state_str = open and "OPEN" or "closed"
+      term.write(GATE_NAME[g] .. ": " .. state_str ..
+        string.rep(" ", W - 2 - #GATE_NAME[g] - 2 - #state_str))
+      term.setBackgroundColor(colors.black)
       term.setTextColor(colors.white)
     end
 
-    -- Toggle button (right side of row)
-    local btn_label = open and "Close" or "Open"
-    local btn_col   = locked and colors.gray or (open and colors.red or colors.green)
-    local bx1 = W - 8
-    btns["gate"..g] = draw_button(bx1, row, W - 1, row, btn_label, btn_col, colors.white)
-  end
+    -- Separator
+    term.setCursorPos(1, 9)
+    term.setTextColor(colors.gray)
+    term.write(string.rep("-", W))
+    term.setTextColor(colors.white)
 
-  -- Separator
-  term.setCursorPos(1, 9)
-  term.setTextColor(colors.gray)
-  term.write(string.rep("-", W))
-  term.setTextColor(colors.white)
-
-  -- Global controls (rows 10-12)
-  local half = math.floor(W / 2)
-
-  if gate_state.lockdown then
+    -- Release lockdown button spans full width
     btns.lockdown_off = draw_button(2, 10, W - 1, 12, "RELEASE LOCKDOWN", colors.orange, colors.white)
-  else
-    btns.open_all    = draw_button(2,        10, half - 1, 12, "OPEN ALL",  colors.green, colors.white)
-    btns.lockdown_on = draw_button(half + 1, 10, W - 1,    12, "LOCKDOWN",  colors.red,   colors.white)
-  end
 
-  -- Hint
-  term.setCursorPos(2, H)
-  term.setTextColor(colors.lightGray)
-  term.write(gate_id and "Commands sent directly to gate ctrl." or "Searching for gate controller...")
-  term.setTextColor(colors.white)
+    term.setCursorPos(2, H)
+    term.setTextColor(colors.yellow)
+    term.write("Lockdown can only be cleared here.")
+    term.setTextColor(colors.white)
+
+  else
+    -- ---- NORMAL: gate status rows with individual toggle buttons ----
+    for g = 1, 4 do
+      local open = gate_state.gate_open[g]
+      local cd   = gate_state.cooldown_rem[g] or 0
+
+      local state_label, state_col
+      if open then
+        state_label = "OPEN  "; state_col = colors.green
+      else
+        state_label = "closed"; state_col = colors.lightGray
+      end
+
+      local row = 3 + g
+      term.setCursorPos(2, row)
+      term.setTextColor(colors.white)
+      term.write(GATE_NAME[g] .. ": ")
+      term.setTextColor(state_col)
+      term.write(state_label)
+      term.setTextColor(colors.white)
+
+      if cd > 0 then
+        term.setTextColor(colors.yellow)
+        term.write(" [" .. cd .. "s]")
+        term.setTextColor(colors.white)
+      end
+
+      -- Toggle button (right side of row)
+      local btn_label = open and "Close" or "Open"
+      local btn_col   = open and colors.red or colors.green
+      btns["gate"..g] = draw_button(W - 8, row, W - 1, row, btn_label, btn_col, colors.white)
+    end
+
+    -- Separator
+    term.setCursorPos(1, 9)
+    term.setTextColor(colors.gray)
+    term.write(string.rep("-", W))
+    term.setTextColor(colors.white)
+
+    -- Global controls
+    local half = math.floor(W / 2)
+    btns.open_all    = draw_button(2,        10, half - 1, 12, "OPEN ALL", colors.green, colors.white)
+    btns.lockdown_on = draw_button(half + 1, 10, W - 1,    12, "LOCKDOWN", colors.red,   colors.white)
+
+    term.setCursorPos(2, H)
+    term.setTextColor(colors.lightGray)
+    term.write(gate_id and "Commands sent directly to gate ctrl." or "Searching for gate controller...")
+    term.setTextColor(colors.white)
+  end
 
   return btns
 end
@@ -591,26 +623,31 @@ while true do
       elseif screen == "reactor.gates" then
         if hit(btns.back, x, y) then
           screen = "reactor"; btns = render()
-        elseif not gate_state.lockdown then
-          -- Individual gate toggles
+        elseif gate_state.lockdown then
+          -- Lockdown active: only release button is live
+          if hit(btns.lockdown_off, x, y) then
+            net_send_gate({ kind="gate_cmd", cmd="lockdown_off" })
+            btns = render()
+          end
+        else
+          -- Normal: individual toggles + global controls
+          local handled = false
           for g = 1, 4 do
             if hit(btns["gate"..g], x, y) then
               net_send_gate({ kind="gate_cmd", cmd="toggle", gate=g })
+              handled = true
               break
             end
           end
-          if hit(btns.open_all, x, y) then
-            net_send_gate({ kind="gate_cmd", cmd="open_all" })
-          elseif hit(btns.lockdown_on, x, y) then
-            net_send_gate({ kind="gate_cmd", cmd="lockdown_on" })
+          if not handled then
+            if hit(btns.open_all, x, y) then
+              net_send_gate({ kind="gate_cmd", cmd="open_all" })
+            elseif hit(btns.lockdown_on, x, y) then
+              net_send_gate({ kind="gate_cmd", cmd="lockdown_on" })
+            end
           end
-        else
-          -- Lockdown active: only release button shown
-          if hit(btns.lockdown_off, x, y) then
-            net_send_gate({ kind="gate_cmd", cmd="lockdown_off" })
-          end
+          btns = render()
         end
-        btns = render()
       end
     end
 

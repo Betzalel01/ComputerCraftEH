@@ -1,6 +1,6 @@
 -- ============================================================
 --  GateController.lua
---  Version: v1.4.0
+--  Version: v1.4.1
 --
 --  RIGHT side (input)
 --    GATE OPEN SENSORS  (HIGH = gate is open)
@@ -61,9 +61,14 @@
 --      levers are never blocked by cooldown.
 --
 --  CHANGELOG
---  v1.4.0 - Added rednet support (protocol gate_v1). Receives
---           gate_cmd messages from tablets; broadcasts gate_state
---           on change and every HEARTBEAT_S seconds.
+--  v1.4.1 - Fixed lockdown being cleared by physical lever reads
+--           during a net-commanded lockdown. Added lockdown_net
+--           flag: when lockdown is triggered via rednet, the
+--           physical orange lever going LOW is ignored by
+--           update_inputs until do_lockdown_off is called
+--           explicitly (via net command or lever going HIGH then
+--           LOW again after a net-release).
+--  v1.4.0 - Added rednet support (protocol gate_v1).
 --  v1.3.1 - Cooldown now triggers on open, not close.
 --  v1.3.0 - Multi-gate moves fire simultaneously. Per-gate cooldown.
 --  v1.2.0 - Individual gate toggle buttons. Unified toggle pulse.
@@ -71,7 +76,7 @@
 --  v1.0.0 - Initial release.
 -- ============================================================
 
-local VERSION     = "v1.4.0"
+local VERSION     = "v1.4.1"
 local GATE_PROTO  = "gate_v1"
 
 local INPUT_SIDE  = "right"
@@ -123,6 +128,8 @@ local gate_open      = { false, false, false, false }
 local button_held    = { false, false, false, false }
 local close_time     = { 0, 0, 0, 0 }
 local lockdown       = false
+local lockdown_net   = false   -- true when lockdown was triggered via rednet;
+                                -- prevents the physical lever LOW from clearing it
 local open_all       = false
 local last_heartbeat = 0
 
@@ -227,10 +234,11 @@ local function do_open_all()
   broadcast_state()
 end
 
-local function do_lockdown_on()
+local function do_lockdown_on(from_net)
   if lockdown then return end
-  lockdown = true
-  log("LOCKDOWN: starting sequence")
+  lockdown     = true
+  lockdown_net = from_net and true or false
+  log("LOCKDOWN: starting sequence" .. (lockdown_net and " (net)" or " (lever)"))
   local to_close = {}
   for g = 1, NUM_GATES do
     if gate_open[g] then table.insert(to_close, g); log("LOCKDOWN: closing " .. GATE_NAME[g]) end
@@ -244,7 +252,8 @@ end
 
 local function do_lockdown_off()
   if not lockdown then return end
-  lockdown = false
+  lockdown     = false
+  lockdown_net = false
   set_lockdown_holds(false)
   log("LOCKDOWN: released, holds cleared")
   local inputs = redstone.getBundledInput(INPUT_SIDE)
@@ -261,7 +270,7 @@ local function update_inputs()
   local new_open_all = colors.test(inputs, INPUT_OPEN_ALL)
   local actions      = { lockdown_start=false, lockdown_end=false, open_all_start=false, toggle_gate={} }
 
-  if new_lockdown ~= lockdown then
+  if new_lockdown ~= lockdown and not lockdown_net then
     log("Lockdown lever: " .. (new_lockdown and "ON" or "OFF"))
     if new_lockdown then actions.lockdown_start = true
     else                 actions.lockdown_end   = true end
@@ -297,7 +306,7 @@ end
 
 local function process(actions)
   local changed = false
-  if actions.lockdown_start then do_lockdown_on();  changed = true end
+  if actions.lockdown_start then do_lockdown_on(false); changed = true end
   if actions.lockdown_end   then do_lockdown_off(); changed = true end
   if actions.open_all_start then do_open_all();     changed = true end
   for _, g in ipairs(actions.toggle_gate) do
@@ -322,7 +331,7 @@ local function handle_net_cmd(msg)
       end
     end
   elseif cmd == "open_all"     then do_open_all()
-  elseif cmd == "lockdown_on"  then do_lockdown_on()
+  elseif cmd == "lockdown_on"  then do_lockdown_on(true)
   elseif cmd == "lockdown_off" then do_lockdown_off()
   end
 end
@@ -375,7 +384,7 @@ end
 
 if lockdown then
   log("Boot: lockdown lever active")
-  do_lockdown_on()
+  do_lockdown_on(false)
 elseif open_all then
   log("Boot: open-all lever active")
   do_open_all()

@@ -1,6 +1,6 @@
 -- ============================================================
 --  GateController.lua
---  Version: v1.3.1
+--  Version: v1.4.0
 --
 --  RIGHT side (input)
 --    GATE OPEN SENSORS  (HIGH = gate is open)
@@ -32,6 +32,19 @@
 --    Purple = Lock Gate 3
 --    Gray   = Lock Gate 4
 --
+--  REDNET PROTOCOL  gate_v1
+--    Receives gate_cmd messages from tablets:
+--      { kind="gate_cmd", cmd="toggle",       gate=1..4 }
+--      { kind="gate_cmd", cmd="open_all"                }
+--      { kind="gate_cmd", cmd="lockdown_on"             }
+--      { kind="gate_cmd", cmd="lockdown_off"            }
+--    Broadcasts gate_state on any change and periodically:
+--      { kind="gate_state",
+--        gate_open    = { bool, bool, bool, bool },
+--        lockdown     = bool,
+--        cooldown_rem = { int, int, int, int }  -- seconds remaining, 0=none
+--      }
+--
 --  BEHAVIOUR
 --    Normal:
 --      Gate sensors track open/closed state.
@@ -42,77 +55,76 @@
 --      hold signals, ignores all further gate input.
 --    Lockdown released:
 --      Hold signals cleared; gates left in current state.
---    Close cooldown (per gate, 13 seconds):
+--    Open cooldown (per gate, 13 seconds):
 --      When a gate is commanded open, its individual toggle
 --      button is ignored for 13 seconds. Lockdown and open-all
 --      levers are never blocked by cooldown.
 --
 --  CHANGELOG
---  v1.3.1 - Cooldown now triggers on open, not close. Toggle
---           button blocked for 13s after a gate is opened.
---  v1.3.0 - Multi-gate moves fire simultaneously. Added per-gate
---           13-second cooldown (was on close, corrected in v1.3.1).
---  v1.2.0 - Added individual gate toggle buttons (white, gray,
---           purple, yellow). Renamed gates: cyan=1, pink=2,
---           red=3, brown=4. Unified toggle pulse output.
---  v1.1.0 - Added open-all lever (lime, right side).
+--  v1.4.0 - Added rednet support (protocol gate_v1). Receives
+--           gate_cmd messages from tablets; broadcasts gate_state
+--           on change and every HEARTBEAT_S seconds.
+--  v1.3.1 - Cooldown now triggers on open, not close.
+--  v1.3.0 - Multi-gate moves fire simultaneously. Per-gate cooldown.
+--  v1.2.0 - Individual gate toggle buttons. Unified toggle pulse.
+--  v1.1.0 - Added open-all lever.
 --  v1.0.0 - Initial release.
 -- ============================================================
 
-local VERSION     = "v1.3.1"
+local VERSION     = "v1.4.0"
+local GATE_PROTO  = "gate_v1"
 
 local INPUT_SIDE  = "right"
 local OUTPUT_SIDE = "left"
 
-local POLL_S      = 0.1    -- sensor read rate (seconds)
-local DISPLAY_S   = 0.5    -- screen refresh rate (seconds)
-local PULSE_S     = 0.5    -- toggle pulse duration (seconds)
-local COOLDOWN_S  = 13.0   -- seconds to block toggle input after a close
+local POLL_S      = 0.1
+local DISPLAY_S   = 0.5
+local HEARTBEAT_S = 2.0    -- how often to broadcast state even with no change
+local PULSE_S     = 0.5
+local COOLDOWN_S  = 13.0
 
-local NUM_GATES   = 4
-local GATE_NAME   = { "Gate 1", "Gate 2", "Gate 3", "Gate 4" }
+local NUM_GATES  = 4
+local GATE_NAME  = { "Gate 1", "Gate 2", "Gate 3", "Gate 4" }
 
 -- ============================================================
 --  SIGNAL MAP
 -- ============================================================
 local INPUT_GATE = {
-  colors.cyan,
-  colors.pink,
-  colors.red,
-  colors.brown,
+  colors.cyan, colors.pink, colors.red, colors.brown,
 }
 local INPUT_LOCKDOWN = colors.orange
 local INPUT_OPEN_ALL = colors.lime
-
-local INPUT_TOGGLE = {
-  colors.white,
-  colors.gray,
-  colors.purple,
-  colors.yellow,
+local INPUT_TOGGLE   = {
+  colors.white, colors.gray, colors.purple, colors.yellow,
 }
-
 local OUTPUT_TOGGLE = {
-  colors.cyan,
-  colors.pink,
-  colors.red,
-  colors.brown,
+  colors.cyan, colors.pink, colors.red, colors.brown,
+}
+local OUTPUT_LOCK = {
+  colors.white, colors.lime, colors.purple, colors.gray,
 }
 
-local OUTPUT_LOCK = {
-  colors.white,
-  colors.lime,
-  colors.purple,
-  colors.gray,
-}
+-- ============================================================
+--  REDNET
+-- ============================================================
+local function open_rednet()
+  if rednet.isOpen() then return true end
+  for _, side in ipairs({ "left","right","top","bottom","front","back" }) do
+    pcall(rednet.open, side)
+    if rednet.isOpen() then return true end
+  end
+  return false
+end
 
 -- ============================================================
 --  STATE
 -- ============================================================
 local gate_open      = { false, false, false, false }
 local button_held    = { false, false, false, false }
-local close_time     = { 0, 0, 0, 0 }   -- epoch ms of last close command; 0 = no cooldown
+local close_time     = { 0, 0, 0, 0 }
 local lockdown       = false
 local open_all       = false
+local last_heartbeat = 0
 
 -- ============================================================
 --  LOGGING
@@ -124,20 +136,32 @@ local function log(msg)
 end
 
 -- ============================================================
---  COOLDOWN HELPERS
+--  COOLDOWN
 -- ============================================================
-local function start_cooldown(g)
-  close_time[g] = os.epoch("utc")
-end
-
+local function start_cooldown(g)  close_time[g] = os.epoch("utc") end
 local function in_cooldown(g)
   if close_time[g] == 0 then return false end
   return (os.epoch("utc") - close_time[g]) < (COOLDOWN_S * 1000)
 end
-
 local function cooldown_remaining(g)
   if not in_cooldown(g) then return 0 end
   return math.ceil((COOLDOWN_S * 1000 - (os.epoch("utc") - close_time[g])) / 1000)
+end
+
+-- ============================================================
+--  BROADCAST STATE
+-- ============================================================
+local function broadcast_state()
+  if not rednet.isOpen() then return end
+  local rem = {}
+  for g = 1, NUM_GATES do rem[g] = cooldown_remaining(g) end
+  rednet.broadcast({
+    kind         = "gate_state",
+    gate_open    = { gate_open[1], gate_open[2], gate_open[3], gate_open[4] },
+    lockdown     = lockdown,
+    cooldown_rem = rem,
+  }, GATE_PROTO)
+  last_heartbeat = os.epoch("utc")
 end
 
 -- ============================================================
@@ -146,159 +170,108 @@ end
 local function set_lockdown_holds(on)
   local current = redstone.getBundledOutput(OUTPUT_SIDE)
   for g = 1, NUM_GATES do
-    if on then
-      current = colors.combine(current, OUTPUT_LOCK[g])
-    else
-      current = colors.subtract(current, OUTPUT_LOCK[g])
-    end
+    current = on and colors.combine(current, OUTPUT_LOCK[g])
+                  or colors.subtract(current, OUTPUT_LOCK[g])
   end
   redstone.setBundledOutput(OUTPUT_SIDE, current)
 end
 
--- Fire a simultaneous pulse for all gates in the provided list.
--- close_list: list of gate indices being closed (no cooldown).
--- open_list:  list of gate indices being opened (triggers cooldown).
 local function multi_pulse(close_list, open_list)
   local combined = redstone.getBundledOutput(OUTPUT_SIDE)
   local any = false
-
-  for _, g in ipairs(close_list) do
-    combined = colors.combine(combined, OUTPUT_TOGGLE[g])
-    any = true
-  end
-  for _, g in ipairs(open_list) do
-    combined = colors.combine(combined, OUTPUT_TOGGLE[g])
-    any = true
-  end
-
+  for _, g in ipairs(close_list) do combined = colors.combine(combined, OUTPUT_TOGGLE[g]); any = true end
+  for _, g in ipairs(open_list)  do combined = colors.combine(combined, OUTPUT_TOGGLE[g]); any = true end
   if not any then return end
 
   redstone.setBundledOutput(OUTPUT_SIDE, combined)
   sleep(PULSE_S)
 
-  -- Drop all pulsed colors at once
   local after = redstone.getBundledOutput(OUTPUT_SIDE)
-  for _, g in ipairs(close_list) do
-    after = colors.subtract(after, OUTPUT_TOGGLE[g])
-  end
-  for _, g in ipairs(open_list) do
-    after = colors.subtract(after, OUTPUT_TOGGLE[g])
-  end
+  for _, g in ipairs(close_list) do after = colors.subtract(after, OUTPUT_TOGGLE[g]) end
+  for _, g in ipairs(open_list)  do after = colors.subtract(after, OUTPUT_TOGGLE[g]) end
   redstone.setBundledOutput(OUTPUT_SIDE, after)
 
-  -- Start cooldown for each gate that was opened
-  for _, g in ipairs(close_list) do
-    gate_open[g] = false
-  end
-  for _, g in ipairs(open_list) do
-    start_cooldown(g)
-    gate_open[g] = true
-  end
+  for _, g in ipairs(close_list) do gate_open[g] = false end
+  for _, g in ipairs(open_list)  do start_cooldown(g); gate_open[g] = true end
 end
 
--- Single gate pulse (used by individual toggle button).
 local function single_pulse(g, closing)
-  local label = (closing and "close " or "open ") .. GATE_NAME[g]
-  log("PULSE: " .. label)
-  multi_pulse(
-    closing and {g} or {},
-    closing and {} or {g}
-  )
+  log("PULSE: " .. (closing and "close " or "open ") .. GATE_NAME[g])
+  multi_pulse(closing and {g} or {}, closing and {} or {g})
 end
 
 -- ============================================================
---  LOCKDOWN SEQUENCE
---  Simultaneously closes all open gates.
+--  GATE OPERATIONS  (shared by physical inputs and rednet cmds)
 -- ============================================================
-local function begin_lockdown()
-  log("LOCKDOWN: starting sequence")
-  local to_close = {}
-  for g = 1, NUM_GATES do
-    if gate_open[g] then
-      table.insert(to_close, g)
-      log("LOCKDOWN: closing " .. GATE_NAME[g])
-    end
+local function do_toggle(g)
+  if in_cooldown(g) then
+    log("TOGGLE " .. GATE_NAME[g] .. ": cooldown " .. cooldown_remaining(g) .. "s")
+    return false
   end
-  if #to_close == 0 then
-    log("LOCKDOWN: all gates already closed")
-  else
-    multi_pulse(to_close, {})
-  end
-  set_lockdown_holds(true)
-  log("LOCKDOWN: hold signals active")
+  local closing = gate_open[g]
+  log("TOGGLE: " .. (closing and "close " or "open ") .. GATE_NAME[g])
+  single_pulse(g, closing)
+  broadcast_state()
+  return true
 end
 
--- ============================================================
---  LOCKDOWN RELEASE
--- ============================================================
-local function end_lockdown()
-  set_lockdown_holds(false)
-  log("LOCKDOWN: released, holds cleared")
-  local inputs = redstone.getBundledInput(INPUT_SIDE)
-  for g = 1, NUM_GATES do
-    gate_open[g] = colors.test(inputs, INPUT_GATE[g])
-  end
-end
-
--- ============================================================
---  OPEN-ALL SEQUENCE
---  Simultaneously opens all closed gates.
--- ============================================================
-local function begin_open_all()
-  if lockdown then
-    log("OPEN-ALL: ignored, lockdown active")
-    return
-  end
+local function do_open_all()
+  if lockdown then log("OPEN-ALL: ignored, lockdown active"); return end
   log("OPEN-ALL: starting sequence")
   local to_open = {}
   for g = 1, NUM_GATES do
-    if not gate_open[g] then
-      table.insert(to_open, g)
-      log("OPEN-ALL: opening " .. GATE_NAME[g])
-    end
+    if not gate_open[g] then table.insert(to_open, g) end
   end
-  if #to_open == 0 then
-    log("OPEN-ALL: all gates already open")
-  else
-    multi_pulse({}, to_open)
+  if #to_open == 0 then log("OPEN-ALL: all gates already open")
+  else multi_pulse({}, to_open) end
+  broadcast_state()
+end
+
+local function do_lockdown_on()
+  if lockdown then return end
+  lockdown = true
+  log("LOCKDOWN: starting sequence")
+  local to_close = {}
+  for g = 1, NUM_GATES do
+    if gate_open[g] then table.insert(to_close, g); log("LOCKDOWN: closing " .. GATE_NAME[g]) end
   end
+  if #to_close == 0 then log("LOCKDOWN: all gates already closed")
+  else multi_pulse(to_close, {}) end
+  set_lockdown_holds(true)
+  log("LOCKDOWN: hold signals active")
+  broadcast_state()
+end
+
+local function do_lockdown_off()
+  if not lockdown then return end
+  lockdown = false
+  set_lockdown_holds(false)
+  log("LOCKDOWN: released, holds cleared")
+  local inputs = redstone.getBundledInput(INPUT_SIDE)
+  for g = 1, NUM_GATES do gate_open[g] = colors.test(inputs, INPUT_GATE[g]) end
+  broadcast_state()
 end
 
 -- ============================================================
 --  READ SENSORS
---  Returns action table; gate sensors and toggles ignored
---  during lockdown.
 -- ============================================================
 local function update_inputs()
   local inputs       = redstone.getBundledInput(INPUT_SIDE)
   local new_lockdown = colors.test(inputs, INPUT_LOCKDOWN)
   local new_open_all = colors.test(inputs, INPUT_OPEN_ALL)
-
-  local actions = {
-    lockdown_start = false,
-    lockdown_end   = false,
-    open_all_start = false,
-    toggle_gate    = {},
-  }
+  local actions      = { lockdown_start=false, lockdown_end=false, open_all_start=false, toggle_gate={} }
 
   if new_lockdown ~= lockdown then
-    lockdown = new_lockdown
-    log("Lockdown lever: " .. (lockdown and "ON" or "OFF"))
-    if lockdown then
-      actions.lockdown_start = true
-    else
-      actions.lockdown_end = true
-    end
+    log("Lockdown lever: " .. (new_lockdown and "ON" or "OFF"))
+    if new_lockdown then actions.lockdown_start = true
+    else                 actions.lockdown_end   = true end
   end
 
   if new_open_all ~= open_all then
     open_all = new_open_all
     log("Open-all lever: " .. (open_all and "ON" or "OFF"))
-    if open_all and not lockdown then
-      actions.open_all_start = true
-    elseif open_all and lockdown then
-      log("OPEN-ALL: ignored, lockdown active")
-    end
+    if open_all and not lockdown then actions.open_all_start = true
+    elseif open_all then log("OPEN-ALL: ignored, lockdown active") end
   end
 
   if not lockdown then
@@ -309,45 +282,48 @@ local function update_inputs()
         log(GATE_NAME[g] .. " is now " .. (open and "OPEN" or "CLOSED"))
       end
     end
-
-    -- Toggle buttons: rising edge, respect cooldown
     for g = 1, NUM_GATES do
       local pressed = colors.test(inputs, INPUT_TOGGLE[g])
       if pressed and not button_held[g] then
         button_held[g] = true
-        if in_cooldown(g) then
-          log("TOGGLE " .. GATE_NAME[g] .. ": blocked (" ..
-              cooldown_remaining(g) .. "s cooldown)")
-        else
-          table.insert(actions.toggle_gate, g)
-        end
-      elseif not pressed then
-        button_held[g] = false
-      end
+        if lockdown then log("TOGGLE " .. GATE_NAME[g] .. ": ignored, lockdown active")
+        else table.insert(actions.toggle_gate, g) end
+      elseif not pressed then button_held[g] = false end
     end
   end
 
   return actions
 end
 
--- ============================================================
---  PROCESS ACTIONS
--- ============================================================
 local function process(actions)
-  if actions.lockdown_start then
-    begin_lockdown()
-  elseif actions.lockdown_end then
-    end_lockdown()
-  end
-
-  if actions.open_all_start then
-    begin_open_all()
-  end
-
+  local changed = false
+  if actions.lockdown_start then do_lockdown_on();  changed = true end
+  if actions.lockdown_end   then do_lockdown_off(); changed = true end
+  if actions.open_all_start then do_open_all();     changed = true end
   for _, g in ipairs(actions.toggle_gate) do
-    local closing = gate_open[g]
-    log("TOGGLE: " .. (closing and "close " or "open ") .. GATE_NAME[g])
-    single_pulse(g, closing)
+    if do_toggle(g) then changed = true end
+  end
+  if changed then broadcast_state() end
+end
+
+-- ============================================================
+--  HANDLE REDNET COMMAND
+-- ============================================================
+local function handle_net_cmd(msg)
+  if type(msg) ~= "table" or msg.kind ~= "gate_cmd" then return end
+  local cmd = msg.cmd
+  if cmd == "toggle" and type(msg.gate) == "number" then
+    local g = msg.gate
+    if g >= 1 and g <= NUM_GATES then
+      if lockdown then
+        log("NET TOGGLE " .. GATE_NAME[g] .. ": ignored, lockdown active")
+      else
+        do_toggle(g)
+      end
+    end
+  elseif cmd == "open_all"     then do_open_all()
+  elseif cmd == "lockdown_on"  then do_lockdown_on()
+  elseif cmd == "lockdown_off" then do_lockdown_off()
   end
 end
 
@@ -358,7 +334,6 @@ local function draw()
   term.clear()
   term.setCursorPos(1, 1)
   term.write("===== Gate Controller " .. VERSION .. " =====")
-
   term.setCursorPos(1, 3)
   if lockdown then
     term.write("  *** LOCKDOWN ACTIVE ***")
@@ -367,19 +342,17 @@ local function draw()
   else
     term.write("  Status: Normal")
   end
-
   for g = 1, NUM_GATES do
     term.setCursorPos(1, 4 + g)
     local state = gate_open[g] and "OPEN  " or "closed"
     local cd    = in_cooldown(g) and (" [" .. cooldown_remaining(g) .. "s]") or ""
     term.write(("  %s :  %s%s"):format(GATE_NAME[g], state, cd))
   end
-
   term.setCursorPos(1, 10)
   term.write("  Log:")
-  local start_i = math.max(1, #log_buf - 8)
-  for i = start_i, #log_buf do
-    term.setCursorPos(1, 10 + (i - start_i + 1))
+  local si = math.max(1, #log_buf - 8)
+  for i = si, #log_buf do
+    term.setCursorPos(1, 10 + (i - si + 1))
     term.write("    " .. log_buf[i])
   end
 end
@@ -389,6 +362,7 @@ end
 -- ============================================================
 redstone.setBundledOutput(OUTPUT_SIDE, 0)
 log("Boot: GateController " .. VERSION)
+open_rednet()
 
 local inputs = redstone.getBundledInput(INPUT_SIDE)
 lockdown = colors.test(inputs, INPUT_LOCKDOWN)
@@ -400,40 +374,56 @@ for g = 1, NUM_GATES do
 end
 
 if lockdown then
-  log("Boot: lockdown lever active, triggering lockdown")
-  begin_lockdown()
+  log("Boot: lockdown lever active")
+  do_lockdown_on()
 elseif open_all then
-  log("Boot: open-all lever active, triggering open-all")
-  begin_open_all()
+  log("Boot: open-all lever active")
+  do_open_all()
 else
   log("Boot: normal state")
 end
 
+broadcast_state()
 draw()
 
 -- ============================================================
 --  MAIN LOOP
 -- ============================================================
-local poll_timer    = os.startTimer(POLL_S)
-local display_timer = os.startTimer(DISPLAY_S)
+local poll_timer      = os.startTimer(POLL_S)
+local display_timer   = os.startTimer(DISPLAY_S)
+local heartbeat_timer = os.startTimer(HEARTBEAT_S)
 
 while true do
-  local ev, a = os.pullEvent()
+  local e = { os.pullEvent() }
+  local ev = e[1]
 
   if ev == "redstone" then
     local actions = update_inputs()
     process(actions)
     draw()
 
+  elseif ev == "rednet_message" then
+    local msg, proto = e[3], e[4]
+    if proto == GATE_PROTO then
+      handle_net_cmd(msg)
+      draw()
+    end
+
   elseif ev == "timer" then
-    if a == poll_timer then
+    local tid = e[2]
+    if tid == poll_timer then
       local actions = update_inputs()
       process(actions)
       poll_timer = os.startTimer(POLL_S)
 
-    elseif a == display_timer then
+    elseif tid == display_timer then
       draw()
       display_timer = os.startTimer(DISPLAY_S)
+
+    elseif tid == heartbeat_timer then
+      broadcast_state()
+      draw()   -- refresh cooldown countdowns
+      heartbeat_timer = os.startTimer(HEARTBEAT_S)
     end
   end
 end
